@@ -97,6 +97,8 @@ class GpuTimestampProfiler
         RestirPtDuplication,
         // M5.6 O0: the shared ReGIR presampling and ReSTIR PT's ReGIR light map, on ReSTIR PT frames that use ReGIR.
         RestirPtReGIR,
+        // FG.3: the NGX Frame Generation evaluation (generated frame), after the Editor overlays.
+        FrameGenerationEvaluate,
         Count
     };
 

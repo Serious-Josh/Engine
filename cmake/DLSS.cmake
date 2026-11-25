@@ -129,6 +129,61 @@ if(NOT ENGINE_DLSS_RR_POLICY STREQUAL "OFF")
     endif()
 endif()
 
+# FG.1: DLSS Frame Generation (NGX feature "DLSS-G", 2x), detected separately in the same SDK checkout. Like Ray
+# Reconstruction it needs the Super Resolution backend (the same NGX instance); AUTO enables it when its headers and production
+# runtime are present. The runtime is deployed beside the Editor only for now: packaged games get Frame Generation in a later
+# stage (Documentation/Rendering/DLSS_Frame_Generation_FG0_Investigation.md §8), although its guide allows shipping it.
+set(ENGINE_ENABLE_DLSS_FG "AUTO" CACHE STRING "DLSS Frame Generation build policy: AUTO, ON or OFF")
+set_property(CACHE ENGINE_ENABLE_DLSS_FG PROPERTY STRINGS AUTO ON OFF)
+string(TOUPPER "${ENGINE_ENABLE_DLSS_FG}" ENGINE_DLSS_FG_POLICY)
+
+if(NOT ENGINE_DLSS_FG_POLICY MATCHES "^(AUTO|ON|OFF)$")
+    message(FATAL_ERROR "ENGINE_ENABLE_DLSS_FG must be AUTO, ON or OFF")
+endif()
+
+set(ENGINE_DLSS_FG_AVAILABLE OFF)
+# The production runtime. The development DLL in lib/Windows_x86_64/dev (watermarked, debug overlays) must never be deployed.
+set(ENGINE_DLSS_FG_RUNTIME "${ENGINE_DLSS_ROOT}/lib/Windows_x86_64/rel/nvngx_dlssg.dll")
+
+if(NOT ENGINE_DLSS_FG_POLICY STREQUAL "OFF")
+    if(NOT ENGINE_DLSS_AVAILABLE)
+        if(ENGINE_DLSS_FG_POLICY STREQUAL "ON")
+            message(FATAL_ERROR "DLSS Frame Generation explicitly required, but the DLSS Super Resolution backend it builds "
+                "on is disabled. Set ENGINE_ENABLE_DLSS to AUTO/ON with a complete SDK, or use ENGINE_ENABLE_DLSS_FG AUTO/OFF.")
+        endif()
+
+        message(STATUS "DLSS Frame Generation AUTO: disabled (the DLSS Super Resolution backend is disabled)")
+    else()
+        set(ENGINE_DLSS_FG_REQUIRED_FILES
+            "${ENGINE_DLSS_INCLUDE_DIR}/nvsdk_ngx_defs_dlssg.h"
+            "${ENGINE_DLSS_INCLUDE_DIR}/nvsdk_ngx_params_dlssg.h"
+            "${ENGINE_DLSS_INCLUDE_DIR}/nvsdk_ngx_helpers_dlssg.h"
+            "${ENGINE_DLSS_INCLUDE_DIR}/nvsdk_ngx_helpers_dlssg_d3d.h"
+            "${ENGINE_DLSS_FG_RUNTIME}"
+        )
+
+        set(ENGINE_DLSS_FG_MISSING "")
+
+        foreach(required IN LISTS ENGINE_DLSS_FG_REQUIRED_FILES)
+            if(NOT EXISTS "${required}")
+                list(APPEND ENGINE_DLSS_FG_MISSING "${required}")
+            endif()
+        endforeach()
+
+        if(ENGINE_DLSS_FG_MISSING)
+            if(ENGINE_DLSS_FG_POLICY STREQUAL "ON")
+                message(FATAL_ERROR "DLSS Frame Generation explicitly required, missing dependencies: "
+                    "${ENGINE_DLSS_FG_MISSING}. Set ENGINE_DLSS_ROOT or use ENGINE_ENABLE_DLSS_FG AUTO/OFF.")
+            endif()
+
+            message(STATUS "DLSS Frame Generation AUTO: disabled; missing dependencies: ${ENGINE_DLSS_FG_MISSING}")
+        else()
+            set(ENGINE_DLSS_FG_AVAILABLE ON)
+            message(STATUS "DLSS Frame Generation support enabled (Editor runtime: ${ENGINE_DLSS_FG_RUNTIME})")
+        endif()
+    endif()
+endif()
+
 # Compiles the backend against the SDK when enabled. The NGX library reaches every executable that links the object
 # library through its link interface.
 function(engine_configure_dlss target)
@@ -143,6 +198,10 @@ function(engine_configure_dlss target)
     )
     if(ENGINE_DLSS_RR_AVAILABLE)
         target_compile_definitions(${target} PRIVATE ENGINE_HAS_DLSS_RR=1)
+    endif()
+
+    if(ENGINE_DLSS_FG_AVAILABLE)
+        target_compile_definitions(${target} PRIVATE ENGINE_HAS_DLSS_FG=1)
     endif()
     target_include_directories(${target} PRIVATE "${ENGINE_DLSS_INCLUDE_DIR}")
     target_link_libraries(${target} INTERFACE
@@ -175,6 +234,20 @@ function(engine_deploy_dlss_rr target)
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ENGINE_DLSS_RR_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"
         COMMENT "Deploying NVIDIA DLSS Ray Reconstruction runtime for ${target} (Editor only)"
+        VERBATIM
+    )
+endfunction()
+
+# FG.1: copies the production DLSS Frame Generation runtime next to the Editor executable. Not called for EngineRuntime until
+# packaged games get Frame Generation.
+function(engine_deploy_dlss_fg target)
+    if(NOT ENGINE_DLSS_FG_AVAILABLE)
+        return()
+    endif()
+
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ENGINE_DLSS_FG_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"
+        COMMENT "Deploying NVIDIA DLSS Frame Generation runtime for ${target} (Editor only)"
         VERBATIM
     )
 endfunction()

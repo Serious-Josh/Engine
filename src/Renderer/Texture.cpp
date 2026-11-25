@@ -1,5 +1,6 @@
 #include "Texture.h"
 #include "Debug/MemoryRegistry.h"
+#include "Renderer/TextureMemoryAllocator.h"
 #include "DescriptorHeap.h"
 #include "Core/Log.h"
 
@@ -172,8 +173,16 @@ bool Texture::Initialize(
     D3D12_HEAP_PROPERTIES heapProperties{};
     heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-    HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description, initialState,
-                                                     nullptr, IID_PPV_ARGS(&m_resource));
+    // Large textures live in Engine-owned heaps that are never returned to the OS during a session
+    // (TextureMemoryAllocator.h); the rest, and everything the allocator declines, are committed resources.
+    HRESULT result = TextureMemoryAllocator::CreateTexture(device, description, initialState, &m_resource);
+
+    if (FAILED(result))
+    {
+        m_resource = nullptr;
+        result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description, initialState,
+                                                 nullptr, IID_PPV_ARGS(&m_resource));
+    }
 
     if (FAILED(result))
     {

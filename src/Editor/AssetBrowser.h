@@ -3,6 +3,7 @@
 #include "assets/AcousticMaterial.h"
 
 #include "Editor/TextureThumbnailCache.h"
+#include "Editor/EditorFilesystemCache.h"
 #include "Editor/MeshDragPayload.h"
 #include "Editor/MaterialDragPayload.h"
 #include "Editor/ThumbnailAdmission.h"
@@ -175,8 +176,10 @@ private:
     friend class ScriptWorkflowVerification;
     friend class ThumbnailSchedulingVerification;
     friend class AssetBrowserSceneVerification;
+    friend class EditorCpuVerification;
 #endif
-    void DrawAssetMoveSource(const std::filesystem::path& path, const std::string& name);
+    // A drag source for a classified texture, material or acoustic material tile (the caller supplies its registry record).
+    void DrawAssetMoveSource(const std::filesystem::path& path, const std::string& name, const AssetID& id, AssetType type);
     void DrawAssetMoveTarget(const std::filesystem::path& directory);
     std::optional<MoveRequest> m_moveRequest;
     class SceneMembershipPanel* m_sceneMembership = nullptr;
@@ -215,6 +218,25 @@ private:
     std::map<std::filesystem::path, AssetRecord> m_textureRecords;
     std::map<std::filesystem::path, AssetRecord> m_materialRecords;
     std::map<std::filesystem::path, AssetRecord> m_meshRecords;
+
+    // The three tables above are rebuilt only when the project root or any registry record changes, not every frame.
+    // m_assetTableRecords is the registry they were built from; each rebuild starts a new generation (0: never built), and
+    // listing entries classified against an older generation are classified again.
+    std::filesystem::path m_assetTableRoot;
+    std::vector<AssetRecord> m_assetTableRecords;
+    std::uint64_t m_assetTableGeneration = 0;
+    bool AssetTablesMatch(const ProjectPaths& paths, const ProjectAssetRegistry& registry) const;
+
+    // A completed delete or rename edits the tables directly; the next SetThumbnailProject rebuilds them from the
+    // registry, as the former per-frame rebuild did. The generation keeps counting, so no stale classification survives.
+    void InvalidateAssetTables()
+    {
+        m_assetTableRoot.clear();
+        m_assetTableRecords.clear();
+    }
+
+    // SetThumbnailProject runs every frame; the project root is canonicalized only when it changes.
+    CanonicalPathCache m_canonicalProjectRoot;
 
     Renderer* m_materialRenderer = nullptr;
 
@@ -333,7 +355,28 @@ private:
         // Canonical path of a .scene entry that passed the project containment checks, or empty when the
         // entry is not a browsable scene. Unset until the entry is first classified against sceneRoot.
         std::optional<std::filesystem::path> sceneCanonicalPath;
+
+        // The tile's ImGui ID, from the path.
+        std::string pathID;
+
+        // Registry facts for the tile, classified once per asset-table generation instead of every frame: each lookup
+        // normalizes the path and searches path-keyed maps (about 6 microseconds per entry per frame). The record
+        // pointers are nodes of m_textureRecords, m_materialRecords and m_meshRecords, which change only with a new
+        // generation; null when absent.
+        std::uint64_t classifiedGeneration = 0;
+        const ProjectContext* classifiedProject = nullptr;
+        bool sceneDocument = false;
+        bool scriptDocument = false;
+        bool script = false;
+        bool materialExtension = false;
+        bool registryFile = false;
+        const AssetRecord* texture = nullptr;
+        const AssetRecord* material = nullptr;
+        const AssetRecord* mesh = nullptr;
+        std::optional<AssetID> acousticMaterial;
     };
+
+    void ClassifyEntry(Entry& entry, const ProjectContext* project) const;
 
     struct Listing
     {

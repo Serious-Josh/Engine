@@ -38,6 +38,7 @@ int VerifySceneMembershipEditor(const std::filesystem::path& outputRoot);
 int VerifyCompositeWorldEditor(const std::filesystem::path& outputRoot);
 int VerifyDemoWorldEditor(const std::filesystem::path& outputRoot);
 int VerifyCompositePlacementStress(const std::filesystem::path& outputRoot);
+int VerifyEditorCpu(const std::filesystem::path& projectDirectory);
 int VerifyResidencyBoundary(const std::filesystem::path& outputRoot);
 int VerifyLevelEditModes(const std::filesystem::path& outputRoot);
 int VerifySceneDocumentCache(const std::filesystem::path& outputRoot);
@@ -592,6 +593,10 @@ int main(int argc, char** argv)
     if(argc == 3 && std::string_view(argv[1]) == "--verify-composite-placement-stress")
     {
         return VerifyCompositePlacementStress(std::filesystem::absolute(argv[2]));
+    }
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-editor-cpu")
+    {
+        return VerifyEditorCpu(std::filesystem::absolute(argv[2]));
     }
     if(argc == 3 && std::string_view(argv[1]) == "--verify-level-edit-modes")
     {

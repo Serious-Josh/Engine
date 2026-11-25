@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -1002,17 +1003,36 @@ bool ShaderCompiler::UsesUnfusedBsdf(const std::filesystem::path& shaderPath)
 
 bool ShaderCompiler::DependenciesUnchanged(const std::vector<ShaderSourceDependency>& dependencies)
 {
+    // Every library and pipeline adoption checks its whole include tree here (a Lighting Mode switch adopts dozens), so
+    // each file is read in one block: a character-by-character stream iterator made the switching frame's checks cost
+    // several milliseconds per library. The comparison is still the full contents.
+    std::string contents;
+
     for(const ShaderSourceDependency& dependency : dependencies)
     {
-        std::ifstream file(dependency.path, std::ios::binary);
+        std::ifstream file(dependency.path, std::ios::binary | std::ios::ate);
 
         if(file.is_open() != dependency.exists)
         {
             return false;
         }
 
-        if(dependency.exists &&
-            std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()) != dependency.contents)
+        if(!dependency.exists)
+        {
+            continue;
+        }
+
+        const std::streamoff size = file.tellg();
+
+        if(size < 0 || static_cast<std::uint64_t>(size) != dependency.contents.size())
+        {
+            return false;
+        }
+
+        contents.resize(static_cast<std::size_t>(size));
+        file.seekg(0);
+
+        if(!file.read(contents.data(), static_cast<std::streamsize>(size)) || contents != dependency.contents)
         {
             return false;
         }

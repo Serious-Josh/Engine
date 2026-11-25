@@ -70,6 +70,42 @@ float PathTraceLuminance(float3 color)
     return dot(color, float3(0.2126f, 0.7152f, 0.0722f));
 }
 
+// One row pair of a bilinear table read: the texel rows around a coordinate v and its blend between them. Every axis
+// of the read is independent, so a caller reading many u at the same v (the roughness row of one surface) computes it
+// once.
+struct PathTraceLUT2Row
+{
+    int row;
+    int nextRow;
+    float blend;
+};
+
+PathTraceLUT2Row PathTraceLUT2RowAt(uint height, float v)
+{
+    float texel = saturate(v) * float(height) - 0.5f;
+    texel = clamp(texel, 0.0f, float(height - 1u));
+
+    PathTraceLUT2Row row;
+    row.row = int(floor(texel));
+    row.nextRow = min(row.row + 1, int(height - 1u));
+    row.blend = texel - float(row.row);
+    return row;
+}
+
+// The bilinear read at u on a row pair, with the same explicit clamp to texel centres along u.
+float2 PathTraceLoadLUT2Row(Texture2D<float2> lut, uint width, PathTraceLUT2Row row, float u)
+{
+    float texel = saturate(u) * float(width) - 0.5f;
+    texel = clamp(texel, 0.0f, float(width - 1u));
+    int column = int(floor(texel));
+    int nextColumn = min(column + 1, int(width - 1u));
+    float blend = texel - float(column);
+
+    float2 top = lerp(lut.Load(int3(column, row.row, 0)), lut.Load(int3(nextColumn, row.row, 0)), blend);
+    float2 bottom = lerp(lut.Load(int3(column, row.nextRow, 0)), lut.Load(int3(nextColumn, row.nextRow, 0)), blend);
+    return lerp(top, bottom, row.blend);
+}
+
 // Bilinear table read with explicit clamp to texel centres. A wrapping sampler would blend the mu = 1 and
 // r = 1 edges with mu = 0 / r = 0.
 float2 PathTraceLoadLUT2(Texture2D<float2> lut, float2 uv)
@@ -77,25 +113,22 @@ float2 PathTraceLoadLUT2(Texture2D<float2> lut, float2 uv)
     uint width;
     uint height;
     lut.GetDimensions(width, height);
+    return PathTraceLoadLUT2Row(lut, width, PathTraceLUT2RowAt(height, uv.y), uv.x);
+}
 
-    float2 texel = saturate(uv) * float2(width, height) - 0.5f;
-    texel = clamp(texel, 0.0f, float2(width - 1u, height - 1u));
-    int2 base = int2(floor(texel));
-    int2 next = min(base + 1, int2(width - 1u, height - 1u));
-    float2 blend = texel - float2(base);
-
-    float2 top = lerp(lut.Load(int3(base.x, base.y, 0)), lut.Load(int3(next.x, base.y, 0)), blend.x);
-    float2 bottom = lerp(lut.Load(int3(base.x, next.y, 0)), lut.Load(int3(next.x, next.y, 0)), blend.x);
-    return lerp(top, bottom, blend.y);
+// The (M, B) table's cosine coordinate (the cosine axis is read at sqrt(mu) for the squared mapping).
+float PathTraceTableCosineCoordinate(PathTraceSurface surface, float cosine)
+{
+    return surface.materialTableCosineMapping == PATH_TRACE_TABLE_COSINE_SQUARED ? sqrt(saturate(cosine)) :
+        saturate(cosine);
 }
 
 // (M, B) at a cosine. Never forms 1 - E.
 float2 PathTraceMissingEnergyAndBias(PathTraceSurface surface, float cosine)
 {
     Texture2D<float2> table = ResourceDescriptorHeap[surface.materialTableIndex];
-    float coordinate = surface.materialTableCosineMapping == PATH_TRACE_TABLE_COSINE_SQUARED ?
-        sqrt(saturate(cosine)) : saturate(cosine);
-    return max(PathTraceLoadLUT2(table, float2(coordinate, surface.material.roughness)), 0.0f);
+    return max(PathTraceLoadLUT2(table, float2(PathTraceTableCosineCoordinate(surface, cosine),
+        surface.material.roughness)), 0.0f);
 }
 
 // (Mavg, Bavg): cosine-weighted averages of the same bilinear reads.
@@ -164,6 +197,18 @@ float3 PathTraceMultipleScatterFresnel(PathTraceSurface surface, float averageMi
         max(1.0f - averageFresnel * averageMissing, 1.0e-6f);
 }
 
+// The multiple-scatter lobe Fms M(l) M(v) / (PI Mavg) from its terms; none for a delta mirror or where Mavg is 0.
+float3 PathTraceMultipleScatterFromTerms(PathTraceSurface surface, float3 multipleScatterFresnel, float averageMissing,
+    float missingLight, float missingView)
+{
+    if(surface.deltaSpecular || averageMissing <= 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    return multipleScatterFresnel * missingLight * missingView / (PI * averageMissing);
+}
+
 float3 PathTraceEvaluateMultipleScatter(PathTraceSurface surface, float cosineLight)
 {
     if(surface.deltaSpecular)
@@ -173,31 +218,44 @@ float3 PathTraceEvaluateMultipleScatter(PathTraceSurface surface, float cosineLi
 
     float averageMissing = PathTraceAverageMissingEnergyAndBias(surface).x;
 
+    // The early exit before the two table reads, as before the split.
     if(averageMissing <= 0.0f)
     {
         return float3(0.0f, 0.0f, 0.0f);
     }
 
-    float missingLight = PathTraceMissingEnergyAndBias(surface, cosineLight).x;
-    float missingView = PathTraceMissingEnergyAndBias(surface, surface.normalDotView).x;
-    return PathTraceMultipleScatterFresnel(surface, averageMissing) * missingLight * missingView /
-        (PI * averageMissing);
+    return PathTraceMultipleScatterFromTerms(surface, PathTraceMultipleScatterFresnel(surface, averageMissing),
+        averageMissing, PathTraceMissingEnergyAndBias(surface, cosineLight).x,
+        PathTraceMissingEnergyAndBias(surface, surface.normalDotView).x);
 }
 
-// Total specular albedo Es(mu) = F0 S + B + Fms M for the Schlick models.
+// Total specular albedo Es(mu) = F0 S + B + Fms M for the Schlick models, from F0, Fms and (M, B) at mu; a delta mirror
+// has Es = F(mu) exactly (Fms and (M, B) unused).
+float3 PathTraceSpecularAlbedoFromTerms(PathTraceSurface surface, float3 F0, float3 multipleScatterFresnel,
+    float cosine, float2 missingBias)
+{
+    if(surface.deltaSpecular)
+    {
+        return FresnelSchlick(cosine, F0);
+    }
+
+    float scale = max(1.0f - missingBias.x - missingBias.y, 0.0f);
+    return F0 * scale + missingBias.y + multipleScatterFresnel * missingBias.x;
+}
+
 float3 PathTraceSpecularAlbedo(PathTraceSurface surface, float cosine)
 {
     float3 F0 = PathTraceSchlickF0(surface);
 
     if(surface.deltaSpecular)
     {
-        return FresnelSchlick(cosine, F0);
+        return PathTraceSpecularAlbedoFromTerms(surface, F0, float3(0.0f, 0.0f, 0.0f), cosine, float2(0.0f, 0.0f));
     }
 
     float2 missingBias = PathTraceMissingEnergyAndBias(surface, cosine);
-    float scale = max(1.0f - missingBias.x - missingBias.y, 0.0f);
     float averageMissing = PathTraceAverageMissingEnergyAndBias(surface).x;
-    return F0 * scale + missingBias.y + PathTraceMultipleScatterFresnel(surface, averageMissing) * missingBias.x;
+    return PathTraceSpecularAlbedoFromTerms(surface, F0, PathTraceMultipleScatterFresnel(surface, averageMissing),
+        cosine, missingBias);
 }
 
 float3 PathTraceAverageSpecularAlbedo(PathTraceSurface surface)
@@ -214,13 +272,28 @@ float3 PathTraceAverageSpecularAlbedo(PathTraceSurface surface)
     return F0 * scale + average.y + PathTraceMultipleScatterFresnel(surface, average.x) * average.x;
 }
 
-// Reciprocal diffuse weight (1 - Es(l)) (1 - Es(v)) / (1 - Es_avg).
+// The diffuse weight's view factor 1 - Es(v) and its average factor max(1 - Es_avg, 1e-6), saturated.
+float3 PathTraceTransmittedView(PathTraceSurface surface)
+{
+    return saturate(1.0f - PathTraceSpecularAlbedo(surface, surface.normalDotView));
+}
+
+float3 PathTraceTransmittedAverage(PathTraceSurface surface)
+{
+    return max(saturate(1.0f - PathTraceAverageSpecularAlbedo(surface)), 1.0e-6f);
+}
+
+// Reciprocal diffuse weight (1 - Es(l)) (1 - Es(v)) / (1 - Es_avg) from Es(l) and the two factors above.
+float3 PathTraceDiffuseWeightFromTerms(float3 specularAlbedoLight, float3 transmittedView, float3 transmittedAverage)
+{
+    float3 transmittedLight = saturate(1.0f - specularAlbedoLight);
+    return transmittedLight * transmittedView / transmittedAverage;
+}
+
 float3 PathTraceDiffuseWeight(PathTraceSurface surface, float cosineLight)
 {
-    float3 transmittedLight = saturate(1.0f - PathTraceSpecularAlbedo(surface, cosineLight));
-    float3 transmittedView = saturate(1.0f - PathTraceSpecularAlbedo(surface, surface.normalDotView));
-    float3 transmittedAverage = saturate(1.0f - PathTraceAverageSpecularAlbedo(surface));
-    return transmittedLight * transmittedView / max(transmittedAverage, 1.0e-6f);
+    return PathTraceDiffuseWeightFromTerms(PathTraceSpecularAlbedo(surface, cosineLight),
+        PathTraceTransmittedView(surface), PathTraceTransmittedAverage(surface));
 }
 
 // Completes a surface whose material, baseColor, normals and view are already filled.
@@ -288,21 +361,103 @@ bool PathTraceDirectionAboveSurface(PathTraceSurface surface, float3 direction)
 //   alpha^2 / (PI ((n.h)^2 (alpha^2 - 1) + 1)^2) = alpha^2 / (PI ((n.h)^2 alpha^2 + |n x h|^2)^2).
 // The legacy form cancels catastrophically in float32 when alpha is near the 0.045^2 floor and n.h is
 // within a few ulps of 1; the cross-product form keeps full precision near the peak.
-float PathTraceDistributionGGX(float3 normal, float3 halfVector, float roughness)
+float PathTraceDistributionGGXFromAlpha(float3 normal, float3 halfVector, float alphaSquared)
 {
-    float alpha = PathTraceGGXAlpha(roughness);
-    float alphaSquared = alpha * alpha;
     float cosine = saturate(dot(normal, halfVector));
     float3 sine = cross(normal, halfVector);
     float denominator = cosine * cosine * alphaSquared + dot(sine, sine);
     return alphaSquared / max(PI * denominator * denominator, 1.0e-30f);
 }
 
-// GGX single scatter D G F / (4 n.l n.v) with the legacy G, F and denominator clamp, and the stable D.
-float3 PathTraceEvaluateGGXSingleScatter(PathTraceSurface surface, float3 direction)
+float PathTraceDistributionGGX(float3 normal, float3 halfVector, float roughness)
+{
+    float alpha = PathTraceGGXAlpha(roughness);
+    return PathTraceDistributionGGXFromAlpha(normal, halfVector, alpha * alpha);
+}
+
+// -----------------------------------------------------------------------------
+// Prepare / evaluate split (2026-11-24; Documentation/Rendering/ReSTIR_PT_Initial_Sampling_Optimization.md)
+// -----------------------------------------------------------------------------
+// Everything the BSDF value needs that does not depend on the light direction, computed once per shading point. A
+// caller that evaluates many directions at one point (ReSTIR PT's light candidate loops evaluate dozens) prepares once.
+// The prepared evaluation and PathTraceEvaluateBSDFLobes share every lobe term (the *FromTerms helpers) and sum them in
+// the same order, so the two agree bit for bit under strict IEEE. The struct stays live through those loops, so it
+// holds only the view and table terms, not a copy of the material: a lobe's raw parameters (the conductor's n and k)
+// are read from the surface inside that lobe's branch. The lobe selection probability is not repeated here:
+// PathTraceFinalizeSurface already stores it once per surface, and the value never reads it.
+struct PathTraceBSDFPrepared
+{
+    // saturate(n . v), the GGX alpha^2 (D and Smith G clamp roughness alike) and Smith G's view root.
+    float normalDotView;
+    float alphaSquared;
+    float smithViewRoot;
+    float3 F0;
+
+    // Multiple scatter, non-delta surfaces only (0 otherwise): Mavg, M(n.v) and Fms.
+    float averageMissing;
+    float missingView;
+    float3 multipleScatterFresnel;
+
+    // The diffuse weight's view and average factors, and EON's light-independent terms (models 0 and 1; 0 for a
+    // conductor).
+    float3 transmittedView;
+    float3 transmittedAverage;
+    EONDiffusePrepared diffuse;
+
+    // The (M, B) table's width and the surface's roughness row, for the per-light read at n.l (non-delta surfaces).
+    uint tableWidth;
+    PathTraceLUT2Row tableRow;
+};
+
+PathTraceBSDFPrepared PathTracePrepareBSDF(PathTraceSurface surface)
+{
+    PathTraceBSDFPrepared prepared = (PathTraceBSDFPrepared)0;
+    prepared.normalDotView = saturate(dot(surface.normal, surface.view));
+    float alpha = PathTraceGGXAlpha(surface.material.roughness);
+    prepared.alphaSquared = alpha * alpha;
+    prepared.smithViewRoot = GeometrySmithGGXRoot(prepared.normalDotView, prepared.alphaSquared);
+    prepared.F0 = PathTraceSchlickF0(surface);
+
+    if(!surface.deltaSpecular)
+    {
+        prepared.averageMissing = PathTraceAverageMissingEnergyAndBias(surface).x;
+        prepared.missingView = PathTraceMissingEnergyAndBias(surface, surface.normalDotView).x;
+        prepared.multipleScatterFresnel = PathTraceMultipleScatterFresnel(surface, prepared.averageMissing);
+
+        Texture2D<float2> table = ResourceDescriptorHeap[surface.materialTableIndex];
+        uint width;
+        uint height;
+        table.GetDimensions(width, height);
+        prepared.tableWidth = width;
+        prepared.tableRow = PathTraceLUT2RowAt(height, surface.material.roughness);
+    }
+
+    // The diffuse lobe's terms: a conductor (model 2) has none.
+    if(surface.material.model != 2u)
+    {
+        prepared.transmittedView = PathTraceTransmittedView(surface);
+        prepared.transmittedAverage = PathTraceTransmittedAverage(surface);
+        prepared.diffuse = PrepareEONDiffuse(PathTraceDiffuseAlbedo(surface), surface.material.roughness,
+            surface.normal, surface.view);
+    }
+
+    return prepared;
+}
+
+// (M, B) at the light's cosine, on the prepared roughness row (PathTraceMissingEnergyAndBias's read). Non-delta only.
+float2 PathTracePreparedMissingEnergyAndBias(PathTraceSurface surface, PathTraceBSDFPrepared prepared, float cosine)
+{
+    Texture2D<float2> table = ResourceDescriptorHeap[surface.materialTableIndex];
+    return max(PathTraceLoadLUT2Row(table, prepared.tableWidth, prepared.tableRow,
+        PathTraceTableCosineCoordinate(surface, cosine)), 0.0f);
+}
+
+// GGX single scatter D G F / (4 n.l n.v) with the legacy G, F and denominator clamp, and the stable D, from the view
+// terms n.v, alpha^2, Smith G's view root and F0.
+float3 PathTraceEvaluateGGXSingleScatterFromTerms(PathTraceSurface surface, float normalDotView, float alphaSquared,
+    float smithViewRoot, float3 F0, float3 direction)
 {
     float normalDotLight = saturate(dot(surface.normal, direction));
-    float normalDotView = saturate(dot(surface.normal, surface.view));
 
     if(normalDotLight <= 0.0f || normalDotView <= 0.0f)
     {
@@ -311,19 +466,76 @@ float3 PathTraceEvaluateGGXSingleScatter(PathTraceSurface surface, float3 direct
 
     float3 halfVector = normalize(direction + surface.view);
     float viewDotHalf = saturate(dot(surface.view, halfVector));
-    float distribution = PathTraceDistributionGGX(surface.normal, halfVector, surface.material.roughness);
-    float geometry = GeometrySmithGGX(normalDotLight, normalDotView, surface.material.roughness);
+    float distribution = PathTraceDistributionGGXFromAlpha(surface.normal, halfVector, alphaSquared);
+    float geometry = GeometrySmithGGXPrepared(normalDotLight, normalDotView, alphaSquared, smithViewRoot);
     float3 fresnel = surface.material.model == 2u ?
         FresnelConductor(viewDotHalf, surface.material.conductorN, surface.material.conductorK) :
-        FresnelSchlick(viewDotHalf, PathTraceSchlickF0(surface));
+        FresnelSchlick(viewDotHalf, F0);
     return distribution * geometry * fresnel / max(4.0f * normalDotLight * normalDotView, 1.0e-6f);
 }
 
-// Non-delta BSDF value f(l, v), without the cosine, and its diffuse lobe, the energy-compensated EON term. The rest
-// (GGX single scatter and multiple scatter) is the specular lobe. The total is the unchanged expression of
-// PathTraceEvaluateBSDF, so callers that discard diffuseValue compile exactly as before. A caller that uses it
-// gives the optimizer another use of the lobe's product, which can change how the total's multiply-adds are fused
-// (RTXPT D.1B.2 measured a few ulp in the extraction ray generations). Zero outside both hemispheres.
+float3 PathTraceEvaluateGGXSingleScatter(PathTraceSurface surface, float3 direction)
+{
+    float normalDotView = saturate(dot(surface.normal, surface.view));
+
+    // The early exit before the view terms, as before the split.
+    if(saturate(dot(surface.normal, direction)) <= 0.0f || normalDotView <= 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    float alpha = PathTraceGGXAlpha(surface.material.roughness);
+    float alphaSquared = alpha * alpha;
+    return PathTraceEvaluateGGXSingleScatterFromTerms(surface, normalDotView, alphaSquared,
+        GeometrySmithGGXRoot(normalDotView, alphaSquared), PathTraceSchlickF0(surface), direction);
+}
+
+// Non-delta BSDF value f(l, v), without the cosine, and its diffuse lobe, the energy-compensated EON term, from the
+// prepared terms. The rest (GGX single scatter and multiple scatter) is the specular lobe. Each lobe is its own step of
+// a running sum, so its temporaries end before the next lobe starts; the sum keeps the established association
+// ((diffuse + single scatter) + multiple scatter, single scatter + multiple scatter for a conductor). Zero outside both
+// hemispheres.
+float3 PathTraceEvaluateBSDFLobesPrepared(PathTraceSurface surface, PathTraceBSDFPrepared prepared, float3 direction,
+    out float3 diffuseValue)
+{
+    diffuseValue = float3(0.0f, 0.0f, 0.0f);
+
+    if(!PathTraceDirectionAboveSurface(surface, direction))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    float normalDotLight = dot(surface.normal, direction);
+    // The light's (M, B) read, shared by the multiple-scatter lobe and the diffuse weight's Es(l).
+    float2 missingBiasLight = surface.deltaSpecular ? float2(0.0f, 0.0f) :
+        PathTracePreparedMissingEnergyAndBias(surface, prepared, normalDotLight);
+
+    // A delta mirror removes the single-scatter density; its energy is the delta event in PathTraceSampleBSDF.
+    float3 value = surface.deltaSpecular ? float3(0.0f, 0.0f, 0.0f) :
+        PathTraceEvaluateGGXSingleScatterFromTerms(surface, prepared.normalDotView, prepared.alphaSquared,
+        prepared.smithViewRoot, prepared.F0, direction);
+
+    if(surface.material.model != 2u)
+    {
+        float3 diffuse = EvaluateEONDiffusePrepared(prepared.diffuse, surface.normal, direction, surface.view);
+        float3 specularAlbedoLight = PathTraceSpecularAlbedoFromTerms(surface, prepared.F0,
+            prepared.multipleScatterFresnel, normalDotLight, missingBiasLight);
+        float3 diffuseWeight = PathTraceDiffuseWeightFromTerms(specularAlbedoLight, prepared.transmittedView,
+            prepared.transmittedAverage);
+        diffuseValue = diffuseWeight * diffuse;
+        value = diffuseWeight * diffuse + value;
+    }
+
+    return value + PathTraceMultipleScatterFromTerms(surface, prepared.multipleScatterFresnel, prepared.averageMissing,
+        missingBiasLight.x, prepared.missingView);
+}
+
+// Non-delta BSDF value f(l, v) for a single direction, and its diffuse lobe: the same lobe terms and sum as
+// PathTraceEvaluateBSDFLobesPrepared, each lobe through its own helper, so nothing that this direction's lobes skip is
+// prepared (the shift kernels, which evaluate one direction per vertex, measured slower with prepare then evaluate). A
+// caller that uses diffuseValue gives the optimizer another use of the lobe's product, which can change how the total's
+// multiply-adds are fused under relaxed floating point (RTXPT D.1B.2 measured a few ulp in the extraction ray
+// generations). Zero outside both hemispheres.
 float3 PathTraceEvaluateBSDFLobes(PathTraceSurface surface, float3 direction, out float3 diffuseValue)
 {
     diffuseValue = float3(0.0f, 0.0f, 0.0f);

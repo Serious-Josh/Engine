@@ -7,6 +7,7 @@
 #include "Renderer/RendererLightingMode.h"
 #include "Renderer/LightingModeTransition.h"
 #include "Renderer/RenderingConfiguration.h"
+#include "Renderer/Latency/ReflexStatus.h"
 #include "Project/ProjectSettings.h"
 #include "Engine/RenderingOverrides.h"
 #include "GpuTimingMonitor.h"
@@ -65,6 +66,12 @@ class DebugUI
     void EndFrame(
         ID3D12GraphicsCommandList* commandList,
         bool* textureUploadRequested = nullptr);
+
+    // FG.3: after EndFrame, draws the same UI again into the render target the caller bound, with sceneTexture shown as
+    // generatedTexture: DLSS Frame Generation's generated frame gets the real frame's UI over its generated viewport image.
+    // Both are ImGui texture IDs (shader-visible SRV GPU handles). The draw data is restored afterwards.
+    void RenderUiOverGeneratedImage(ID3D12GraphicsCommandList* commandList, std::uint64_t sceneTexture,
+        std::uint64_t generatedTexture);
 
     void SetTLASUpdated(bool updated);
     void RecordFramePacingCpuTiming(const CpuTiming::FrameSample& sample)
@@ -225,6 +232,40 @@ class DebugUI
         return m_restirPtFirefly;
     }
 
+    // Residual boiling P1 (experimental): x1's light sampler for camera mirror chains, shown under the reuse toggles.
+    void SetRestirPtMirrorX1(bool mirrorX1)
+    {
+        m_restirPtMirrorX1 = mirrorX1;
+    }
+
+    bool GetRestirPtMirrorX1() const
+    {
+        return m_restirPtMirrorX1;
+    }
+
+    // Residual boiling §5d option 2 (experimental): reuse direct light only, add fresh bounce light (denoiser frames).
+    void SetRestirPtDirectReservoir(bool directReservoir)
+    {
+        m_restirPtDirectReservoir = directReservoir;
+    }
+
+    bool GetRestirPtDirectReservoir() const
+    {
+        return m_restirPtDirectReservoir;
+    }
+
+    // Wall boiling (experimental): light-traced bounce connections, MIS-combined with the BSDF bounce (needs the
+    // direct-light reservoir; above 64 lights only).
+    void SetRestirPtLightBounce(bool lightBounce)
+    {
+        m_restirPtLightBounce = lightBounce;
+    }
+
+    bool GetRestirPtLightBounce() const
+    {
+        return m_restirPtLightBounce;
+    }
+
     // M5.6 O0: ReSTIR PT's table-light candidates from the shared ReGIR cells (above 64 local lights).
     void SetRestirPtRegir(bool regir)
     {
@@ -383,6 +424,36 @@ class DebugUI
         m_dlssCanRetry = canRetry;
         m_dlssState = std::move(state);
         m_dlssDetail = std::move(detail);
+    }
+
+    // FG.1: DLSS Frame Generation's capability and feature slot, refreshed by the renderer when they change. FG.3: whether
+    // it is available on this PC, for the Project Settings toggle.
+    void SetFrameGenerationReadout(std::string state, std::string detail, bool available)
+    {
+        m_frameGenerationState = std::move(state);
+        m_frameGenerationDetail = std::move(detail);
+        m_frameGenerationAvailable = available;
+    }
+
+    const std::string& GetFrameGenerationState() const noexcept
+    {
+        return m_frameGenerationState;
+    }
+
+    bool IsFrameGenerationAvailable() const noexcept
+    {
+        return m_frameGenerationAvailable;
+    }
+
+    // NVIDIA Reflex: what the last frame requested and what the driver reports, refreshed by the renderer every frame.
+    void SetReflexStatus(const ReflexStatus& status)
+    {
+        m_reflexStatus = status;
+    }
+
+    const ReflexStatus& GetReflexStatus() const noexcept
+    {
+        return m_reflexStatus;
     }
 
     // RR.1A: DLSS Ray Reconstruction's capability and feature slot. RR.1D: its requested/effective state and whether a
@@ -595,15 +666,19 @@ class DebugUI
 
     int m_requestedEnvironmentIndex = -1;
 
-    // ReSTIR PT Enhanced reuse toggles (SetRestirPtReuse / ConsumeRestirPtReuseChange).
+    // ReSTIR PT Enhanced reuse toggles (SetRestirPtReuse / ConsumeRestirPtReuseChange). The Renderer seeds every value at
+    // startup; these initial values match its launch defaults.
     bool m_restirPtTemporalReuse = false;
-    bool m_restirPtSpatialReuse = false;
+    bool m_restirPtSpatialReuse = true;
     bool m_restirPtReuseChanged = false;
     int m_restirPtSpatialPairs = 3;
-    int m_restirPtStagnancyMode = 0;
-    bool m_restirPtFirefly = false;
+    int m_restirPtStagnancyMode = 1;
+    bool m_restirPtFirefly = true;
+    bool m_restirPtMirrorX1 = true;
+    bool m_restirPtDirectReservoir = true;
+    bool m_restirPtLightBounce = true;
     bool m_restirPtRegir = true;
-    bool m_restirPtRegirWindow32 = false;
+    bool m_restirPtRegirWindow32 = true;
     int m_restirPtRegirSpatialPairs = 0;
     int m_restirPtRegirSlots = 512;
     bool m_restirPtRegirCone = true;
@@ -636,6 +711,7 @@ class DebugUI
     std::string m_pathTraceDenoiserPreparation;
     PathTraceDenoiserStages m_pathTraceDenoiserStages{};
     std::string m_dlssState = "Not initialized";
+    ReflexStatus m_reflexStatus;
     bool m_dlssRetry = false;
     bool m_dlssCanRetry = false;
     bool m_dlssInputPreparation = false;
@@ -643,6 +719,9 @@ class DebugUI
     std::string m_rayReconstructionState = "Not initialized";
     std::string m_rayReconstructionDetail;
     bool m_rayReconstructionCanRetry = false;
+    std::string m_frameGenerationState = "Not initialized";
+    std::string m_frameGenerationDetail;
+    bool m_frameGenerationAvailable = false;
     // UPSCALING.2C/3C: 0 = 100% (Native), 1 = 75% (diagnostic resolve), 2 = 75% DLSS (experimental).
     int m_pathTraceRenderScale = 0;
     bool m_pathTraceCameraJitterActive = false;

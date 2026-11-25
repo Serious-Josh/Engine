@@ -19,6 +19,12 @@ class ProjectAssetRegistry
         std::vector<AssetRecord> GetAssets() const;
         std::vector<AssetRecord> GetAssets(AssetType type) const;
 
+        // Every record in registration order, without a copy. Invalidated by any registry change.
+        const std::vector<AssetRecord>& GetRecords() const noexcept
+        {
+            return m_records;
+        }
+
         bool UpdatePath(const AssetID& id, const std::filesystem::path& newRelativePath);
         bool UpdateMeshImportUnits(const AssetID& id, const MeshImportUnits& units);
         bool Unregister(const AssetID& id);

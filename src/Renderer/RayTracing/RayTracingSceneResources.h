@@ -30,6 +30,7 @@ class CommandContext;
 class Renderer;
 class FileSceneRuntime;
 class FileSceneAssetCatalog;
+class BLASMemoryPool;
 
 struct SceneBLASRetirementBatchIdentity
 {
@@ -288,6 +289,13 @@ class RayTracingSceneResources
         const Mesh* mesh,
         const TLASGeometryRecordingEvidence& evidence) const;
 
+    // Every BLAS built from here on places its result in this pool (null: a committed buffer per BLAS). The pool must
+    // outlive every BLAS, so its owner sets it once and shuts it down after this object's final Shutdown.
+    void SetBLASMemoryPool(BLASMemoryPool* pool)
+    {
+        m_blasMemoryPool = pool;
+    }
+
     void Shutdown();
 
     const TopLevelAccelerationStructure& GetTopLevel() const;
@@ -505,6 +513,8 @@ class RayTracingSceneResources
     // One independently owned candidate; manager pin prevents destruction on
     // handle cancellation while recorded/submitted work still references it.
     std::shared_ptr<CandidateState> m_candidate;
+
+    BLASMemoryPool* m_blasMemoryPool = nullptr;
 
     // Explicit Shutdown releases membership before the registry. Keep the same
     // reverse declaration order for any future owning destructors as well.

@@ -91,6 +91,12 @@ class CommandContext
 
     uint64_t GetFrameFenceValue(unsigned int frameIndex) const;
 
+    // FG.2: the frame queue's fence, which the Frame Generation present thread waits on (read-only use: it never signals).
+    ID3D12Fence* GetFence() const
+    {
+        return m_fence;
+    }
+
     // Single-threaded, like submission. Capture immediately after successful
     // Execute, before another Execute. Idle signals never become capturable.
     // At most eight retained tokens; exhaustion returns an invalid token.

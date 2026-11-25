@@ -29,6 +29,12 @@ if(EXISTS "@ENGINE_SHARC_ROOT@/License.md")
     string(APPEND notices "===== NVIDIA SHARC v1.8.3 (NVIDIA RTXGI SDK) =====\n${text}\n\n")
 endif()
 
+# NVIDIA NVAPI (Reflex): its MIT-licensed static library is linked into the executable when the SDK is available.
+if("@ENGINE_NVAPI_AVAILABLE@" AND EXISTS "@ENGINE_NVAPI_LICENSE@")
+    file(READ "@ENGINE_NVAPI_LICENSE@" text)
+    string(APPEND notices "===== NVIDIA NVAPI SDK =====\n${text}\n\n")
+endif()
+
 # Dear ImGui ships no license file in external/imgui; Engine keeps its MIT text beside these scripts.
 file(READ "${source}/cmake/ImGuiLicense.txt" text)
 string(APPEND notices "===== Dear ImGui =====\n${text}\n\n")

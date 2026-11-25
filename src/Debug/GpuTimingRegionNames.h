@@ -61,5 +61,6 @@ inline constexpr const char* GpuTimingRegionNames[] = {"GPU frame",
                                                        "ReSTIR PT spatial resample",
                                                        "ReSTIR PT temporal reuse",
                                                        "ReSTIR PT duplication map",
-                                                       "ReSTIR PT ReGIR"};
+                                                       "ReSTIR PT ReGIR",
+                                                       "DLSS Frame Generation"};
 static_assert(sizeof(GpuTimingRegionNames) / sizeof(GpuTimingRegionNames[0]) == GpuTimingMonitor::RegionCount);

@@ -41,6 +41,9 @@ namespace CpuTiming
         double execute = 0.0;
         double executeInterval = 0.0;
         double present = 0.0;
+
+        // NvAPI_D3D_Sleep at the start of the frame (Engine::Frame, before input); 0 while NVIDIA Reflex is off.
+        double reflexSleep = 0.0;
     };
 
     // Includes all function exits and local cleanup in the enclosing duration.

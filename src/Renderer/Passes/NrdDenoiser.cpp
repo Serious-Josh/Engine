@@ -3,6 +3,7 @@
 #endif
 
 #include "Renderer/Passes/NrdDenoiser.h"
+#include "Debug/MemoryRegistry.h"
 #include "Debug/TransitionTiming.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Math/Matrix4.h"
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <system_error>
 
 namespace
 {
@@ -80,6 +82,94 @@ bool NrdDenoiser::Initialize(
     uint32_t height,
     const Description& description)
 {
+    if(!AcceptDescription(device, graphicsQueue, width, height, description))
+    {
+        return false;
+    }
+
+    if(!Recreate(descriptorHeap, width, height))
+    {
+        Shutdown();
+        return false;
+    }
+
+    return true;
+}
+
+bool NrdDenoiser::BeginInitialize(
+    ID3D12Device* device,
+    ID3D12CommandQueue* graphicsQueue,
+    uint32_t width,
+    uint32_t height,
+    const Description& description)
+{
+    if(m_creationThread.joinable() || !AcceptDescription(device, graphicsQueue, width, height, description))
+    {
+        return false;
+    }
+
+    m_creationWidth = width;
+    m_creationHeight = height;
+    m_creationResult = nrd::Result::FAILURE;
+    m_creationFinished.store(false, std::memory_order_relaxed);
+
+    try
+    {
+        m_creationThread = std::thread([this, width, height]()
+        {
+            const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+            m_creationResult = CreateSdkInstance(width, height);
+            m_creationFinished.store(true, std::memory_order_release);
+        });
+    }
+    catch(const std::system_error&)
+    {
+        Shutdown();
+        return false;
+    }
+
+    return true;
+}
+
+NrdDenoiser::CreationProgress NrdDenoiser::FinishInitialize(DescriptorHeap& descriptorHeap, bool wait)
+{
+    if(IsInitialized())
+    {
+        return CreationProgress::Initialized;
+    }
+
+    if(!m_creationThread.joinable())
+    {
+        return CreationProgress::None;
+    }
+
+    if(!wait && !m_creationFinished.load(std::memory_order_acquire))
+    {
+        return CreationProgress::Running;
+    }
+
+    m_creationThread.join();
+
+    // A failed SDK creation already destroyed what it had created; Shutdown clears the description.
+    if(m_creationResult != nrd::Result::SUCCESS)
+    {
+        Log::Error("Failed to create NRD instance '" + m_description.name + "'. nrd::Result: " +
+            std::to_string(static_cast<uint32_t>(m_creationResult)));
+        Shutdown();
+        return CreationProgress::Failed;
+    }
+
+    return CreateOutputs(descriptorHeap, m_creationWidth, m_creationHeight) ? CreationProgress::Initialized :
+        CreationProgress::Failed;
+}
+
+bool NrdDenoiser::AcceptDescription(
+    ID3D12Device* device,
+    ID3D12CommandQueue* graphicsQueue,
+    uint32_t width,
+    uint32_t height,
+    const Description& description)
+{
     if (m_device ||
         !device ||
         !graphicsQueue ||
@@ -130,12 +220,6 @@ bool NrdDenoiser::Initialize(
         m_denoisers[index].description = description.denoisers[index];
     }
 
-    if (!Recreate(descriptorHeap, width, height))
-    {
-        Shutdown();
-        return false;
-    }
-
     return true;
 }
 
@@ -149,6 +233,12 @@ bool NrdDenoiser::Resize(
 
 void NrdDenoiser::Shutdown()
 {
+    // A background creation still running owns m_integration until it finishes.
+    if(m_creationThread.joinable())
+    {
+        m_creationThread.join();
+    }
+
     // Destroy waits for the GPU (autoWaitForIdle) before the outputs it may still be writing are released. An externally
     // synchronized instance (ER.1 Phase 3.1) does not wait: its caller proved that no submitted work references it.
     m_integration.Destroy();
@@ -184,6 +274,7 @@ bool NrdDenoiser::Recreate(
 {
     if (!m_device ||
         !m_graphicsQueue ||
+        m_creationThread.joinable() ||
         width == 0 ||
         height == 0 ||
         width > (std::numeric_limits<uint16_t>::max)() ||
@@ -201,6 +292,21 @@ bool NrdDenoiser::Recreate(
     m_width = 0;
     m_height = 0;
 
+    const nrd::Result result = CreateSdkInstance(width, height);
+
+    if (result != nrd::Result::SUCCESS)
+    {
+        Log::Error("Failed to recreate NRD instance '" + m_description.name + "'. nrd::Result: " +
+                   std::to_string(static_cast<uint32_t>(result)));
+        Shutdown();
+        return false;
+    }
+
+    return CreateOutputs(descriptorHeap, width, height);
+}
+
+nrd::Result NrdDenoiser::CreateSdkInstance(uint32_t width, uint32_t height)
+{
     nrd::IntegrationCreationDesc integrationDesc{};
 
     std::strncpy(integrationDesc.name, m_description.name.c_str(), sizeof(integrationDesc.name) - 1);
@@ -240,16 +346,11 @@ bool NrdDenoiser::Recreate(
     deviceDesc.disableNVAPIInitialization = true;
 
     TransitionTiming::Scope er1Scope("NRD RecreateD3D12 " + m_description.name);
-    const nrd::Result result = m_integration.RecreateD3D12(integrationDesc, instanceDesc, deviceDesc);
+    return m_integration.RecreateD3D12(integrationDesc, instanceDesc, deviceDesc);
+}
 
-    if (result != nrd::Result::SUCCESS)
-    {
-        Log::Error("Failed to recreate NRD instance '" + m_description.name + "'. nrd::Result: " +
-                   std::to_string(static_cast<uint32_t>(result)));
-        Shutdown();
-        return false;
-    }
-
+bool NrdDenoiser::CreateOutputs(DescriptorHeap& descriptorHeap, uint32_t width, uint32_t height)
+{
     // R.1: the new pool's initial states (no recording has used it).
     std::vector<nri::AccessLayoutStage> poolStates(m_integration.GetPoolStateNum());
     m_integration.GetPoolStates(poolStates.data());

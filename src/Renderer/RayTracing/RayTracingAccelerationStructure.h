@@ -7,6 +7,7 @@
 #include <optional>
 #include <vector>
 
+class BLASMemoryPool;
 class Mesh;
 
 enum class RayTracingAccelerationStructureBuildPreference
@@ -35,6 +36,9 @@ struct RayTracingBottomLevelDescription
 
     RayTracingAccelerationStructureBuildPreference buildPreference =
         RayTracingAccelerationStructureBuildPreference::FastTrace;
+
+    // Where the result is placed: a range of this pool, or a committed buffer of its own when null.
+    BLASMemoryPool* memoryPool = nullptr;
 };
 
 struct RayTracingInstanceDescription

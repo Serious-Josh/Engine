@@ -88,6 +88,87 @@ float3 EvaluateEONDiffuse(
     return singleScatter + multipleScatter;
 }
 
+// EON diffuse split into its light-independent part (prepared once per shading point) and its per-light part, so a
+// caller that evaluates many light directions at one point does the view work once. Every term keeps
+// EvaluateEONDiffuse's expression and order, so both forms agree bit for bit under strict IEEE. EvaluateEONDiffuse
+// keeps its own single-direction form on purpose: routing it through these pieces made ReSTIR PT's spatial-pairs
+// kernel 0.75 ms slower on Tri-Test (2026-11-24).
+struct EONDiffusePrepared
+{
+    // saturate(roughness) and saturate(n . v).
+    float roughness;
+    float normalDotView;
+    // albedo INV_PI A, the single-scatter term's factor in front of (1 + roughness s / t).
+    float3 singleScatterScale;
+    // The multiple-scatter albedo times INV_PI and max(1e-6, 1 - E(v)), and max(1e-6, 1 - E_avg).
+    float3 multipleScatterView;
+    float averageDenominator;
+};
+
+EONDiffusePrepared PrepareEONDiffuse(
+    float3 albedo,
+    float roughness,
+    float3 normal,
+    float3 viewDirection)
+{
+    EONDiffusePrepared prepared;
+    prepared.roughness = saturate(roughness);
+    prepared.normalDotView = saturate(dot(normal, viewDirection));
+
+    float A = 1.0f / (1.0f + EON_CONSTANT_1 * prepared.roughness);
+    prepared.singleScatterScale = albedo * INV_PI * A;
+
+    float viewAlbedo = EvaluateFONDirectionalAlbedo(prepared.normalDotView, prepared.roughness);
+    float averageAlbedo = A * (1.0f + EON_CONSTANT_2 * prepared.roughness);
+    float3 multipleScatterAlbedo =
+        (albedo * albedo) *
+        averageAlbedo /
+        max(
+            float3(1.0e-6f, 1.0e-6f, 1.0e-6f),
+            1.0f - albedo * (1.0f - averageAlbedo)
+        );
+
+    prepared.multipleScatterView = multipleScatterAlbedo * INV_PI * max(1.0e-6f, 1.0f - viewAlbedo);
+    prepared.averageDenominator = max(1.0e-6f, 1.0f - averageAlbedo);
+    return prepared;
+}
+
+float3 EvaluateEONDiffusePrepared(
+    EONDiffusePrepared prepared,
+    float3 normal,
+    float3 lightDirection,
+    float3 viewDirection)
+{
+    float NdotL = saturate(dot(normal, lightDirection));
+    float NdotV = prepared.normalDotView;
+
+    if(NdotL <= 0.0f || NdotV <= 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    float s = dot(lightDirection, viewDirection) - NdotL * NdotV;
+    float sOverT;
+
+    if(s > 0.0f)
+    {
+        sOverT = s / max(NdotL, NdotV);
+    }
+    else
+    {
+        sOverT = s;
+    }
+
+    float3 singleScatter = prepared.singleScatterScale * (1.0f + prepared.roughness * sOverT);
+    float lightAlbedo = EvaluateFONDirectionalAlbedo(NdotL, prepared.roughness);
+    float3 multipleScatter =
+        prepared.multipleScatterView *
+        max(1.0e-6f, 1.0f - lightAlbedo) /
+        prepared.averageDenominator;
+
+    return singleScatter + multipleScatter;
+}
+
 float DistributionGGX(
     float3 normal,
     float3 halfVector,
@@ -114,6 +195,33 @@ float DistributionGGX(
         (PI * denominator * denominator);
 }
 
+// Height-correlated Smith G's square-root term for one direction: sqrt(max(0, mu^2 (1 - alpha^2) + alpha^2)).
+// GeometrySmithGGXPrepared takes the view's as a precomputed input.
+float GeometrySmithGGXRoot(
+    float cosine,
+    float alphaSquared)
+{
+    return sqrt(max(
+        0.0f,
+        cosine * cosine * (1.0f - alphaSquared) +
+        alphaSquared
+    ));
+}
+
+float GeometrySmithGGXPrepared(
+    float NdotL,
+    float NdotV,
+    float alphaSquared,
+    float viewRoot)
+{
+    float lambdaL = NdotV * GeometrySmithGGXRoot(NdotL, alphaSquared);
+    float lambdaV = NdotL * viewRoot;
+
+    return
+        (2.0f * NdotL * NdotV) /
+        max(lambdaL + lambdaV, 1.0e-6f);
+}
+
 float GeometrySmithGGX(
     float NdotL,
     float NdotV,
@@ -123,25 +231,7 @@ float GeometrySmithGGX(
     float alpha = perceptualRoughness * perceptualRoughness;
     float alphaSquared = alpha * alpha;
 
-    float lambdaL =
-        NdotV *
-        sqrt(max(
-            0.0f,
-            NdotL * NdotL * (1.0f - alphaSquared) +
-            alphaSquared
-        ));
-
-    float lambdaV =
-        NdotL *
-        sqrt(max(
-            0.0f,
-            NdotV * NdotV * (1.0f - alphaSquared) +
-            alphaSquared
-        ));
-
-    return
-        (2.0f * NdotL * NdotV) /
-        max(lambdaL + lambdaV, 1.0e-6f);
+    return GeometrySmithGGXPrepared(NdotL, NdotV, alphaSquared, GeometrySmithGGXRoot(NdotV, alphaSquared));
 }
 
 float3 FresnelSchlick(

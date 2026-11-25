@@ -5,6 +5,9 @@
 #include <d3d12.h>
 #include <vector>
 #include <cstdint>
+#include <memory>
+
+class BLASMemoryAllocation;
 
 struct BLASRetirementBatchIdentity
 {
@@ -47,8 +50,11 @@ class BottomLevelAccelerationStructure
     void Shutdown();
 
     D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const;
-    // Borrow for independent candidate lifetime pinning; registry retains ownership.
-    ID3D12Resource* GetResource() const { return m_resource; }
+    // The buffer that holds the result: a BLAS memory pool block shared with other BLASes, or a committed buffer of its
+    // own without a pool. Not an identity: compare GetGPUAddress() instead.
+    ID3D12Resource* GetResource() const;
+    // A reference for independent candidate lifetime pinning; the registry retains ownership of the BLAS.
+    const std::shared_ptr<const BLASMemoryAllocation>& GetResultAllocation() const { return m_result; }
 
     private:
     bool InitializeBuild(
@@ -56,14 +62,14 @@ class BottomLevelAccelerationStructure
         ID3D12GraphicsCommandList4* commandList,
         const RayTracingBottomLevelDescription& description);
 
-    ID3D12Resource* m_resource = nullptr;
+    std::shared_ptr<const BLASMemoryAllocation> m_result;
     ID3D12Resource* m_scratchResource = nullptr;
 
     struct RetiredBatch
     {
         BLASRetirementBatchIdentity identity{};
 
-        ID3D12Resource* result = nullptr;
+        std::shared_ptr<const BLASMemoryAllocation> result;
         ID3D12Resource* scratch = nullptr;
     };
 

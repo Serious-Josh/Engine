@@ -3,6 +3,7 @@
 #include "Debug/DebugUI.h"
 #include "Debug/LightingModeTransitionPresentation.h"
 #include "DemoContent/FileBackedDemoScene.h"
+#include "Engine/RenderingConfigurationResolver.h"
 #include "Engine/RenderingOverrides.h"
 #include "imgui.h"
 
@@ -91,6 +92,45 @@ namespace
             "Saving a different value here clears that override.");
     }
 
+    // NVIDIA Reflex Low Latency's dropdown. While DLSS Frame Generation is requested, Reflex runs at On (NVIDIA requires it
+    // and forbids turning it off meanwhile), so the dropdown shows On, disabled; the saved choice stays for when it is off.
+    void DrawReflexSetting(const DebugUI& debugUI, RenderingSettings& draft)
+    {
+        const char* reflexModes[] = {"Off", "On", "On + Boost"};
+        constexpr const char* label = "NVIDIA Reflex Low Latency";
+
+        if(IsFrameGenerationRequested(draft))
+        {
+            ProjectReflexMode required = ProjectReflexMode::On;
+            ImGui::BeginDisabled();
+            DraftCombo(label, required, reflexModes);
+            ImGui::EndDisabled();
+            Tooltip("DLSS Frame Generation requires NVIDIA Reflex, so it stays On while Frame Generation is on.\n"
+                "The saved choice applies again when Frame Generation is off.");
+            ImGui::SameLine();
+            ImGui::TextDisabled("(set by Frame Generation)");
+        }
+        else
+        {
+            DraftCombo(label, draft.latency.reflex, reflexModes);
+            Tooltip("NVIDIA Reflex reduces system latency and increases PC responsiveness, in the Editor and in built games.\n"
+                "On + Boost also keeps the GPU at its maximum clocks: slightly lower latency in CPU-bound frames, at a slightly\n"
+                "lower frame rate and higher GPU power.");
+        }
+
+        const ReflexAvailability availability = debugUI.GetReflexStatus().availability;
+        const bool unavailableHere = availability == ReflexAvailability::NotCompiled ||
+            availability == ReflexAvailability::NvapiUnavailable || availability == ReflexAvailability::Unsupported;
+
+        if(unavailableHere)
+        {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("Not available on this PC: %s. Built games use the saved mode wherever Reflex is supported.",
+                ReflexAvailabilityName(availability));
+            ImGui::PopTextWrapPos();
+        }
+    }
+
     const char* PsrChainName(std::uint32_t chain)
     {
         if(chain >= 2u)
@@ -99,6 +139,54 @@ namespace
         }
 
         return chain == 1u ? "single-bounce" : "off";
+    }
+
+    // The Lighting Mode list offers Path Tracing once per estimator. Both Path Tracing entries save lightingMode
+    // "pathTracing"; the entry also saves rendering.pathTracing.estimator, so the project file format is unchanged.
+    enum class LightingModeChoice
+    {
+        Legacy,
+        ReferencePathTracer,
+        PathTracingReSTIRDI,
+        PathTracingReSTIRPT
+    };
+
+    LightingModeChoice GetLightingModeChoice(const RenderingSettings& rendering)
+    {
+        if(rendering.lightingMode == ProjectLightingMode::Legacy)
+        {
+            return LightingModeChoice::Legacy;
+        }
+
+        if(rendering.lightingMode == ProjectLightingMode::ReferencePathTracer)
+        {
+            return LightingModeChoice::ReferencePathTracer;
+        }
+
+        const bool restirPt = rendering.pathTracing.estimator == ProjectPathTraceEstimator::ReSTIRPTEnhanced;
+        return restirPt ? LightingModeChoice::PathTracingReSTIRPT : LightingModeChoice::PathTracingReSTIRDI;
+    }
+
+    // Legacy and Reference leave the estimator as it is (every mode's settings are always kept).
+    void ApplyLightingModeChoice(LightingModeChoice choice, RenderingSettings& rendering)
+    {
+        switch(choice)
+        {
+        case LightingModeChoice::Legacy:
+            rendering.lightingMode = ProjectLightingMode::Legacy;
+            break;
+        case LightingModeChoice::ReferencePathTracer:
+            rendering.lightingMode = ProjectLightingMode::ReferencePathTracer;
+            break;
+        case LightingModeChoice::PathTracingReSTIRDI:
+            rendering.lightingMode = ProjectLightingMode::PathTracing;
+            rendering.pathTracing.estimator = ProjectPathTraceEstimator::ReSTIRDI;
+            break;
+        case LightingModeChoice::PathTracingReSTIRPT:
+            rendering.lightingMode = ProjectLightingMode::PathTracing;
+            rendering.pathTracing.estimator = ProjectPathTraceEstimator::ReSTIRPTEnhanced;
+            break;
+        }
     }
 }
 
@@ -496,8 +584,8 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
 
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("Saved in ProjectSettings.json and packaged by Build Game. Built games render every lighting "
-        "mode, PSR, SHARC and DLSS. DLSS needs nvngx_dlss.dll beside the game's executable, which Build Game does not "
-        "ship yet; without it the game renders at Native.");
+        "mode except Path Tracing (ReSTIR-PT), which is Editor only, and PSR, SHARC and DLSS. DLSS needs nvngx_dlss.dll "
+        "beside the game's executable, which Build Game does not ship yet; without it the game renders at Native.");
     ImGui::PopTextWrapPos();
     const std::size_t overrides = CountOverrides(debugUI.GetRenderingOverrides());
 
@@ -510,9 +598,21 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
     ImGui::BeginDisabled(!editable);
 
     ImGui::SeparatorText("General");
-    const char* lightingModes[] = {"Legacy", "Reference Path Tracer", "Path Tracing (Raster Primary + ReSTIR DI)"};
-    DraftCombo("Lighting Mode", draft.lightingMode, lightingModes);
-    SessionOverrideNote(debugUI, Field::lightingMode);
+    const char* lightingModes[] = {"Legacy", "Reference Path Tracer", "Path Tracing (Raster Primary + ReSTIR DI)",
+        "Path Tracing (ReSTIR-PT)"};
+    LightingModeChoice lightingModeChoice = GetLightingModeChoice(draft);
+
+    if(DraftCombo("Lighting Mode", lightingModeChoice, lightingModes))
+    {
+        ApplyLightingModeChoice(lightingModeChoice, draft);
+    }
+
+    Tooltip("Path Tracing (ReSTIR-PT) is the experimental ReSTIR PT Enhanced renderer: one path reservoir for direct and\n"
+        "indirect light. It is Editor only; built games render Path Tracing (Raster Primary + ReSTIR DI) instead.");
+    const bool pathTracingChoice = lightingModeChoice == LightingModeChoice::PathTracingReSTIRDI ||
+        lightingModeChoice == LightingModeChoice::PathTracingReSTIRPT;
+    const bool estimatorOverridden = pathTracingChoice && IsOverridden(debugUI.GetRenderingOverrides(), Field::estimator);
+    SessionOverrideNote(debugUI, estimatorOverridden ? Field::estimator : Field::lightingMode);
     const char* toneMappers[] = {"AgX", "GT7"};
     DraftCombo("Tonemapper", draft.toneMapper, toneMappers);
     Tooltip("Final display mapping only; the lighting and accumulation are unchanged.");
@@ -530,6 +630,24 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
     Tooltip("What the quality's resolution scales: the scene's render resolution (lower under DLSS or a render scale) or the\n"
         "output image. The fog is always composited at the output.");
     SessionOverrideNote(debugUI, Field::volumetricResolutionBasis);
+
+    // FG.3: DLSS Frame Generation (2x), in every lighting mode, Editor viewport only for now.
+    ImGui::SeparatorText("DLSS Frame Generation");
+    ImGui::Checkbox("Frame Generation (2x)", &draft.frameGeneration.enabled);
+    Tooltip("Frame Generation boosts frame rates by using AI to render additional frames: one between each pair of\n"
+        "rendered frames. Needs a GeForce RTX 40 Series GPU or newer, turns NVIDIA Reflex Low Latency on, and adds some\n"
+        "latency. Editor viewport only for now: built games keep the setting and ignore it.");
+
+    if(!debugUI.IsFrameGenerationAvailable())
+    {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("Frame Generation: %s", debugUI.GetFrameGenerationState().c_str());
+        ImGui::PopTextWrapPos();
+    }
+
+    // NVIDIA Reflex Low Latency, in every lighting mode, with NVIDIA's name and modes (RTX UI Developer Guidelines).
+    ImGui::SeparatorText("Latency");
+    DrawReflexSetting(debugUI, draft);
 
     if(draft.lightingMode == ProjectLightingMode::Legacy)
     {
@@ -606,13 +724,8 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
         SessionOverrideNote(debugUI, Field::dlssQuality);
         ImGui::EndDisabled();
 
+        // The estimator is chosen by the Lighting Mode entry above.
         ImGui::SeparatorText("Path tracing and denoising");
-        const char* estimators[] = {"ReSTIR DI (production)", "ReSTIR PT Enhanced (experimental)"};
-        DraftCombo("PT estimator", pathTracing.estimator, estimators);
-        Tooltip("ReSTIR DI with the indirect path tracer is production. ReSTIR PT Enhanced (M5, experimental, Editor only)\n"
-            "samples direct and indirect light into one path reservoir; it runs without PSR and SHARC, and packaged games\n"
-            "always render ReSTIR DI.");
-        SessionOverrideNote(debugUI, Field::estimator);
         ImGui::Checkbox("PT camera jitter (experimental)", &pathTracing.cameraJitter);
         SessionOverrideNote(debugUI, Field::cameraJitter);
         const char* denoisers[] = {"Off", "Engine", "NRD REBLUR (experimental)", "NRD RELAX (experimental)",
@@ -642,9 +755,17 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
         SessionOverrideNote(debugUI, Field::uncertaintyFloorLog10);
 
         ImGui::SeparatorText("SHARC");
+        const bool restirPt = lightingModeChoice == LightingModeChoice::PathTracingReSTIRPT;
+        ImGui::BeginDisabled(restirPt);
         ImGui::Checkbox("Enable SHARC (experimental)", &pathTracing.sharc);
         Tooltip("Cached radiance for path continuation. Its tuning stays in the Debug panel.");
         SessionOverrideNote(debugUI, Field::sharc);
+        ImGui::EndDisabled();
+
+        if(restirPt)
+        {
+            ImGui::TextDisabled("ReSTIR-PT uses its own SHARC radiance cache at x3 (Debug panel, on by default).");
+        }
     }
 
     ImGui::EndDisabled();
@@ -762,6 +883,17 @@ void Editor::DrawRenderingRuntimeStatus(const DebugUI& debugUI)
     if(!status.dlssDetail.empty())
     {
         ImGui::TextWrapped("%s", status.dlssDetail.c_str());
+    }
+
+    ImGui::TextWrapped("DLSS Frame Generation: %s", debugUI.GetFrameGenerationState().c_str());
+    const ReflexStatus& reflex = debugUI.GetReflexStatus();
+    ImGui::TextWrapped("NVIDIA Reflex: %s", DescribeReflexStatus(reflex).c_str());
+
+    if(reflex.latencyValid)
+    {
+        ImGui::Text("Render latency %.1f ms (simulation start to GPU end, %u frames); GPU frame %.1f ms; last sleep %.2f ms",
+            reflex.averageRenderLatencyMilliseconds, reflex.latencyFrames, reflex.averageGpuFrameMilliseconds,
+            reflex.lastSleepMilliseconds);
     }
 
     if(status.pathTraceActiveLastFrame)

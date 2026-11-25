@@ -2,6 +2,7 @@
 #include "InspectorNumericDrag.h"
 #include "EditorWorkspace.h"
 #include "EditorIcons.h"
+#include "EditorFilesystemCache.h"
 #include "Project/ProjectManifest.h"
 #include "Math/Math.h"
 #include "assets/ProjectAssetResolver.h"
@@ -315,7 +316,7 @@ std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> InspectorPanel::GetSceneMeshThumbnail
     const auto* record = id ? registry.Find(*id) : nullptr;
 
     if(!m_thumbnailRenderer || !record || record->type != AssetType::Mesh ||
-        ProjectAssetResolver::Resolve(paths, registry, *id).status != AssetAvailability::Available)
+        ResolveAvailability(paths, registry, *id) != AssetAvailability::Available)
     {
         ReleaseSceneObjectPreview();
         return std::nullopt;
@@ -1035,6 +1036,7 @@ void InspectorPanel::LoadSelection(
     m_textureSearch.fill(0);
     m_texturePickerRegistry.clear();
     m_textureChoices.clear();
+    ++m_textureChoicesGeneration;
     m_refreshTextureChoices = true;
     m_projectRoot = paths.GetRoot();
     m_savedMaterial.reset();
@@ -1398,7 +1400,7 @@ void InspectorPanel::DrawTextureReference(
         {
             display = record->relativePath.filename().string();
             description = record->relativePath.generic_string();
-            const auto availability = ProjectAssetResolver::Resolve(paths, registry, record->id).status;
+            const auto availability = ResolveAvailability(paths, registry, record->id);
             missing = availability != AssetAvailability::Available;
 
             description += "\n";
@@ -1494,6 +1496,9 @@ void InspectorPanel::DismissTexturePicker()
     PruneTexturePickerRequests(true);
     m_texturePicker.reset();
     m_texturePickerError.clear();
+
+    // Opening the picker always starts from a fresh scan.
+    m_texturePickerListing.reset();
 }
 
 void InspectorPanel::PruneTexturePickerRequests(bool all)
@@ -1631,6 +1636,18 @@ void InspectorPanel::RefreshTextureChoices(const ProjectAssetRegistry& registry)
         });
     m_texturePickerRegistry = textures;
     m_refreshTextureChoices = false;
+    ++m_textureChoicesGeneration;
+}
+
+AssetAvailability InspectorPanel::ResolveAvailability(const ProjectPaths& paths, const ProjectAssetRegistry& registry,
+    const AssetID& id)
+{
+    if(m_assetAvailability)
+    {
+        return m_assetAvailability->Find(paths, registry, id);
+    }
+
+    return ProjectAssetResolver::Resolve(paths, registry, id).status;
 }
 
 namespace
@@ -1736,47 +1753,112 @@ bool InspectorPanel::DrawTextureTile(const AssetRecord& texture, float extent, b
     return pressed;
 }
 
-void InspectorPanel::DrawTextureGrid(TextureSlot slot, const ProjectPaths& paths,
-    const ProjectAssetRegistry& registry)
+const InspectorPanel::TexturePickerListing& InspectorPanel::GetTexturePickerListing(const ProjectPaths& paths)
 {
+    const auto now = std::chrono::steady_clock::now();
+    const bool current = m_texturePickerListing &&
+        m_texturePickerListing->texturesDirectory.native() == paths.GetTexturesDirectory().native() &&
+        m_texturePickerListing->folder.native() == m_texturePickerFolder.native() &&
+        m_texturePickerListing->choicesGeneration == m_textureChoicesGeneration &&
+        now - m_texturePickerListing->scannedAt < TexturePickerRescanInterval;
+
+    if(current)
+    {
+        return *m_texturePickerListing;
+    }
+
+    TexturePickerListing listing;
+    listing.texturesDirectory = paths.GetTexturesDirectory();
+    listing.choicesGeneration = m_textureChoicesGeneration;
+    listing.scannedAt = now;
+
     // Only enumerate the current directory; canonical checks also exclude escaping junctions.
     std::error_code error;
     const auto root = std::filesystem::canonical(paths.GetTexturesDirectory(), error);
+
     if(error)
     {
-        ImGui::TextDisabled("Textures folder is unavailable.");
-        return;
+        listing.folder = m_texturePickerFolder;
+        m_texturePickerListing = std::move(listing);
+        return *m_texturePickerListing;
     }
+
+    listing.texturesAvailable = true;
     auto folder = root / m_texturePickerFolder;
     const auto resolvedFolder = std::filesystem::canonical(folder, error);
+
     if(error || !IsPathWithin(resolvedFolder, root))
     {
         m_texturePickerFolder.clear();
         folder = root;
     }
+
+    listing.folder = m_texturePickerFolder;
+    std::filesystem::directory_iterator entry(folder, error), end;
+
+    for(; !error && entry != end; entry.increment(error))
+    {
+        std::error_code childError;
+        const auto resolved = std::filesystem::canonical(entry->path(), childError);
+
+        if(childError || !IsPathWithin(resolved, root))
+        {
+            continue;
+        }
+
+        if(entry->is_directory(childError) && !childError)
+        {
+            listing.folders.push_back(entry->path().filename());
+        }
+    }
+
+    listing.readError = static_cast<bool>(error);
+    std::sort(listing.folders.begin(), listing.folders.end());
+    const auto shownFolder = (paths.GetTexturesDirectory() / m_texturePickerFolder).lexically_normal();
+
+    for(std::size_t index = 0; index < m_textureChoices.size(); ++index)
+    {
+        const auto& texture = m_textureChoices[index];
+
+        if(!ProjectAssetRegistry::PathsEqual((paths.GetRoot() / texture.relativePath).lexically_normal().parent_path(), shownFolder))
+        {
+            continue;
+        }
+
+        std::error_code textureError;
+        const auto resolved = std::filesystem::canonical(paths.GetRoot() / texture.relativePath, textureError);
+
+        if(!textureError && IsPathWithin(resolved, root))
+        {
+            listing.textures.push_back(index);
+        }
+    }
+
+    m_texturePickerListing = std::move(listing);
+    return *m_texturePickerListing;
+}
+
+void InspectorPanel::DrawTextureGrid(TextureSlot slot, const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry)
+{
+    // The scan is drawn as it was taken; the Textures root and the folder's checks run again on every rescan.
+    const TexturePickerListing& listing = GetTexturePickerListing(paths);
+
+    if(!listing.texturesAvailable)
+    {
+        ImGui::TextDisabled("Textures folder is unavailable.");
+        return;
+    }
+
     ImGui::TextUnformatted((std::filesystem::path("Textures") / m_texturePickerFolder).generic_string().c_str());
+
     if(!m_texturePickerFolder.empty() && ImGui::SmallButton("Up to parent folder"))
     {
         m_texturePickerFolder = m_texturePickerFolder.parent_path();
         return;
     }
-    std::vector<std::filesystem::path> folders;
-    std::filesystem::directory_iterator entry(folder, error), end;
-    for(; !error && entry != end; entry.increment(error))
-    {
-        std::error_code childError;
-        const auto resolved = std::filesystem::canonical(entry->path(), childError);
-        if(childError || !IsPathWithin(resolved, root))
-        {
-            continue;
-        }
-        if(entry->is_directory(childError) && !childError)
-        {
-            folders.push_back(entry->path().filename());
-        }
-    }
-    std::sort(folders.begin(), folders.end());
-    for(const auto& child : folders)
+
+    for(const auto& child : listing.folders)
     {
         const auto position = ImGui::GetCursorScreenPos();
         const float iconSize = ImGui::GetFontSize();
@@ -1796,7 +1878,8 @@ void InspectorPanel::DrawTextureGrid(TextureSlot slot, const ProjectPaths& paths
                 ImGui::GetColorU32(ImGuiCol_Text), child.string().c_str());
         }
     }
-    if(error)
+
+    if(listing.readError)
     {
         ImGui::TextDisabled("Unable to read this folder.");
     }
@@ -1813,20 +1896,10 @@ void InspectorPanel::DrawTextureGrid(TextureSlot slot, const ProjectPaths& paths
     std::transform(search.begin(), search.end(), search.begin(), lowercase);
     size_t matches = 0;
 
-    for(const auto& texture : m_textureChoices)
+    // A chosen texture dismisses the picker, which discards the listing; the loop ends right after it.
+    for(const std::size_t index : listing.textures)
     {
-        if(!ProjectAssetRegistry::PathsEqual(
-                (paths.GetRoot() / texture.relativePath).lexically_normal().parent_path(),
-                (paths.GetTexturesDirectory() / m_texturePickerFolder).lexically_normal()))
-        {
-            continue;
-        }
-        std::error_code textureError;
-        const auto resolved = std::filesystem::canonical(paths.GetRoot() / texture.relativePath, textureError);
-        if(textureError || !IsPathWithin(resolved, root))
-        {
-            continue;
-        }
+        const auto& texture = m_textureChoices[index];
         auto filtered = texture.relativePath.filename().string();
         std::transform(filtered.begin(), filtered.end(), filtered.begin(), lowercase);
 

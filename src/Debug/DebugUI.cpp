@@ -183,6 +183,7 @@ void DebugUI::DrawCpuTiming()
     static constexpr TimingRow rows[] = {
         {"Frame start-to-start", &CpuTiming::FrameSample::frameInterval, &CpuTiming::FrameSample::frameIntervalValid},
         {"Frame execution (incl. messages/UI)", &CpuTiming::FrameSample::frameExecution},
+        {"NVIDIA Reflex sleep (in frame execution)", &CpuTiming::FrameSample::reflexSleep},
         {"Renderer::Render total", &CpuTiming::FrameSample::render},
         {"CommandContext::Begin total", &CpuTiming::FrameSample::begin},
         {"Begin fence wait only", &CpuTiming::FrameSample::fenceWait},
@@ -503,7 +504,9 @@ bool DebugUI::Initialize(
 
     initInfo.Device = device;
     initInfo.CommandQueue = commandQueue;
-    initInfo.NumFramesInFlight = 2;
+    // FG.3: four, because a DLSS Frame Generation frame renders the UI twice (RenderUiOverGeneratedImage) and the backend
+    // takes the next vertex and index buffers on every RenderDrawData; two frames are in flight.
+    initInfo.NumFramesInFlight = 4;
     initInfo.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
     initInfo.DSVFormat = DXGI_FORMAT_D32_FLOAT;
@@ -1127,6 +1130,42 @@ void DebugUI::EndFrame(
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 }
 
+void DebugUI::RenderUiOverGeneratedImage(ID3D12GraphicsCommandList* commandList, std::uint64_t sceneTexture,
+    std::uint64_t generatedTexture)
+{
+    ImDrawData* const drawData = ImGui::GetDrawData();
+
+    if(!drawData || !drawData->Valid)
+    {
+        return;
+    }
+
+    // Stage 1: every draw of the scene image draws the generated image instead (user textures only; atlases untouched).
+    const auto scene = static_cast<ImTextureID>(sceneTexture);
+    const auto generated = static_cast<ImTextureID>(generatedTexture);
+    std::vector<ImDrawCmd*> replaced;
+
+    for(ImDrawList* list : drawData->CmdLists)
+    {
+        for(ImDrawCmd& command : list->CmdBuffer)
+        {
+            if(command.TexRef._TexData == nullptr && command.TexRef._TexID == scene)
+            {
+                command.TexRef._TexID = generated;
+                replaced.push_back(&command);
+            }
+        }
+    }
+
+    // Stage 2: the second submission of this frame's draw data (the backend's buffers allow four per two frames in flight).
+    ImGui_ImplDX12_RenderDrawData(drawData, commandList);
+
+    for(ImDrawCmd* command : replaced)
+    {
+        command->TexRef._TexID = scene;
+    }
+}
+
 void DebugUI::SetTLASUpdated(bool updated)
 {
     m_tlasUpdated = updated;
@@ -1555,6 +1594,18 @@ void DebugUI::DrawPathTraceReferenceSettings()
                 }
             }
 
+            // Residual boiling P1 (experimental): what a perfect mirror shows is lit with x1's light sampler and candidate
+            // count instead of the deep-vertex ones (proposal only; no history reset).
+            ImGui::Checkbox("Mirror reflections: x1 light sampling (experimental)", &m_restirPtMirrorX1);
+            // Residual boiling §5d option 2 (experimental): with a denoiser, the reservoir carries direct light only and
+            // bounce light is added fresh each frame (no decorrelation swap; firefly replacement uses the fresh direct
+            // estimate). Resets history.
+            ImGui::Checkbox("Reuse direct light only, fresh bounce light (experimental)", &m_restirPtDirectReservoir);
+            // Wall boiling (experimental): each pixel also traces one ray from a nearby light and connects its hit to the
+            // primary surface, MIS-combined with the BSDF bounce, so small bright lit patches no longer reach walls as rare
+            // single-frame spikes. Active with the option above, above 64 lights; no history reset (bounce light is fresh).
+            ImGui::Checkbox("Bounce light: light-traced connections (experimental)", &m_restirPtLightBounce);
+
             if(m_restirPtSpatialReuse && resolved.pathTrace.samplesPerFrame != 1u)
             {
                 ImGui::TextDisabled("Spatial reuse runs at 1 sample per frame only.");
@@ -1688,6 +1739,15 @@ void DebugUI::DrawPathTraceReferenceSettings()
     if(ImGui::TreeNode("Ray Reconstruction details"))
     {
         ImGui::TextWrapped("%s", m_rayReconstructionDetail.c_str());
+        ImGui::TreePop();
+    }
+
+    // FG.1: capability only; the Frame Generation toggle arrives with FG.3.
+    ImGui::TextWrapped("Frame Generation (2x): %s", m_frameGenerationState.c_str());
+
+    if(ImGui::TreeNode("Frame Generation details"))
+    {
+        ImGui::TextWrapped("%s", m_frameGenerationDetail.c_str());
         ImGui::TreePop();
     }
 

@@ -65,6 +65,52 @@ public:
 
     const std::string& FailureReason() const { return m_failure; }
 
+    // Lighting Mode switch hitch: both pipelines built before the first Ray Reconstruction frame, on a pipeline worker
+    // (free-threaded device calls and the worker's own ShaderLibrary), then adopted on the renderer thread. Created by the
+    // first frame instead, the PSR variant alone took about a second with a cold driver shader cache.
+    struct PreparedPipelines
+    {
+        ComputePipeline pipeline;
+        ComputePipeline psrPipeline;
+        bool ready = false;
+        bool psrReady = false;
+
+        // ComputePipeline releases nothing by itself; an adopted pipeline keeps its own references.
+        ~PreparedPipelines()
+        {
+            pipeline.Shutdown();
+            psrPipeline.Shutdown();
+        }
+    };
+
+    // Worker thread. Logs nothing: a set that failed is not adopted, and Ensure then creates (and reports) it as before.
+    static bool PreparePipelines(ID3D12Device* device, ShaderLibrary& shaderLibrary, PreparedPipelines& prepared)
+    {
+        std::string failure;
+        prepared.ready = BuildPipeline(device, shaderLibrary, false, prepared.pipeline, failure);
+        prepared.psrReady = prepared.ready && BuildPipeline(device, shaderLibrary, true, prepared.psrPipeline, failure);
+        return prepared.ready;
+    }
+
+    // Renderer thread: shares what PreparePipelines built (reference counted, so the prepared set may be released
+    // afterwards). A pipeline the pass already has is kept.
+    void AdoptPrepared(const PreparedPipelines& prepared)
+    {
+        if(prepared.ready && !m_pipelineReady)
+        {
+            m_pipeline.CopyFrom(prepared.pipeline);
+            m_pipelineReady = true;
+        }
+
+        if(prepared.psrReady && !m_psrPipelineReady && !m_psrPipelineFailed)
+        {
+            m_psrPipeline.CopyFrom(prepared.psrPipeline);
+            m_psrPipelineReady = true;
+        }
+    }
+
+    bool HasPipelines() const noexcept { return m_pipelineReady && m_psrPipelineReady; }
+
     // Creates the pipeline (and, with psr, its PSR variant) once and the targets for this extent (recreated when it
     // changes). diagnosticThroughput adds the throughput and second-mirror targets.
     bool Ensure(ID3D12Device* device, ShaderLibrary& shaderLibrary, DescriptorHeap& heap, unsigned int width,
@@ -288,6 +334,18 @@ private:
     // for the second mirror of a two-mirror chain.
     bool CreatePipeline(ID3D12Device* device, ShaderLibrary& shaderLibrary, bool psr, ComputePipeline& pipeline)
     {
+        if(!BuildPipeline(device, shaderLibrary, psr, pipeline, m_failure))
+        {
+            Log::Error(m_failure);
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool BuildPipeline(ID3D12Device* device, ShaderLibrary& shaderLibrary, bool psr, ComputePipeline& pipeline,
+        std::string& failure)
+    {
         ShaderDescription shaderDescription{};
         shaderDescription.path = psr ? "RrInputPreparationPsr.hlsl" : "RrInputPreparation.hlsl";
         shaderDescription.entryPoint = "CSMain";
@@ -296,8 +354,7 @@ private:
 
         if(!computeShader)
         {
-            m_failure = std::string("Failed to load ") + shaderDescription.path + ".";
-            Log::Error(m_failure);
+            failure = std::string("Failed to load ") + shaderDescription.path + ".";
             return false;
         }
 
@@ -335,8 +392,7 @@ private:
 
         if(!pipeline.Initialize(device, pipelineDescription))
         {
-            m_failure = std::string("Failed to create the ") + shaderDescription.path + " pipeline.";
-            Log::Error(m_failure);
+            failure = std::string("Failed to create the ") + shaderDescription.path + " pipeline.";
             return false;
         }
 

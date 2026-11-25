@@ -658,6 +658,7 @@ AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::path& pat
             Entry entry;
             entry.path = entryPath;
             entry.name = DisplayName(entryPath);
+            entry.pathID = PathID(entryPath);
             entry.directory = directory;
             entry.navigable = directory && !reparsePoint;
             entry.ordinaryFile = !directory && !reparsePoint;
@@ -682,6 +683,52 @@ AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::path& pat
         return left.name < right.name;
     });
     return listing;
+}
+
+void AssetBrowser::ClassifyEntry(Entry& entry, const ProjectContext* project) const
+{
+    const bool current = entry.classifiedGeneration != 0 && entry.classifiedGeneration == m_assetTableGeneration &&
+        entry.classifiedProject == project;
+
+    if(current)
+    {
+        return;
+    }
+
+    entry.classifiedGeneration = m_assetTableGeneration;
+    entry.classifiedProject = project;
+
+    // The same lookups the tile loop made every frame, in the same order and with the same conditions.
+    const auto normal = entry.path.lexically_normal();
+    const auto extension = entry.path.extension();
+    entry.sceneDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(extension, ".scene");
+    entry.scriptDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(extension, ".as");
+    entry.materialExtension = _wcsicmp(extension.c_str(), L".material") == 0;
+
+    // Only a .as entry can be a script, so other entries skip the registry scan.
+    const auto* scriptRecord = entry.scriptDocument && project && m_thumbnailRegistry ?
+        m_thumbnailRegistry->FindByPath(entry.path.lexically_relative(project->GetRoot())) : nullptr;
+    entry.script = scriptRecord && scriptRecord->type == AssetType::Script;
+
+    const auto texture = m_textureRecords.find(normal);
+    const auto material = m_materialRecords.find(normal);
+    const auto mesh = m_meshRecords.find(normal);
+    entry.texture = texture != m_textureRecords.end() ? &texture->second : nullptr;
+    entry.material = material != m_materialRecords.end() ? &material->second : nullptr;
+    entry.mesh = mesh != m_meshRecords.end() ? &mesh->second : nullptr;
+
+    // M4: an icon tile; acoustic materials have no visual preview, so no thumbnail is ever requested.
+    const auto* acousticRecord = !entry.directory && project && m_thumbnailRegistry &&
+        _wcsicmp(extension.c_str(), L".acousticmaterial") == 0 ?
+        m_thumbnailRegistry->FindByPath(entry.path.lexically_relative(project->GetRoot())) : nullptr;
+    entry.acousticMaterial.reset();
+
+    if(acousticRecord && acousticRecord->type == AssetType::AcousticMaterial)
+    {
+        entry.acousticMaterial = acousticRecord->id;
+    }
+
+    entry.registryFile = m_thumbnailPaths && entry.path == m_thumbnailPaths->GetAssetRegistryPath();
 }
 
 void AssetBrowser::ClassifySceneEntries(Listing& listing, const ProjectContext& project) const
@@ -949,11 +996,15 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
     const float compactTileHeight = compactIconSize + style.ItemInnerSpacing.y +
         ImGui::GetTextLineHeight() + style.FramePadding.y * 2.0f;
     EditorPhaseTiming::Scope previewLookupPhase(m_phaseTiming, EditorPhaseTiming::Phase::AssetBrowserContentsLookup);
+
+    for(auto& entry : listing.entries)
+    {
+        ClassifyEntry(entry, project);
+    }
+
     const bool hasPreviewTiles = std::any_of(listing.entries.begin(), listing.entries.end(), [&](const Entry& entry)
     {
-        const auto path = entry.path.lexically_normal();
-        return !entry.directory && m_filter.PassFilter(entry.name.c_str()) &&
-            (m_textureRecords.contains(path) || m_materialRecords.contains(path) || m_meshRecords.contains(path));
+        return !entry.directory && m_filter.PassFilter(entry.name.c_str()) && (entry.texture || entry.material || entry.mesh);
     });
     previewLookupPhase.End();
     // Fixed columns prevent sparse listings from stretching small icons across the panel.
@@ -984,34 +1035,24 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             }
 
             ImGui::TableNextColumn();
-            ImGui::PushID(PathID(entry.path).c_str());
+            ImGui::PushID(entry.pathID.c_str());
             // Compact tiles submit one item containing both icon and filename.
             // Thumbnail tiles keep their existing preview and wrapped-label layout.
             ImGui::BeginGroup();
-            // Per-entry scopes add to one per-frame sample for their phase.
+            // Per-entry scopes add to one per-frame sample for their phase. The entry was classified above.
             EditorPhaseTiming::Scope lookupPhase(m_phaseTiming, EditorPhaseTiming::Phase::AssetBrowserContentsLookup);
-            const bool sceneDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".scene");
-            const bool scriptDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".as");
-            // Only a .as entry can be a script, so other entries skip the registry scan.
-            const auto* scriptRecord = scriptDocument && project && m_thumbnailRegistry ?
-                m_thumbnailRegistry->FindByPath(entry.path.lexically_relative(project->GetRoot())) : nullptr;
-            const bool isScript = scriptDocument && scriptRecord && scriptRecord->type == AssetType::Script;
-            const auto registered = m_textureRecords.find(entry.path.lexically_normal());
-            const bool isTexture = !entry.directory && !sceneDocument && registered != m_textureRecords.end();
-            const auto material = m_materialRecords.find(entry.path.lexically_normal());
-            const bool isMaterial = !entry.directory && material != m_materialRecords.end() &&
-                _wcsicmp(entry.path.extension().c_str(), L".material") == 0;
-            const bool isMesh = !entry.directory && !sceneDocument && m_meshRecords.contains(entry.path.lexically_normal());
+            const bool sceneDocument = entry.sceneDocument;
+            const bool scriptDocument = entry.scriptDocument;
+            const bool isScript = scriptDocument && entry.script;
+            const bool isTexture = !entry.directory && !sceneDocument && entry.texture;
+            const bool isMaterial = !entry.directory && entry.material && entry.materialExtension;
+            const bool isMesh = !entry.directory && !sceneDocument && entry.mesh;
             lookupPhase.End();
             const bool isScene = sceneDocument && project &&
                 entry.sceneCanonicalPath && !entry.sceneCanonicalPath->empty();
             const bool active = isScene && !activeScenePath.empty() &&
                 ProjectAssetRegistry::PathsEqual(*entry.sceneCanonicalPath, activeScenePath);
-            // M4: an icon tile; acoustic materials have no visual preview, so no thumbnail is ever requested.
-            const auto* acousticRecord = !entry.directory && project && m_thumbnailRegistry &&
-                _wcsicmp(entry.path.extension().c_str(), L".acousticmaterial") == 0 ?
-                m_thumbnailRegistry->FindByPath(entry.path.lexically_relative(project->GetRoot())) : nullptr;
-            const bool isAcoustic = acousticRecord && acousticRecord->type == AssetType::AcousticMaterial;
+            const bool isAcoustic = entry.acousticMaterial.has_value();
             const bool hasThumbnail = isTexture || isMaterial || isMesh;
             const bool compactTile = !hasThumbnail && !isScript;
             const auto tilePosition = ImGui::GetCursorScreenPos();
@@ -1061,7 +1102,12 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             }
             else if(isTexture || isMaterial || isAcoustic)
             {
-                DrawAssetMoveSource(entry.path, entry.name);
+                // The tile's registry record was classified with the listing: it is the record a path search of the
+                // registry would find, and that search (every record's path normalized) ran for every tile every frame.
+                const AssetID id = isTexture ? entry.texture->id : isMaterial ? entry.material->id : *entry.acousticMaterial;
+                const AssetType type = isTexture ? AssetType::Texture : isMaterial ? AssetType::Material :
+                    AssetType::AcousticMaterial;
+                DrawAssetMoveSource(entry.path, entry.name, id, type);
             }
 
             const TextureThumbnailCache::Preview* preview = nullptr;
@@ -1073,7 +1119,8 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             {
                 if(isTexture && !m_thumbnailResetRequested && m_thumbnailPaths && m_thumbnailRegistry)
                 {
-                    preview = m_thumbnails->FindOrCreate(*m_thumbnailPaths, *m_thumbnailRegistry, registered->second);
+                    EditorPhaseTiming::Scope texturePhase(m_phaseTiming, EditorPhaseTiming::Phase::AssetBrowserTextureThumbnails);
+                    preview = m_thumbnails->FindOrCreate(*m_thumbnailPaths, *m_thumbnailRegistry, *entry.texture);
                 }
 
                 auto* draw = ImGui::GetWindowDrawList();
@@ -1094,8 +1141,8 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 {
                     // Resident tiles display their finished image and join the renderer's working set
                     // directly; only the remaining tiles go through admission (B.2 rotation).
-                    const auto key = material->second.id.ToReference();
-                    std::optional<MaterialPreviewImage> image = GetResidentMaterialThumbnail(key, material->second.id);
+                    const auto key = entry.material->id.ToReference();
+                    std::optional<MaterialPreviewImage> image = GetResidentMaterialThumbnail(key, entry.material->id);
                     const auto admission = image ? ThumbnailAdmission::TileState::Admitted :
                         m_materialAdmission.MarkVisible(key, now);
                     const char* status = admission == ThumbnailAdmission::TileState::CoolingDown ? "Unavailable" : "Queued";
@@ -1108,13 +1155,13 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                             MaterialThumbnailDiagnostics::Timer requestTimer(diagnostics.browserRequestMicroseconds);
                             MaterialThumbnailDiagnostics::Add(diagnostics.browserRequests);
                             m_materialRenderer->RequestSavedMaterialThumbnail(
-                                *m_thumbnailPaths, *m_thumbnailRegistry, material->second.id, materialError);
+                                *m_thumbnailPaths, *m_thumbnailRegistry, entry.material->id, materialError);
                         }
 
                         // Lookup registers this exact image's current ImGui reference with Renderer.
                         MaterialThumbnailDiagnostics::Timer lookupTimer(diagnostics.imageLookupMicroseconds);
                         MaterialThumbnailDiagnostics::Add(diagnostics.imageLookups);
-                        image = m_materialRenderer->GetSavedMaterialThumbnailImage(*m_thumbnailPaths, material->second.id);
+                        image = m_materialRenderer->GetSavedMaterialThumbnailImage(*m_thumbnailPaths, entry.material->id);
                         status = "Generating";
 
                         if(image)
@@ -1145,7 +1192,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 }
                 else if(isMesh && m_materialRenderer && m_thumbnailPaths && m_thumbnailRegistry)
                 {
-                    const auto& record = m_meshRecords.at(entry.path.lexically_normal());
+                    const auto& record = *entry.mesh;
                     const auto key = record.id.ToReference();
 
                     // A resident tile displays its retained image without occupying a generation slot.
@@ -1209,8 +1256,8 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             }
             ImGui::EndGroup();
             CaptureDropTarget(entry.navigable ? entry.path : std::filesystem::path{});
-            const bool located=m_navigationHighlight && ((isMaterial && material->second.id==*m_navigationHighlight) ||
-                (isAcoustic && acousticRecord->id==*m_navigationHighlight));
+            const bool located=m_navigationHighlight && ((isMaterial && entry.material->id==*m_navigationHighlight) ||
+                (isAcoustic && *entry.acousticMaterial==*m_navigationHighlight));
             if(located)
             {
                 if(m_revealPending) { ImGui::SetScrollHereY(0.5f); m_revealPending=false; }
@@ -1258,8 +1305,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             }
 
             // Only decides whether the menu is offered; Rename/Delete re-check the filesystem when chosen.
-            const bool eligible = entry.ordinaryFile && listing.browsable && m_thumbnailPaths &&
-                entry.path != m_thumbnailPaths->GetAssetRegistryPath();
+            const bool eligible = entry.ordinaryFile && listing.browsable && m_thumbnailPaths && !entry.registryFile;
 
             if(eligible && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
             {
@@ -1286,7 +1332,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
 
                 if(isMesh && ImGui::MenuItem("Import Units...", nullptr, false, canRequest && !m_unitsRequest))
                 {
-                    m_unitsAsset = m_meshRecords.at(entry.path.lexically_normal());
+                    m_unitsAsset = *entry.mesh;
                     m_unitsDraft = m_unitsAsset->meshImportUnits;
                     m_unitsManualScale = static_cast<float>(m_unitsDraft.scale);
                     m_openUnits = true;
@@ -1938,10 +1984,41 @@ void AssetBrowser::ImportFileDrop(
     }
 }
 
+bool AssetBrowser::AssetTablesMatch(const ProjectPaths& paths, const ProjectAssetRegistry& registry) const
+{
+    if(m_assetTableGeneration == 0 || m_assetTableRoot.native() != paths.GetRoot().native())
+    {
+        return false;
+    }
+
+    // Every record, not only the three table types: script and acoustic tiles are classified from the registry too.
+    const auto& records = registry.GetRecords();
+
+    if(records.size() != m_assetTableRecords.size())
+    {
+        return false;
+    }
+
+    for(std::size_t index = 0; index < records.size(); ++index)
+    {
+        const AssetRecord& current = records[index];
+        const AssetRecord& tabled = m_assetTableRecords[index];
+        const bool same = current.id == tabled.id && current.type == tabled.type &&
+            current.relativePath.native() == tabled.relativePath.native() && current.meshImportUnits == tabled.meshImportUnits;
+
+        if(!same)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectAssetRegistry& registry)
 {
     std::error_code projectError;
-    const auto canonicalProject = std::filesystem::canonical(paths.GetRoot(), projectError);
+    const auto& canonicalProject = m_canonicalProjectRoot.Resolve(paths.GetRoot(), projectError);
 
     if(projectError || canonicalProject != m_meshDragProject)
     {
@@ -1970,24 +2047,37 @@ void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectA
     m_thumbnailProjectRoot = paths.GetRoot();
     m_thumbnailPaths = paths;
     m_thumbnailRegistry = &registry;
+
+    // Called every frame; the tables change only with the registry or the project root.
+    if(AssetTablesMatch(paths, registry))
+    {
+        return;
+    }
+
     m_textureRecords.clear();
     m_materialRecords.clear();
     m_meshRecords.clear();
 
-    for(const auto& record : registry.GetAssets(AssetType::Texture))
+    // One pass in registry order fills each table in the same order as before, so a duplicate path keeps its first record.
+    for(const auto& record : registry.GetRecords())
     {
-        m_textureRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
+        if(record.type == AssetType::Texture)
+        {
+            m_textureRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
+        }
+        else if(record.type == AssetType::Material)
+        {
+            m_materialRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
+        }
+        else if(record.type == AssetType::Mesh)
+        {
+            m_meshRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
+        }
     }
 
-    for(const auto& record : registry.GetAssets(AssetType::Material))
-    {
-        m_materialRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
-    }
-
-    for(const auto& record : registry.GetAssets(AssetType::Mesh))
-    {
-        m_meshRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
-    }
+    m_assetTableRoot = paths.GetRoot();
+    m_assetTableRecords = registry.GetRecords();
+    ++m_assetTableGeneration;
 }
 
 void AssetBrowser::DrawMeshImportUnits()
@@ -2331,6 +2421,7 @@ void AssetBrowser::OnDeletionCompleted(const std::filesystem::path& path, const 
         m_thumbnails->Invalidate(path);
         m_textureRecords.erase(path.lexically_normal());
         m_materialRecords.erase(path.lexically_normal());
+        InvalidateAssetTables();
         m_materialImagesInvalidated = true;
         m_materialRequestsReset = true;
 
@@ -2429,6 +2520,7 @@ void AssetBrowser::OnRenameCompleted(
         {
             m_thumbnails->Invalidate(source);
             m_textureRecords.erase(source.lexically_normal());
+            InvalidateAssetTables();
         }
 
         if(m_selection == source)
@@ -2444,14 +2536,15 @@ void AssetBrowser::InvalidateMeshDragIdentity() noexcept
     m_meshDragIdentity = nextIdentity.fetch_add(1, std::memory_order_relaxed);
 }
 
-void AssetBrowser::DrawAssetMoveSource(const std::filesystem::path& path, const std::string& name)
+void AssetBrowser::DrawAssetMoveSource(const std::filesystem::path& path, const std::string& name, const AssetID& id,
+    AssetType type)
 {
     if(!m_thumbnailRegistry || !m_thumbnailPaths || !m_meshDragIdentity)
     {
         return;
     }
-    const auto* record = m_thumbnailRegistry->FindByPath(path.lexically_relative(m_thumbnailPaths->GetRoot()));
-    if(!record || record->type == AssetType::Script || record->type == AssetType::AudioBank ||
+
+    if(type == AssetType::Script || type == AssetType::AudioBank ||
         !ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers))
     {
         return;
@@ -2463,11 +2556,11 @@ void AssetBrowser::DrawAssetMoveSource(const std::filesystem::path& path, const 
     }
     MovePayload payload;
     payload.projectIdentity = m_meshDragIdentity;
-    const auto reference = record->id.ToReference();
+    const auto reference = id.ToReference();
     std::copy(reference.begin(), reference.end(), payload.reference.begin());
-    if(record->type == AssetType::Material)
+    if(type == AssetType::Material)
     {
-        const auto material = MakeMaterialDragPayload(record->id);
+        const auto material = MakeMaterialDragPayload(id);
         if(material)
             ImGui::SetDragDropPayload(MaterialDragPayloadType, &*material, sizeof(*material), ImGuiCond_Once);
         ImGui::Text("Material: %s", name.c_str());

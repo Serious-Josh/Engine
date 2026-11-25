@@ -133,6 +133,7 @@ class Engine
     friend class CompositeWorldEditorVerification;
     friend class DemoWorldEditorVerification;
     friend class CompositePlacementStress;
+    friend class EditorCpuVerification;
     friend class RenderingVerification;
     friend class GamePlayGPUVerification;
     friend class AirPackagedParityVerification;
@@ -403,6 +404,9 @@ class Engine
     // Settings (no session overrides), and the last requested/effective lighting report logged.
     RenderingConfiguration m_packagedRenderingConfiguration;
     ProjectLightingMode m_packagedRequestedLightingMode = ProjectLightingMode::Legacy;
+    // The cooked settings themselves, for what is applied outside the rendering configuration (NVIDIA Reflex: Off for an
+    // archive cooked before Reflex existed).
+    RenderingSettings m_packagedRenderingSettings;
     std::string m_packagedLightingReport;
     bool m_packagedFirstPathTraceImageLogged = false;
     void ReportPackagedLightingMode(double renderMilliseconds);
@@ -714,6 +718,8 @@ class Engine
     std::optional<SceneObjectCreationResult> m_lastSceneObjectCreation;
 
     void Frame();
+    // The NVIDIA Reflex mode this frame runs: the packaged game's cooked mode, or the Editor's saved Project Settings.
+    ReflexMode GetRequestedReflexMode();
     // Continuation gates preserve the existing fatal-return boundaries in Frame.
     bool DeliverFrameDisplacementCompletion(bool& completionDelivered);
     bool ExecutePendingEditorMutations();

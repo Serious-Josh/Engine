@@ -338,7 +338,10 @@ ConfigurationReadiness Renderer::EvaluateConfigurationReadiness(const RenderingC
             }
             else if(!m_restirPtPass.IsInitialized())
             {
-                Combine(resources, Make(ReadinessState::Preparing, "ReSTIR PT pipelines created on activation"));
+                const bool prepared = m_restirPtPipelinePreparation == ReSTIRPTPipelinePreparation::Prepared;
+                Combine(resources, Make(ReadinessState::Preparing, prepared ?
+                    "ReSTIR PT pipelines prepared, adopted by the configuration's preparation" :
+                    "ReSTIR PT pipelines preparing on their worker"));
             }
         }
 

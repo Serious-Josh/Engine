@@ -56,7 +56,25 @@ public:
     void Draw(ImDrawList& draw, EditorIcon icon, ImVec2 origin, ImVec2 bounds, ImU32 tint) const;
     ImVec2 GetSize(EditorIcon icon, float maximumDimension) const;
 
+    // Binds the atlas on a draw list for the icons drawn while it lives. Outside a batch every Draw switches the list's
+    // texture to the atlas and back, which opens a draw command per icon: most of the cost when the viewport shows about
+    // a thousand light icons. Inside a batch, draw only icons; Draw restores the previous texture for its fallback symbol.
+    class Batch
+    {
+    public:
+        Batch(const EditorIcons& icons, ImDrawList& draw);
+        ~Batch();
+        Batch(const Batch&) = delete;
+        Batch& operator=(const Batch&) = delete;
+
+    private:
+        ImDrawList& m_draw;
+        bool m_bound = false;
+    };
+
 private:
+    ImTextureID GetAtlasTexture() const;
+
     static constexpr unsigned int Count = static_cast<unsigned int>(EditorIcon::Count);
     static constexpr unsigned int Cell = 100, RasterSize = 96;
     struct Entry

@@ -4,8 +4,10 @@
 #include "Renderer/Texture.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef NOMINMAX
@@ -129,6 +131,34 @@ class NrdDenoiser
         uint32_t height);
     void Shutdown();
 
+    // Lighting Mode switch hitch: Initialize in two halves, so the SDK's instance creation (about 50 ms: the NRI device
+    // wrapper, NRD's pipelines and pool textures, all free-threaded device calls) runs off the renderer thread.
+    // BeginInitialize validates the request exactly as Initialize does and starts that creation on a thread of its own.
+    // FinishInitialize, on the renderer thread, joins a finished creation (waits for it, with wait) and creates the output
+    // textures and their descriptors, which only the renderer thread allocates. Until FinishInitialize returns Initialized
+    // the instance is not initialized and only FinishInitialize, IsCreating and Shutdown (which joins a running creation)
+    // may be called.
+    enum class CreationProgress
+    {
+        None,
+        Running,
+        Initialized,
+        Failed
+    };
+
+    bool BeginInitialize(
+        ID3D12Device* device,
+        ID3D12CommandQueue* graphicsQueue,
+        uint32_t width,
+        uint32_t height,
+        const Description& description);
+    CreationProgress FinishInitialize(DescriptorHeap& descriptorHeap, bool wait);
+
+    bool IsCreating() const
+    {
+        return m_creationThread.joinable();
+    }
+
     bool IsInitialized() const
     {
         return m_width != 0;
@@ -178,14 +208,30 @@ class NrdDenoiser
         Texture specularOutput;
     };
 
+    bool AcceptDescription(
+        ID3D12Device* device,
+        ID3D12CommandQueue* graphicsQueue,
+        uint32_t width,
+        uint32_t height,
+        const Description& description);
     bool Recreate(
         DescriptorHeap& descriptorHeap,
         uint32_t width,
         uint32_t height);
+    // The SDK part of a (re)creation: device calls only, so it may run on the creation thread.
+    nrd::Result CreateSdkInstance(uint32_t width, uint32_t height);
+    // The renderer-thread part: the pool states and the output textures with their descriptors.
+    bool CreateOutputs(DescriptorHeap& descriptorHeap, uint32_t width, uint32_t height);
     Denoiser* FindDenoiser(nrd::Identifier identifier);
     void ReleaseOutputs();
 
     nrd::Integration m_integration;
+    // BeginInitialize's creation thread; it alone touches m_integration until FinishInitialize or Shutdown joins it.
+    std::thread m_creationThread;
+    std::atomic<bool> m_creationFinished = false;
+    nrd::Result m_creationResult = nrd::Result::FAILURE;
+    uint32_t m_creationWidth = 0;
+    uint32_t m_creationHeight = 0;
     // R.1: the integration's texture-pool barrier states, mirrored transactionally (NRD tracks them itself): a discarded
     // recording that ran Denoise returns them to the last submitted states before the next Denoise.
     TransactionalResourceState<std::vector<nri::AccessLayoutStage>> m_poolStates;

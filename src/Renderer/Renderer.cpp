@@ -20,6 +20,7 @@
 #include "Displacement/DisplacementRequestValidation.h"
 #include "../../assets/Shaders/GIModeConfig.hlsli"
 #include "Renderer/Mesh.h"
+#include "Renderer/TextureMemoryAllocator.h"
 #include "Renderer/Passes/EquirectangularToCubemapPass.h"
 #include "Renderer/Passes/EnvironmentMipPass.h"
 #include "Renderer/Passes/DiffuseIrradiancePass.h"
@@ -2938,12 +2939,15 @@ bool Renderer::Initialize(
     // RR.1A: Ray Reconstruction is Editor-only (its runtime is never deployed with packaged games); a packaged run reports
     // it NotPermitted without querying NGX for it.
     m_dlssBackend.SetRayReconstructionPermitted(!m_packagedRuntime);
+    // FG.1: Frame Generation starts in the Editor viewport; packaged games get it in a later stage.
+    m_dlssBackend.SetFrameGenerationPermitted(!m_packagedRuntime);
     m_projectWorkflowStart = projectWorkflowStart && !m_packagedRuntime;
     // PS.5C: the worker's private shader library for the PSR auxiliary pipelines reads the same cooked bootstrap.
     m_packagedShaderPayload = m_packagedRuntime ?
         std::make_shared<const std::vector<std::byte>>(packagedShaders.begin(), packagedShaders.end()) : nullptr;
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
+    m_rayTracingScene.SetBLASMemoryPool(&m_blasMemoryPool);
 
     // Diagnostics only: the existing CPU frame-hitch report is logged when ENGINE_FRAME_HITCH_LOGGING is exactly "1".
     // A longer value does not fit the buffer and returns its required size, so it leaves the report off.
@@ -3349,7 +3353,9 @@ bool Renderer::Initialize(
         const std::string visibilityBench = environment("ENGINE_RESTIR_PT_VISIBILITY_BENCH");
         m_restirPtSettings.visibilityBench = visibilityBench == "excluding" ? ReSTIRPTSettings::VisibilityBench::Excluding :
             visibilityBench == "plain" ? ReSTIRPTSettings::VisibilityBench::Plain : ReSTIRPTSettings::VisibilityBench::None;
-        // M5.2: ENGINE_RESTIR_PT_TEMPORAL=1 turns on temporal reuse (off by default until M5.2 is reviewed).
+        // M5.2: temporal reuse, off by default (user decision 2026-11-24, spatial-only reuse with the direct-light
+        // reservoir: reused direct samples persisting over frames made the "tearing" and shadow "wiggle", residual
+        // boiling report §10); ENGINE_RESTIR_PT_TEMPORAL=1 turns it on at launch (the Editor's checkbox starts from it).
         m_restirPtSettings.temporal = environment("ENGINE_RESTIR_PT_TEMPORAL") == "1";
         // M5.4 C1: ENGINE_RESTIR_PT_TEMPORAL_PASS=0 keeps the fused M5.2 kernel (comparison and bit-identity runs).
         m_restirPtSettings.temporalPass = environment("ENGINE_RESTIR_PT_TEMPORAL_PASS") != "0";
@@ -3366,6 +3372,22 @@ bool Renderer::Initialize(
         const std::string duplication = environment("ENGINE_RESTIR_PT_DUPLICATION");
         m_restirPtSettings.duplication = duplication == "apply" ? ReSTIRPTSettings::Duplication::Apply :
             duplication == "measure" ? ReSTIRPTSettings::Duplication::Measure : ReSTIRPTSettings::Duplication::Off;
+        // Residual boiling P1 (on by default, user decision 2026-11-24): ENGINE_RESTIR_PT_MIRROR_X1=0 turns off x1's light
+        // sampler at camera mirror chains' first non-delta vertex (ReSTIRPTSettings::mirrorChainX1Sampling).
+        m_restirPtSettings.mirrorChainX1Sampling = environment("ENGINE_RESTIR_PT_MIRROR_X1") != "0";
+        m_restirPtUiMirrorX1 = m_restirPtSettings.mirrorChainX1Sampling;
+        m_debugUI.SetRestirPtMirrorX1(m_restirPtUiMirrorX1);
+        // Residual boiling §5d option 2 (on by default, user decision 2026-11-24): ENGINE_RESTIR_PT_DIRECT_RESERVOIR=0 turns
+        // off direct-only reuse with fresh bounce light on denoiser frames (ReSTIRPTSettings::directReservoir).
+        m_restirPtSettings.directReservoir = environment("ENGINE_RESTIR_PT_DIRECT_RESERVOIR") != "0";
+        m_restirPtUiDirectReservoir = m_restirPtSettings.directReservoir;
+        m_debugUI.SetRestirPtDirectReservoir(m_restirPtUiDirectReservoir);
+        // Wall boiling (experimental, on by default, user decision 2026-11-24): ENGINE_RESTIR_PT_LIGHT_BOUNCE=0 turns off
+        // light-traced bounce connections at launch (ReSTIRPTSettings::lightTracedBounce); the Editor checkbox starts
+        // from it.
+        m_restirPtSettings.lightTracedBounce = environment("ENGINE_RESTIR_PT_LIGHT_BOUNCE") != "0";
+        m_restirPtUiLightBounce = m_restirPtSettings.lightTracedBounce;
+        m_debugUI.SetRestirPtLightBounce(m_restirPtUiLightBounce);
         // M5.5-B experiments (unpackaged diagnostics, off by default): ENGINE_RESTIR_PT_DECORRELATE=<p> final-shading
         // decorrelation probability (0..1); ENGINE_RESTIR_PT_CONFIDENCE_CAP=<n> the temporal confidence cap (20).
         if(const std::string decorrelate = environment("ENGINE_RESTIR_PT_DECORRELATE"); !decorrelate.empty())
@@ -3477,9 +3499,9 @@ bool Renderer::Initialize(
         {
             m_restirPtSettings.temporalConfidenceCap = (std::max)(1u, static_cast<std::uint32_t>(std::stoul(cap)));
         }
-        // M5.3: ENGINE_RESTIR_PT_SPATIAL=1 turns on paired spatial reuse (off by default until M5.3 is reviewed);
-        // ENGINE_RESTIR_PT_SPATIAL_COLOUR=0 shades with F(Y) W in place of colour-noise reduction.
-        m_restirPtSettings.spatial = environment("ENGINE_RESTIR_PT_SPATIAL") == "1";
+        // M5.3: paired spatial reuse, on by default (user decision 2026-11-24); ENGINE_RESTIR_PT_SPATIAL=0 turns it off at
+        // launch. ENGINE_RESTIR_PT_SPATIAL_COLOUR=0 shades with F(Y) W in place of colour-noise reduction.
+        m_restirPtSettings.spatial = environment("ENGINE_RESTIR_PT_SPATIAL") != "0";
         m_restirPtSettings.spatialColourNoiseReduction = environment("ENGINE_RESTIR_PT_SPATIAL_COLOUR") != "0";
         // The Debug UI's reuse toggles start from these (Rendering Settings, under the PT estimator).
         m_debugUI.SetRestirPtReuse(m_restirPtSettings.temporal, m_restirPtSettings.spatial);
@@ -4220,8 +4242,12 @@ bool Renderer::InitializeSwapChain(void* windowHandle)
 {
     const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
 
-    return m_swapChain.Initialize(m_graphicsDevice.GetFactory(), m_graphicsDevice.GetDevice(),
+    // FG.2: kept to recreate the swap chain when the Frame Generation present path switches.
+    m_windowHandle = windowHandle;
+    const bool initialized = m_swapChain.Initialize(m_graphicsDevice.GetFactory(), m_graphicsDevice.GetDevice(),
                                   m_commandContext.GetCommandQueue(), windowHandle, m_applicationWidth, m_applicationHeight);
+    SyncFrameSlotToSwapChain();
+    return initialized;
 }
 
 // Resize and geometry drawing
@@ -4506,10 +4532,35 @@ bool Renderer::ResizeApplicationResources(
     m_applicationWidth = 0;
     m_applicationHeight = 0;
 
+    // FG.2: the present thread owns the swap chain while the Frame Generation present path is active. It stops (presenting
+    // what was submitted) for the resize and restarts with composites at the new extent.
+    const bool presentingFromThread = m_frameGenerationPresentation;
+
+    if(presentingFromThread)
+    {
+        m_framePresenter.Stop();
+    }
+
     if(!m_swapChain.Resize(width, height))
     {
         Log::Error("Failed to resize swap chain.");
         return false;
+    }
+
+    if(presentingFromThread)
+    {
+        std::string failure;
+
+        if(!m_framePresenter.Start(m_swapChain, m_commandContext.GetFence(), width, height, DXGI_FORMAT_R8G8B8A8_UNORM,
+            failure))
+        {
+            Log::Error("Frame Generation present path: " + failure + " after the resize.");
+            return false;
+        }
+    }
+    else
+    {
+        SyncFrameSlotToSwapChain();
     }
 
     m_applicationWidth = width;
@@ -4539,12 +4590,20 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
         return false;
     }
 
+    // Lighting Mode switch hitch: the presented configuration is what the next recording renders (ResizeScene runs after
+    // SelectPresentedConfiguration, so in a switching frame it is already the new one). A resize for a configuration that
+    // does not render Ray Tracing leaves Ray Tracing's own resources alone: recreating its two NRD instances for an extent
+    // it would never render at cost about 120 ms of the switch from Ray Tracing to Path Tracing at a DLSS preset.
+    const bool presentedLeavesLegacy = m_configurationPreparation.HasPresented() &&
+        m_configurationPreparation.GetPresented().lightingMode != RendererLightingMode::Legacy;
+
     // M0c.1: Legacy's own passes follow the render extent only while Legacy is the active (last rendered) mode. Otherwise
     // they keep their previous extent (stale) and EnsureLegacyLightingExtent resizes them before the next Legacy frame.
     // M0c.4: and only while resident: released textures (retired, or never used at startup, where the transition's active
-    // mode is still Legacy while nothing is lit) are created by that same first Legacy frame, not by a resize.
+    // mode is still Legacy while nothing is lit) are created by that same first Legacy frame, not by a resize. Also stale
+    // when the presented configuration leaves Legacy (a switching frame, where Legacy is still the active mode).
     if(m_lightingModeTransition.GetStatus().active == RendererLightingMode::Legacy && m_legacyLighting.retention.resident &&
-        !m_legacyLighting.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+        !presentedLeavesLegacy && !m_legacyLighting.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         return false;
     }
@@ -4559,7 +4618,17 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
         return false;
     }
 
-    // NRD.2: instances that do not exist yet are created at the new extent when first needed.
+    // NRD.2: instances that do not exist yet are created at the new extent when first needed. Ray Tracing's two instances
+    // are released instead while the presented configuration does not render it (ResizeScene drained the GPU, so nothing
+    // references them); its next frame creates them at its own extent (EnsureHybridNrdDenoisers), as after retirement.
+    if(presentedLeavesLegacy && (m_nrdReflectionDenoiser.IsInitialized() || m_nrdGIDenoiser.IsInitialized()))
+    {
+        m_nrdReflectionDenoiser.Shutdown();
+        m_nrdGIDenoiser.Shutdown();
+        m_nrdExecutedLastFrame = false;
+        Log::Info("NRD REBLUR released by a resize for a configuration that does not render Ray Tracing.");
+    }
+
     if(m_nrdReflectionDenoiser.IsInitialized() &&
         !m_nrdReflectionDenoiser.Resize(m_resourceDescriptorHeap, width, height))
     {
@@ -4793,8 +4862,8 @@ Renderer::ModeResourceDecision Renderer::EvaluateModeResourceRetirement(ModeReso
         return ModeResourceDecision::Keep;
     }
 
-    const bool graceExpired =
-        dueRegardless || std::chrono::steady_clock::now() - residency.lastActive >= ModeResourceGracePeriod;
+    // Inactive resources stay resident until memory pressure (see ModeResourceGracePeriod) or the caller's own rule.
+    const bool graceExpired = dueRegardless;
     const bool underPressure = !graceExpired && IsModeResourceMemoryUnderPressure();
 
     if(!graceExpired && !underPressure)
@@ -4895,7 +4964,7 @@ void Renderer::UpdateLegacyLightingRetention()
     m_legacyLighting.ReleaseTextures();
     m_legacyLighting.retention.resident = false;
     Log::Info(std::string("Retired the inactive Legacy lighting resources (") +
-        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "grace period ended") + ").");
+        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "due") + ").");
 }
 
 // M0c.3 Phase A: called on recordings that do not render a path-traced mode, after the frame's mode is committed and
@@ -4939,7 +5008,8 @@ void Renderer::UpdatePathTracingRetention()
     ReleasePathTracingResources();
     m_pathTracingResidency.resident = false;
     Log::Info(std::string("Retired the inactive Path Tracing resources (") +
-        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "grace period ended") + ").");
+        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "due") + ").");
+
 }
 
 void Renderer::ReleasePathTracingResources()
@@ -5157,7 +5227,7 @@ void Renderer::DrawMaterialRange(
     commandList->SetGraphicsRoot32BitConstants(0, 8, &materialConstants, 0);
 
     const unsigned int displacementLODDescriptorIndex =
-        m_displacementLODDescriptorIndices[m_swapChain.GetCurrentBackBufferIndex()];
+        m_displacementLODDescriptorIndices[m_frameSlot];
 
     commandList->SetGraphicsRoot32BitConstants(0, 1, &displacementLODDescriptorIndex, 8);
 
@@ -5828,6 +5898,10 @@ bool Renderer::ReleaseSceneResources()
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
     m_rayTracingScene.Shutdown();
+    // The GPU is drained, so the scene's BLAS ranges and texture ranges are reusable by the next scene at once; the
+    // blocks and heaps stay.
+    CollectBLASMemory();
+    CollectTextureMemory();
     ShutdownMaterialTables();
 
     m_selectionMaskCandidate.reset();
@@ -6800,7 +6874,8 @@ void Renderer::CreateLightingModeResources(RendererLightingMode mode)
 
     if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT)
     {
-        // M5.1: configuration B's pipelines, light tiles and counters (compiled here, on the render thread, on activation).
+        // M5.1: configuration B's pipelines, light tiles and counters. The configuration's preparation normally adopted the
+        // pipelines already (prepared on their worker); only a direct Render caller creates them here, blocking.
         EnsureReSTIRPT();
     }
     else if(primary == PathTracePrimary::RasterReSTIRDI && m_pathTraceReferencePass.IsPrimaryReady(primary))
@@ -7295,8 +7370,8 @@ void Renderer::EvaluatePathTraceReSTIRPT()
 // tiles from the light sampling published for exactly this table, then the unified initial path sampling into the path
 // tracer's own targets. A frame without published light sampling for a table that has lights records nothing and logs once
 // (the finite table lights could not be sampled; rendering them incompletely would be silently biased).
-// ReGIR architecture investigation (experimental): ENGINE_RESTIR_PT_LIST_PROTOTYPE=1 (with the matching shader define, see
-// ShaderCompiler) builds only ReSTIR PT's ReGIR header (presample flag 16): the per-receiver list prototype reads no slots.
+// The adaptive light sampler (RESTIR_PT_LIST_PROTOTYPE, see ShaderCompiler) builds only ReSTIR PT's ReGIR header (presample
+// flag 16) unless a mode reads the slots: the list walk reads none.
 // ReGIR architecture investigation (experimental): ENGINE_RESTIR_PT_REGIR_STRATIFIED=1 stratifies ReSTIR PT's exact slots
 // (presample flag 32).
 static bool ReGIRStratifiedExperiment()
@@ -7310,16 +7385,44 @@ static bool ReGIRStratifiedExperiment()
     return enabled;
 }
 
-static bool ReGIRListFallbackOnly()
+// The adaptive light sampler's research modes (ENGINE_RESTIR_PT_LIST_MODE, ';'-separated; RESTIR_PT_LIST_* in
+// RestirPtInitialBody.hlsli). Unset: production, the adaptive walk at x1 and uniform list draws at deeper vertices.
+// A value without "x1": the adaptive walk at every vertex (the research report's upper bound).
+struct ReGIRListMode
 {
-    static const bool enabled = []
+    bool x1Only = true;
+};
+
+static const ReGIRListMode& ReGIRListModeFromEnvironment()
+{
+    static const ReGIRListMode mode = []
     {
+        ReGIRListMode parsed;
         const char* value = std::getenv("ENGINE_RESTIR_PT_LIST_MODE");
-        // Modes that read slots (fallback-only, ReGIR at deeper vertices) keep the full build.
-        return value && (std::string(value).find("fallback") != std::string::npos ||
-            std::string(value).find("deepregir") != std::string::npos);
+
+        if(value == nullptr)
+        {
+            return parsed;
+        }
+
+        const std::string text(value);
+        parsed.x1Only = text.find("x1") != std::string::npos;
+
+        // The single-pass, two-pass and compact-record samplers, ReGIR slots at deeper vertices and the M override no
+        // longer exist (deepregir: measured 2026-11-24, no gain under the current defaults).
+        const bool removedMode = text.find("single") != std::string::npos ||
+            text.find("fallback") != std::string::npos || text.find("compact") != std::string::npos ||
+            text.find("deepregir") != std::string::npos;
+
+        if(removedMode || std::getenv("ENGINE_RESTIR_PT_LIST_M") != nullptr)
+        {
+            Log::Warning("ENGINE_RESTIR_PT_LIST_MODE: single, fallback, compact, deepregir and ENGINE_RESTIR_PT_LIST_M "
+                "were removed; only x1 is read.");
+        }
+
+        return parsed;
     }();
-    return enabled;
+    return mode;
 }
 
 static bool ReGIRListPrototype()
@@ -7357,6 +7460,30 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     {
         m_restirPtUiFirefly = firefly;
         m_restirPtSettings.fireflyReplacement = firefly;
+    }
+
+    // Residual boiling P1: the Editor's mirror-chain x1 sampling, applied only when it changes (proposal only, so the
+    // history is kept).
+    if(const bool mirrorX1 = m_debugUI.GetRestirPtMirrorX1(); mirrorX1 != m_restirPtUiMirrorX1)
+    {
+        m_restirPtUiMirrorX1 = mirrorX1;
+        m_restirPtSettings.mirrorChainX1Sampling = mirrorX1;
+    }
+
+    // Residual boiling §5d option 2: the Editor's direct-light reservoir, applied only when it changes (the history
+    // signature includes it, so the switch resets the reservoirs).
+    if(const bool directReservoir = m_debugUI.GetRestirPtDirectReservoir(); directReservoir != m_restirPtUiDirectReservoir)
+    {
+        m_restirPtUiDirectReservoir = directReservoir;
+        m_restirPtSettings.directReservoir = directReservoir;
+    }
+
+    // Wall boiling: the Editor's light-traced bounce connections, applied only when it changes (bounce light is never
+    // reused, so the history is kept).
+    if(const bool lightBounce = m_debugUI.GetRestirPtLightBounce(); lightBounce != m_restirPtUiLightBounce)
+    {
+        m_restirPtUiLightBounce = lightBounce;
+        m_restirPtSettings.lightTracedBounce = lightBounce;
     }
 
     // M5.6 O0: the Editor's ReGIR light candidates, applied only when it changes.
@@ -7494,14 +7621,13 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
             m_restirPtSettings.regirWindow, (m_restirPtSettings.regirCone ? 1u : 0u) |
             (m_restirPtSettings.regirDirectFetch ? 2u : 0u) | (m_restirPtSettings.regirExactProposal ? 4u : 0u) |
             (m_restirPtSettings.regirSpotTarget ? 8u : 0u) |
-            (ReGIRListPrototype() && m_restirPtSettings.regirListPrototype && !ReGIRListFallbackOnly() ? 16u : 0u) |
+            (ReGIRListPrototype() && m_restirPtSettings.regirListPrototype ? 16u : 0u) |
             (ReGIRStratifiedExperiment() ? 32u : 0u),
             m_restirPtSettings.regirSlots);
 
         if(slots != UINT_MAX)
         {
-            regirLightsIndex = m_restirPtPass.RecordReGIRLights(commandList, m_uploadBuffer, lightSamplingIndex, tableLights,
-                ReGIRListPrototype() ? m_frameSceneLightBufferIndex : 0xFFFFFFFFu);
+            regirLightsIndex = m_restirPtPass.RecordReGIRLights(commandList, m_uploadBuffer, lightSamplingIndex, tableLights);
             regirSlotsIndex = regirLightsIndex != 0xFFFFFFFFu ? slots : 0xFFFFFFFFu;
         }
 
@@ -7513,7 +7639,9 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     // M5.2: this recording's reservoir sets and whether the previous frame's may be read.
     PreviousGBufferView previousGBuffer;
     const bool previousSurfacesAvailable = TryGetPreviousGBuffer(previousGBuffer);
-    const ReSTIRPTFrame restirPtFrame = m_restirPtPass.BeginFrame(MakeReSTIRPTHistorySignature(settings),
+    // History through lighting changes: before the signature, which a global discontinuity changes (its epoch).
+    const std::vector<std::array<float, 4>> lightingRegions = DetectReSTIRPTLightingDiscontinuities(frameLighting);
+    const ReSTIRPTFrame restirPtFrame = m_restirPtPass.BeginFrame(MakeReSTIRPTHistorySignature(settings, frameLighting),
         previousSurfacesAvailable);
     m_restirPtHistoryDecision = restirPtFrame.decision;
     // M5.3: spatial reuse needs one sample per frame (the paper's single path tree per pixel) and its buffers.
@@ -7554,6 +7682,19 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     constants.regirSlotsIndex = regirSlotsIndex;
     constants.regirLightsIndex = regirLightsIndex;
 
+    // Local lighting discontinuities since the committed frame: temporal reuse is refused at surfaces inside them.
+    if(restirPtFrame.historyValid)
+    {
+        constants.discontinuityCount = static_cast<std::uint32_t>(
+            (std::min)(lightingRegions.size(), static_cast<std::size_t>(ReSTIRPTMaxDiscontinuityRegions)));
+
+        for(std::uint32_t region = 0; region < constants.discontinuityCount; ++region)
+        {
+            std::memcpy(constants.discontinuityRegions[region], lightingRegions[region].data(),
+                sizeof(constants.discontinuityRegions[region]));
+        }
+    }
+
     // M5.6 O0.1: the spatial partners on ReGIR frames, when configured separately.
     if(regirSlotsIndex != 0xFFFFFFFFu && m_restirPtSettings.regirSpatialPairs != 0u)
     {
@@ -7573,24 +7714,23 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         const char* value = std::getenv("ENGINE_RESTIR_PT_PNC_LOG");
         return value && std::string(value) == "1";
     }();
-    // ReGIR architecture investigation (experimental): bit 2 switches the compiled-in list prototype on.
-    // ENGINE_RESTIR_PT_LIST_MODE (experimental, ';'-separated): single (bit 3), x1 (bit 4), fallback (bit 5).
-    static const std::uint32_t listModeBits = []
+    // The adaptive light sampler: bit 2 on (the Editor's "Adaptive x1 light sampling"), bit 4 at x1 only (RESTIR_PT_LIST_ON
+    // and _X1_ONLY in RestirPtInitialBody.hlsli).
+    const ReGIRListMode& listMode = ReGIRListModeFromEnvironment();
+    const std::uint32_t listModeBits = 4u | (listMode.x1Only ? 16u : 0u);
+    // Bit 10: residual boiling P1, x1's light sampler at the first non-delta vertex of camera mirror chains (applies to the
+    // list sampler and the light tiles alike).
+    constexpr std::uint32_t mirrorChainX1Bit = 1024u;
+    // Bit 11, wall boiling test only (the light-traced bounce variant reads it): ENGINE_RESTIR_PT_LIGHT_BOUNCE_TEST=bonly
+    // gives every path the light-traced technique can produce to that technique alone (no MIS), to inspect its own noise.
+    static const std::uint32_t lightBounceTestBits = []
     {
-        // Without ENGINE_RESTIR_PT_LIST_MODE: the hybrid under test (adaptive x1, uniform lists deeper; compact records
-        // measured neutral to slower, so off).
-        const char* value = std::getenv("ENGINE_RESTIR_PT_LIST_MODE");
-        const std::string text = value ? std::string(value) : std::string("adaptive;x1;deepuniform");
-        return (text.find("single") != std::string::npos ? 8u : 0u) | (text.find("x1") != std::string::npos ? 16u : 0u) |
-            (text.find("fallback") != std::string::npos ? 32u : 0u) | (text.find("deepregir") != std::string::npos ? 64u : 0u) |
-            (text.find("deepuniform") != std::string::npos ? 128u : 0u) |
-            (text.find("adaptive") != std::string::npos ? 256u : 0u) | (text.find("compact") != std::string::npos ? 512u : 0u) |
-            // ENGINE_RESTIR_PT_LIST_M: the x1 list sampler's M (bits 16-23; 0 = the vertex's candidate count).
-            ((std::getenv("ENGINE_RESTIR_PT_LIST_M") ? (std::min)(255ul, std::strtoul(std::getenv("ENGINE_RESTIR_PT_LIST_M"),
-                nullptr, 10)) : 0ul) << 16);
+        const char* value = std::getenv("ENGINE_RESTIR_PT_LIGHT_BOUNCE_TEST");
+        return value && std::string(value) == "bonly" ? 2048u : 0u;
     }();
     constants.regirPadding[0] = (regirExact ? 1u : 0u) | (pncLog ? 2u : 0u) |
-        (ReGIRListPrototype() && m_restirPtSettings.regirListPrototype ? 4u | listModeBits : 0u);
+        (ReGIRListPrototype() && m_restirPtSettings.regirListPrototype ? listModeBits : 0u) |
+        (m_restirPtSettings.mirrorChainX1Sampling ? mirrorChainX1Bit : 0u) | lightBounceTestBits;
 
     // The SHARC radiance cache: this frame's, resolved before configuration B's kernels (sharcCapacity 0: none).
     if(m_restirPtSharcConstants)
@@ -7647,6 +7787,7 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     std::memcpy(constants.duplicationResponse, duplicationResponse.data(), sizeof(constants.duplicationResponse));
     // M5.6 O0.1: debug view 3's buffer, as descriptor index + 1 (0: none).
     constants.regirPadding[1] = debugPixels ? m_restirPtPass.GetDebugPixels().GetUAVDescriptorIndex() + 1u : 0u;
+
     constants.motionIndex = m_gBuffer.GetMotion().GetSRVIndex();
     // M5.4 C6: the current camera-relative view-projection and the raster identity (dual motion vectors).
     const Matrix4 cameraRelativeViewProjection = CameraRelativeViewProjection(view, projection);
@@ -7768,31 +7909,79 @@ namespace
 // every table light record, the environment's texture, conditional CDF and total weight (the sampling distribution) and
 // its calibrated identity; the settings hash the path-space settings. Read from this frame's accumulation key, which
 // PathTraceReference set before the B frame records.
-ReSTIRPTHistorySignature Renderer::MakeReSTIRPTHistorySignature(const PathTraceReferenceSettings& settings) const
+std::vector<std::array<float, 4>> Renderer::DetectReSTIRPTLightingDiscontinuities(const FrameLighting& frameLighting)
+{
+    if(!m_restirPtCommittedLighting)
+    {
+        m_restirPtPendingLighting = std::make_shared<FrameLighting>(frameLighting);
+        return {};
+    }
+
+    const FrameLighting& committed = *m_restirPtCommittedLighting;
+    const auto same = [](const Vector3& left, const Vector3& right)
+    {
+        return left.x == right.x && left.y == right.y && left.z == right.z;
+    };
+    // The same inputs as SHARC's test (ApplySharcLightingDiscontinuities): an unchanged frame keeps the committed copy.
+    const bool unchanged = same(committed.sun.direction, frameLighting.sun.direction) &&
+        committed.sun.intensity == frameLighting.sun.intensity && same(committed.sun.color, frameLighting.sun.color) &&
+        committed.table == frameLighting.table && committed.tableLightIDs == frameLighting.tableLightIDs;
+
+    if(unchanged)
+    {
+        m_restirPtPendingLighting = m_restirPtCommittedLighting;
+        return {};
+    }
+
+    m_restirPtPendingLighting = std::make_shared<FrameLighting>(frameLighting);
+    const LightingDiscontinuities changes = DetectLightingDiscontinuities(committed, frameLighting, 0.2f, 5.0f,
+        ReSTIRPTMaxDiscontinuityRegions);
+
+    if(changes.global)
+    {
+        ++m_restirPtLightingEpoch;
+        return {};
+    }
+
+    return changes.regions;
+}
+
+ReSTIRPTHistorySignature Renderer::MakeReSTIRPTHistorySignature(const PathTraceReferenceSettings& settings,
+    const FrameLighting& frameLighting) const
 {
     ReSTIRPTHistorySignature signature;
     signature.sceneResourceLifetime = m_sceneResourceLifetime;
     signature.topLevelAddress = m_rayTracingScene.GetTopLevel().GetGPUAddress();
     signature.topLevelGeometry = m_rayTracingScene.GetTLASGeometryIdentity();
-    signature.materialRevision = m_materialPublication.revision;
+    // Material indices are stable (the table is append-only and parameter snapshots keep its size), and every shift
+    // evaluates the current materials, so parameter edits keep history; only the table's size (its topology) counts.
+    signature.materialRevision = m_materialPublication.desired.size();
     signature.width = m_sceneWidth;
     signature.height = m_sceneHeight;
+
+    // Lights by structure, not value: a sample's light endpoint is rebuilt from its table index at shift time (with the
+    // current position, radiance and cone; rcRadiance holds 1 / p_1 of the sample's own frame), so moved or changed lights
+    // keep their samples, as ReSTIR DI keeps them through its light translation (PT.2B). Index identity needs the same
+    // lights in the same order (count, stable IDs, types). Sudden changes are handled by DetectReSTIRPTLightingDiscontinuities:
+    // global ones advance the epoch hashed here, local ones refuse temporal reuse inside their regions.
     std::uint64_t lighting = 0xCBF29CE484222325ull;
+    lighting = HashValue(lighting, m_restirPtLightingEpoch);
+    lighting = HashValue(lighting, frameLighting.table.lightCount);
+
+    for(std::uint32_t light = 0; light < frameLighting.table.lightCount; ++light)
+    {
+        lighting = HashValue(lighting, frameLighting.table.lights[light].type);
+    }
+
+    for(const std::string& identity : frameLighting.tableLightIDs)
+    {
+        lighting = HashBytes(lighting, identity.data(), identity.size());
+        lighting = HashValue(lighting, static_cast<std::uint32_t>(identity.size()));
+    }
 
     if(m_pathTraceAccumulationKey)
     {
         const PathTraceAccumulationKey& key = *m_pathTraceAccumulationKey;
-        lighting = HashValue(lighting, key.sun.direction);
-        lighting = HashValue(lighting, key.sun.color);
-        lighting = HashValue(lighting, key.sun.intensity);
-        lighting = HashValue(lighting, key.sun.angularRadius);
-        lighting = HashValue(lighting, key.lights.lightCount);
-
-        if(!key.lights.lights.empty())
-        {
-            lighting = HashBytes(lighting, key.lights.lights.data(), key.lights.lights.size() * sizeof(GPULight));
-        }
-
         lighting = HashValue(lighting, key.environmentTextureIndex);
         lighting = HashValue(lighting, key.environmentConditionalCDFIndex);
         lighting = HashValue(lighting, key.environmentTotalWeight);
@@ -7822,6 +8011,8 @@ ReSTIRPTHistorySignature Renderer::MakeReSTIRPTHistorySignature(const PathTraceR
     path = HashValue(path, m_restirPtSettings.neeInverseProxy);
     path = HashValue(path, m_restirPtSettings.dualMotion);
     path = HashValue(path, static_cast<int>(m_restirPtSettings.duplication));
+    // Residual boiling §5d option 2: a direct-light reservoir holds a different class of sample.
+    path = HashValue(path, m_restirPtSettings.directReservoir);
     signature.settingsHash = path;
     return signature;
 }
@@ -7908,8 +8099,171 @@ bool Renderer::EnsureReSTIRPT()
     const bool sharcAvailable = NvidiaSharcCapabilityFailure().empty();
     ShaderCompiler::SetRestirPtSharc(sharcAvailable);
     m_debugUI.SetRestirPtSharc(m_restirPtSettings.sharc, sharcAvailable);
+
+    // Pipelines prepared on the worker for the same SHARC choice are adopted (or their failure is the pass's). Otherwise
+    // (a direct Render caller, no worker, a job still running, or a set compiled for the other SHARC choice) they are
+    // created here, blocking.
+    if(m_restirPtPipelinePreparation == ReSTIRPTPipelinePreparation::Prepared && m_restirPtPreparedPipelines)
+    {
+        const bool sameSharc = m_restirPtPreparedPipelines->sharc == sharcAvailable;
+        bool initialized = false;
+
+        if(sameSharc)
+        {
+            initialized = m_restirPtPass.Initialize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_resourceUploader,
+                m_restirPtSettings, *m_restirPtPreparedPipelines);
+        }
+
+        ReleasePreparedReSTIRPTPipelines();
+
+        if(sameSharc)
+        {
+            return initialized;
+        }
+    }
+
     return m_restirPtPass.Initialize(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
         m_resourceUploader, m_restirPtSettings);
+}
+
+ShaderLibraryPreparation Renderer::PrepareReSTIRPTPipelines()
+{
+    ShaderLibraryPreparation result{};
+    result.state = ShaderLibraryPreparationState::PreparingPipelines;
+
+    // A finished job is taken first, also when the pass was meanwhile created synchronously (its set is then released).
+    if(m_restirPtPipelinePreparation == ReSTIRPTPipelinePreparation::Preparing)
+    {
+        TakeReSTIRPTPipelines();
+    }
+
+    if(m_restirPtPass.HasFailed())
+    {
+        result.state = ShaderLibraryPreparationState::Failed;
+        result.diagnostic = m_restirPtPass.GetFailure();
+        return result;
+    }
+
+    if(m_restirPtPass.IsInitialized())
+    {
+        if(m_restirPtPipelinePreparation == ReSTIRPTPipelinePreparation::Prepared)
+        {
+            ReleasePreparedReSTIRPTPipelines();
+        }
+
+        result.state = ShaderLibraryPreparationState::Ready;
+        return result;
+    }
+
+    if(m_restirPtPipelinePreparation == ReSTIRPTPipelinePreparation::NotSubmitted && !SubmitReSTIRPTPipelines())
+    {
+        m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::Synchronous;
+        Log::Warning("ReSTIR PT pipelines: no pipeline worker could take them; they are created when ReSTIR PT starts.");
+    }
+
+    if(m_restirPtPipelinePreparation == ReSTIRPTPipelinePreparation::Prepared ||
+        m_restirPtPipelinePreparation == ReSTIRPTPipelinePreparation::Synchronous)
+    {
+        result.state = ShaderLibraryPreparationState::Ready;
+    }
+
+    return result;
+}
+
+bool Renderer::SubmitReSTIRPTPipelines()
+{
+    if(!m_graphicsDevice.GetDevice() || !m_graphicsDevice.GetRayTracingDevice() || m_shaderLibrary.IsPackaged())
+    {
+        return false;
+    }
+
+    // A worker of its own, so a slow preparation (seconds per kernel after a shader change) never delays the
+    // configuration's DXR pipelines on the shared pipeline worker.
+    if(!m_restirPtPipelineWorker)
+    {
+        auto worker = std::make_unique<RayTracingPipelineWorker>();
+
+        if(!worker->Start())
+        {
+            return false;
+        }
+
+        m_restirPtPipelineWorker = std::move(worker);
+    }
+
+    // As EnsureReSTIRPT compiles them: with the SHARC radiance cache exactly when NVIDIA SHARC is usable here.
+    const bool sharcAvailable = NvidiaSharcCapabilityFailure().empty();
+    ShaderCompiler::SetRestirPtSharc(sharcAvailable);
+    auto prepared = std::make_shared<ReSTIRPTPreparedPipelines>();
+    prepared->sharc = sharcAvailable;
+    const std::filesystem::path shaderRoot = m_shaderLibrary.GetShaderRoot();
+    // Read only by the job (free-threaded device methods); Shutdown joins the worker before the device is released.
+    ID3D12Device* device = m_graphicsDevice.GetDevice();
+    RayTracingPipelineRequest request{};
+    request.key = ReSTIRPTPipelineJobKey;
+    request.device = m_graphicsDevice.GetRayTracingDevice();
+    request.prepareAuxiliary = [prepared, shaderRoot, device]()
+    {
+        return ReSTIRPTPass::PreparePipelines(device, shaderRoot, *prepared);
+    };
+
+    if(!m_restirPtPipelineWorker->Submit(std::move(request)))
+    {
+        return false;
+    }
+
+    m_restirPtPreparedPipelines = std::move(prepared);
+    m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::Preparing;
+    m_restirPtPipelinesRequested = std::chrono::steady_clock::now();
+    Log::Info("ReSTIR PT pipelines: preparing on their own worker.");
+    return true;
+}
+
+void Renderer::TakeReSTIRPTPipelines()
+{
+    if(!m_restirPtPipelineWorker ||
+        m_restirPtPipelineWorker->GetState(ReSTIRPTPipelineJobKey) != RayTracingPipelineJobState::Completed)
+    {
+        return;
+    }
+
+    const std::optional<RayTracingPipelineOutcome> outcome = m_restirPtPipelineWorker->TakeCompleted(ReSTIRPTPipelineJobKey);
+    m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::Prepared;
+
+    // Created on another device (the device was recreated meanwhile): released, and prepared again on the next poll.
+    if(!outcome || outcome->device != m_graphicsDevice.GetRayTracingDevice())
+    {
+        ReleasePreparedReSTIRPTPipelines();
+        m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::NotSubmitted;
+        return;
+    }
+
+    if(!outcome->succeeded && m_restirPtPreparedPipelines->failure.empty())
+    {
+        m_restirPtPreparedPipelines->failure = "the pipeline preparation job failed.";
+    }
+
+    const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+        m_restirPtPipelinesRequested).count();
+
+    if(m_restirPtPreparedPipelines->failure.empty())
+    {
+        Log::Info("ReSTIR PT pipelines: prepared on their worker " + std::to_string(milliseconds) + " ms after the request.");
+    }
+    else
+    {
+        Log::Error("ReSTIR PT pipelines: preparation failed after " + std::to_string(milliseconds) + " ms: " +
+            m_restirPtPreparedPipelines->failure);
+    }
+}
+
+void Renderer::ReleasePreparedReSTIRPTPipelines()
+{
+    if(m_restirPtPreparedPipelines)
+    {
+        m_restirPtPreparedPipelines->Shutdown();
+        m_restirPtPreparedPipelines.reset();
+    }
 }
 
 // M4.3 ReGIR presampling (experimental; ReGIR_M4_3_Math.md): fills the slots the DirectLighting/ReGIR permutation reads,
@@ -8676,8 +9030,17 @@ bool Renderer::CreateDlssFeatureOnLifecycleList(DlssFeatureKind kind,
     {
         // A handle without a usable creation (a partial initialization): its creation commands never execute, so the
         // handle is released at once.
-        const std::string detail = kind == DlssFeatureKind::SuperResolution ? m_dlssBackend.GetFeatureStatus().detail :
-            m_dlssBackend.GetRayReconstructionFeatureStatus().detail;
+        std::string detail = m_dlssBackend.GetFeatureStatus().detail;
+
+        if(kind == DlssFeatureKind::RayReconstruction)
+        {
+            detail = m_dlssBackend.GetRayReconstructionFeatureStatus().detail;
+        }
+        else if(kind == DlssFeatureKind::FrameGeneration)
+        {
+            detail = m_dlssBackend.GetFrameGenerationFeatureStatus().detail;
+        }
+
         m_commandContext.AbandonLifecycleCommands();
         m_dlssBackend.AbandonFeatureCreation(kind, detail);
         return false;
@@ -8917,6 +9280,59 @@ void Renderer::PublishDlssReadout()
         // A latched failure can be retried: Retry clears it at the next ResizeScene (an unavailable runtime cannot).
         const bool rrCanRetry = m_rayReconstructionRequested && !m_rrFailure.empty();
         m_debugUI.SetRayReconstructionReadout(std::move(rrState), std::move(rrDetail), rrCanRetry);
+    }
+
+    // FG.1: Frame Generation's capability and feature slot; FG.3: its requested and effective state.
+    const DlssFrameGenerationStatus& fg = backend.frameGeneration;
+    const DlssFeatureStatus& fgFeature = m_dlssBackend.GetFrameGenerationFeatureStatus();
+    const bool fgHandle = m_dlssBackend.HasFeature(DlssFeatureKind::FrameGeneration);
+    const bool fgAvailable = fg.availability == DlssFrameGenerationAvailability::Available;
+    std::string fgState;
+
+    if(!m_frameGenerationRequested)
+    {
+        fgState = std::string("Off (") + DlssFrameGenerationAvailabilityName(fg.availability) + ")";
+    }
+    else if(!fgAvailable)
+    {
+        fgState = std::string("On but unavailable (") + DlssFrameGenerationAvailabilityName(fg.availability) + ")";
+    }
+    else if(m_frameGenerationEvaluatedLastFrame)
+    {
+        fgState = "Active (2x)";
+    }
+    else
+    {
+        fgState = std::string("On; not generating: ") +
+            (m_frameGenerationInactiveReason.empty() ? "waiting for a frame" : m_frameGenerationInactiveReason);
+    }
+
+#if defined(ENGINE_HAS_DLSS_FG)
+    std::string fgDetail = "Compiled: yes. ";
+#else
+    std::string fgDetail = "Compiled: no. ";
+#endif
+    fgDetail += std::string("Runtime nvngx_dlssg.dll: ") + (fg.runtimePresent ? "present" : "not found") + ". NGX: " +
+        (fg.available ? "available" : "not available") + "; multi-frame count maximum " +
+        std::to_string(fg.multiFrameCountMax) + ". " + fg.detail;
+
+    if(fgHandle)
+    {
+        fgDetail += " Feature: created (" + std::to_string(fgFeature.outputWidth) + "x" +
+            std::to_string(fgFeature.outputHeight) + " output, " + std::to_string(fgFeature.renderWidth) + "x" +
+            std::to_string(fgFeature.renderHeight) + " depth and motion vectors).";
+    }
+    else
+    {
+        fgDetail += " Feature: none.";
+    }
+
+    if(fgState != m_frameGenerationPublishedState || fgDetail != m_frameGenerationPublishedDetail)
+    {
+        Log::Info("DLSS Frame Generation: " + fgState + ". " + fgDetail);
+        m_frameGenerationPublishedState = fgState;
+        m_frameGenerationPublishedDetail = fgDetail;
+        m_debugUI.SetFrameGenerationReadout(std::move(fgState), std::move(fgDetail), fgAvailable);
     }
 }
 
@@ -10346,6 +10762,13 @@ bool Renderer::EnsureNrdHybridDenoiser()
 
     const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
 
+    // Lighting Mode switch hitch: a creation the configuration's preparation started is completed here, waiting for it if it
+    // still runs (a resize since then released it, so it is always for this extent).
+    if(m_nrdHybridDenoiser.IsCreating())
+    {
+        return PollNrdHybridCreation(true) == NrdDenoiser::CreationProgress::Initialized;
+    }
+
     NrdDenoiser::Description description = PathTraceHybridDescription();
 
     if(std::exchange(m_nrdHybridFailCreationForTesting, false) ||
@@ -10357,12 +10780,82 @@ bool Renderer::EnsureNrdHybridDenoiser()
         return false;
     }
 
+    ReportNrdHybridCreated();
+    return true;
+}
+
+// Completes a creation that NrdDenoiser::BeginInitialize started (without wait: only once it finished). A failure is sticky
+// as Initialize's is: the next frame that needs the instance falls back without trying again until the extent changes.
+NrdDenoiser::CreationProgress Renderer::PollNrdHybridCreation(bool wait)
+{
+    if(!m_nrdHybridDenoiser.IsCreating())
+    {
+        return m_nrdHybridDenoiser.IsInitialized() ? NrdDenoiser::CreationProgress::Initialized :
+            NrdDenoiser::CreationProgress::None;
+    }
+
+    const NrdDenoiser::CreationProgress progress = m_nrdHybridDenoiser.FinishInitialize(m_resourceDescriptorHeap, wait);
+
+    if(progress == NrdDenoiser::CreationProgress::Initialized)
+    {
+        ReportNrdHybridCreated();
+    }
+    else if(progress == NrdDenoiser::CreationProgress::Failed)
+    {
+        m_nrdHybridCreationFailed = true;
+    }
+
+    return progress;
+}
+
+void Renderer::ReportNrdHybridCreated()
+{
     ++m_nrdHybridCreations;
     m_nrdHybridInstanceNew = true;
-    Log::Info("NRD hybrid diagnostic initialized at " + std::to_string(m_sceneWidth) + "x" +
-        std::to_string(m_sceneHeight) + ": persistent " + std::to_string(m_nrdHybridDenoiser.GetPersistentMemoryUsageInMb()) +
-        " MiB, transient " + std::to_string(m_nrdHybridDenoiser.GetAliasableMemoryUsageInMb()) + " MiB.");
-    return true;
+    Log::Info("NRD hybrid diagnostic initialized at " + std::to_string(m_nrdHybridDenoiser.GetWidth()) + "x" +
+        std::to_string(m_nrdHybridDenoiser.GetHeight()) + ": persistent " +
+        std::to_string(m_nrdHybridDenoiser.GetPersistentMemoryUsageInMb()) + " MiB, transient " +
+        std::to_string(m_nrdHybridDenoiser.GetAliasableMemoryUsageInMb()) + " MiB.");
+}
+
+// Lighting Mode switch hitch: the NRD Hybrid instance of a pending request that renders at the current extent, created
+// ahead of its switch: the SDK's part (about 50 ms) on the instance's own creation thread, its outputs here once that has
+// finished. A request that resizes the scene is left to its switching frame, since the resize releases the instance (as
+// is a test that injects a creation failure). Never a preparation failure: a failed creation is sticky, and the switching
+// frame falls back exactly as when it creates the instance itself.
+ShaderLibraryPreparation Renderer::PrepareNrdHybridDenoiser(const ConfigurationIdentity& identity)
+{
+    ShaderLibraryPreparation result{};
+    result.state = ShaderLibraryPreparationState::Ready;
+    const bool atCurrentExtent = m_renderScale == RenderScale::Native &&
+        static_cast<RenderScale>(identity.renderScaleIndex) == RenderScale::Native && m_sceneWidth != 0 &&
+        m_sceneHeight != 0;
+
+    if(m_nrdHybridDenoiser.IsInitialized() || m_nrdHybridCreationFailed || m_nrdHybridFailCreationForTesting ||
+        !atCurrentExtent)
+    {
+        return result;
+    }
+
+    if(!m_nrdHybridDenoiser.IsCreating())
+    {
+        const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
+        if(m_nrdHybridDenoiser.BeginInitialize(m_graphicsDevice.GetDevice(), m_commandContext.GetCommandQueue(),
+            m_sceneWidth, m_sceneHeight, PathTraceHybridDescription()))
+        {
+            result.state = ShaderLibraryPreparationState::PreparingPipelines;
+        }
+
+        return result;
+    }
+
+    if(PollNrdHybridCreation(false) == NrdDenoiser::CreationProgress::Running)
+    {
+        result.state = ShaderLibraryPreparationState::PreparingPipelines;
+    }
+
+    return result;
 }
 
 void Renderer::ReleaseNrdHybridDenoiser()
@@ -11876,7 +12369,7 @@ bool Renderer::RenderUIOnly()
     m_referenceRayCounts.Invalidate();
     m_debugUI.SetReferenceRayCounts(m_referenceRayCounts.Get());
     if(m_packagedRuntime || m_resizeFailed || m_applicationWidth == 0 || m_applicationHeight == 0 ||
-        m_sceneInitializationAttempt.candidate || !m_swapChain.GetCurrentBackBuffer())
+        m_sceneInitializationAttempt.candidate || !HasPresentationTarget())
     {
         return false;
     }
@@ -11884,7 +12377,15 @@ bool Renderer::RenderUIOnly()
     // Same allocator/fence and submission association as scene frames. No scene histories,
     // upload regions, thumbnail requests or material publications are touched here.
     RecordingEligibilityScope recordingEligibility{*this};
-    const auto slot = m_swapChain.GetCurrentBackBufferIndex();
+    const auto slot = m_frameSlot;
+    // FG.2: the swap chain's back buffer, or a Frame Generation present composite (acquired before the recording opens, so a
+    // stopped present path leaves nothing to abort).
+    PresentationTarget presentationTarget;
+
+    if(!AcquirePresentationTarget(presentationTarget))
+    {
+        return false;
+    }
 
     if(!BeginTrackedRecording(slot))
     {
@@ -11894,13 +12395,13 @@ bool Renderer::RenderUIOnly()
     auto* commands = m_commandContext.GetCommandList();
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = m_swapChain.GetCurrentBackBuffer();
+    barrier.Transition.pResource = presentationTarget.resource;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateBefore = presentationTarget.idleState;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     commands->ResourceBarrier(1, &barrier);
 
-    const auto target = m_swapChain.GetCurrentRTV();
+    const auto target = presentationTarget.rtv;
     constexpr float background[]{0.035f, 0.04f, 0.05f, 1.0f};
     commands->ClearRenderTargetView(target, background, 0, nullptr);
     commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
@@ -11914,7 +12415,7 @@ bool Renderer::RenderUIOnly()
     m_debugUI.EndFrame(commands);
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateAfter = presentationTarget.idleState;
     commands->ResourceBarrier(1, &barrier);
 
     // Submission failure may follow execution. Keep all owners alive and let the caller
@@ -11924,13 +12425,17 @@ bool Renderer::RenderUIOnly()
         return false;
     }
 
-    return m_swapChain.Present();
+    return PresentTarget(presentationTarget);
 }
 
 Renderer::FrameRenderResult Renderer::Render(
     const Scene& scene,
     const RendererOptions& requestedOptions)
 {
+    // FG.2/FG.3: switches the Frame Generation present path between frames, before anything records, when the Frame
+    // Generation request (or the ENGINE_FG_PRESENT_TEST diagnostics) changed.
+    ApplyFramePresentationRequest();
+
     // M0c.5 Stage 5.3: an Editor frame requesting AIR, its views, mist or haze prepares them first (between frames: nothing is
     // recording yet). Until they are ready the frame records without those requests, so the previous presentation (no AIR) stays;
     // before the first lit frame it also stays unlit (RecordRenderFrame), so no frame is lit without its volumetrics.
@@ -12058,6 +12563,8 @@ Renderer::FrameRenderResult Renderer::Render(
     // S0.5: a fully prepared environment replaces the published one before this frame reads it.
     PublishPreparedEnvironment();
     CollectGeometryUploadRetirements();
+    CollectBLASMemory();
+    CollectTextureMemory();
 
     if (!RecordRenderFrame(scene, options))
     {
@@ -12561,7 +13068,7 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::RecordLightSampling(ID3D12GraphicsCommandLis
 
     LightSamplingConstants constants{};
     std::string failure;
-    const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
+    const unsigned int frameIndex = m_frameSlot;
     // An incremental update publishes its changed words on top of the previous publication, if the buffer holds it.
     const LightSamplingPatch patch{basePublication, &dirty};
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::LightSamplingUpload);
@@ -12701,8 +13208,11 @@ bool Renderer::RecordRenderFrame(
     m_frameLightSamplingConstants = 0;
 
     FinalSceneImage finalImage{};
+    // FG.2: the swap chain's back buffer, or a Frame Generation present composite (acquired before the recording opens);
+    // FG.3: plus the generated frame's composite while DLSS Frame Generation runs.
+    PresentationTarget presentationTarget;
 
-    if (!TryGetFinalSceneImage(finalImage) || !m_swapChain.GetCurrentBackBuffer())
+    if (!TryGetFinalSceneImage(finalImage) || !AcquirePresentationTarget(presentationTarget, true))
     {
         Log::Error("Scene presentation requires a valid final texture and application backbuffer.");
         return false;
@@ -12767,7 +13277,7 @@ bool Renderer::RecordRenderFrame(
     m_cpuFrameTiming.frameSerial = m_gpuProfilerFrameSerial;
     CpuTiming::ScopedDuration renderDuration(m_cpuFrameTiming.render);
 
-    const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
+    const unsigned int frameIndex = m_frameSlot;
 
     if constexpr (kEnableFrameHitchDiagnostics)
     {
@@ -13095,12 +13605,13 @@ bool Renderer::RecordRenderFrame(
     {
         m_airLastRequested = airNow;
     }
-    else if(airNow - m_airLastRequested >= ModeResourceGracePeriod)
+    else if(airNow - m_airLastRequested >= ModeResourceGracePeriod && IsModeResourceMemoryUnderPressure())
     {
+        // Unused AIR storage is released only under memory pressure (ModeResourceGracePeriod).
         m_airField.Release(m_commandContext.GetLastSubmissionFenceValue());
         ++m_airStorageRetirements;
-        Log::Info("AIR storage retired (AIR unused for " + std::to_string(ModeResourceGracePeriod.count()) +
-            " s); released once the GPU completes fence " + std::to_string(m_commandContext.GetLastSubmissionFenceValue()) + ".");
+        Log::Info("AIR storage retired (unused, video memory pressure); released once the GPU completes fence " +
+            std::to_string(m_commandContext.GetLastSubmissionFenceValue()) + ".");
     }
 
     // M0c.6: the AIR vector view's split list (16 MiB, sized for the largest vector budget) the same way, after the grace period
@@ -13111,10 +13622,10 @@ bool Renderer::RecordRenderFrame(
         {
             m_airVectorsLastRequested = airNow;
         }
-        else if(airNow - m_airVectorsLastRequested >= ModeResourceGracePeriod)
+        else if(airNow - m_airVectorsLastRequested >= ModeResourceGracePeriod && IsModeResourceMemoryUnderPressure())
         {
             m_editorAirPass.RetireSplitResources(m_commandContext.GetLastSubmissionFenceValue());
-            Log::Info("AIR vector view resources retired (unused for " + std::to_string(ModeResourceGracePeriod.count()) + " s).");
+            Log::Info("AIR vector view resources retired (unused, video memory pressure).");
         }
     }
 
@@ -13530,6 +14041,7 @@ bool Renderer::RecordRenderFrame(
     m_previousGBufferAvailableThisFrame = false;
     m_rtxdiResources.AbandonFrame();
     m_restirPtPass.AbandonFrame();
+    m_restirPtPendingLighting.reset();
 
     const bool pathTracePrimaryChanged = runPathTrace && m_previousGBufferPrimary &&
         *m_previousGBufferPrimary != pathTracePrimary;
@@ -14255,10 +14767,10 @@ bool Renderer::RecordRenderFrame(
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = m_swapChain.GetCurrentBackBuffer();
+    barrier.Transition.pResource = presentationTarget.resource;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateBefore = presentationTarget.idleState;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
     commandList->ResourceBarrier(1, &barrier);
@@ -14268,7 +14780,7 @@ bool Renderer::RecordRenderFrame(
 
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_swapChain.GetCurrentRTV();
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = presentationTarget.rtv;
 
     D3D12_VIEWPORT viewport{};
     viewport.TopLeftX = 0.0f;
@@ -14880,7 +15392,9 @@ bool Renderer::RecordRenderFrame(
     // them yet (UPSCALING.3C evaluates DLSS here, in place of the diagnostic resolve's colour).
     m_upscalerInputs.prepared = false;
 
-    // RR.1C: Ray Reconstruction frames need the same depth and motion vectors.
+    // RR.1C: Ray Reconstruction frames need the same depth and motion vectors. FG.3: so does DLSS Frame Generation, which
+    // prepares them on its own frames too (without Super Resolution or Ray Reconstruction a failure only stops it).
+    const bool frameGenerationInputs = presentationTarget.generatedComposite.has_value();
     const auto failInputPreparation = [&](const std::string& reason)
     {
         if(m_rrModeThisFrame)
@@ -14890,11 +15404,17 @@ bool Renderer::RecordRenderFrame(
             return;
         }
 
+        if(frameGenerationInputs && !m_dlssModeThisFrame && !m_dlssInputPreparation)
+        {
+            m_frameGenerationInactiveReason = "input preparation failed: " + reason;
+            return;
+        }
+
         FailDlss("Input preparation", reason);
         m_dlssModeThisFrame = false;
     };
 
-    if(((m_dlssInputPreparation && m_dlssFailure.empty()) || m_dlssModeThisFrame || m_rrModeThisFrame)
+    if(((m_dlssInputPreparation && m_dlssFailure.empty()) || m_dlssModeThisFrame || m_rrModeThisFrame || frameGenerationInputs)
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
         && !m_sharcDiagnosticPresentedThisFrame
 #endif
@@ -15272,6 +15792,9 @@ bool Renderer::RecordRenderFrame(
         m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
 
+    // FG.3: on a DLSS Frame Generation frame, the HUD-less image (before the overlays below) for its evaluation.
+    RecordFrameGenerationHudless(commandList, presentationTarget);
+
     // Draw only into the final editor image: temporal history and lighting must never see these lines.
     // The grid goes first so collider lines stay on top of it.
     // Editor overlays are composed only into the Editor fly view; a Game Camera frame never shows them.
@@ -15356,6 +15879,16 @@ bool Renderer::RecordRenderFrame(
     }
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+    // FG.3: DLSS Frame Generation's generated frame, between the previous real frame and this finished one (overlays
+    // included; the HUD-less copy tells it which pixels are overlays).
+    if(presentationTarget.generatedComposite)
+    {
+        presentationTarget.generatedRecorded = RecordFrameGeneration(commandList, frameIndex, frameView,
+            cameraConstants.previousViewProjection, presentationTarget);
+    }
+
+    m_frameGenerationEvaluatedLastFrame = presentationTarget.generatedRecorded;
+
     if (m_packagedRuntime)
     {
         const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(m_applicationWidth), static_cast<float>(m_applicationHeight), 0, 1};
@@ -15379,7 +15912,7 @@ bool Renderer::RecordRenderFrame(
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
             commandList->ResourceBarrier(1, &barrier);
             m_packagedPresentCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
-            commandList->CopyResource(m_packagedPresentCopyForTesting->GetResource(), m_swapChain.GetCurrentBackBuffer());
+            commandList->CopyResource(m_packagedPresentCopyForTesting->GetResource(), presentationTarget.resource);
             m_packagedPresentCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -15387,7 +15920,7 @@ bool Renderer::RecordRenderFrame(
         }
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = presentationTarget.idleState;
         commandList->ResourceBarrier(1, &barrier);
     }
     else
@@ -15443,6 +15976,9 @@ bool Renderer::RecordRenderFrame(
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
 
+        // FG.3: the generated frame's composite gets the same UI over the generated viewport image.
+        RecordGeneratedFrameUi(commandList, presentationTarget, uiViewport, uiScissor, clearColor);
+
         // Verification only, like m_packagedPresentCopyForTesting: the Editor's finished image, UI included.
         if(m_editorPresentCopyForTesting && m_editorPresentCopyForTesting->GetWidth() == m_applicationWidth &&
             m_editorPresentCopyForTesting->GetHeight() == m_applicationHeight)
@@ -15451,7 +15987,7 @@ bool Renderer::RecordRenderFrame(
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
             commandList->ResourceBarrier(1, &barrier);
             m_editorPresentCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
-            commandList->CopyResource(m_editorPresentCopyForTesting->GetResource(), m_swapChain.GetCurrentBackBuffer());
+            commandList->CopyResource(m_editorPresentCopyForTesting->GetResource(), presentationTarget.resource);
             m_editorPresentCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -15459,7 +15995,7 @@ bool Renderer::RecordRenderFrame(
         }
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = presentationTarget.idleState;
 
         commandList->ResourceBarrier(1, &barrier);
 
@@ -15647,6 +16183,14 @@ bool Renderer::RecordRenderFrame(
     m_nrdHybridDispatchedThisFrame = false;
     m_rtxdiResources.CommitFrame();
     m_restirPtPass.CommitFrame();
+
+    // The committed ReSTIR PT frame's lighting: the next frame's discontinuities are measured against it.
+    if(m_restirPtPendingLighting)
+    {
+        m_restirPtCommittedLighting = std::move(m_restirPtPendingLighting);
+        m_restirPtPendingLighting.reset();
+    }
+
     m_sharcNvidia.CommitSubmission();
 
     // Capture the successful submission fence now; confirmation retains owners, not completion proof.
@@ -15692,9 +16236,8 @@ bool Renderer::RecordRenderFrame(
     ++m_gpuProfilerFrameSerial;
 
     postSubmissionProbe.reset();
-    const auto presentStart = CpuTiming::Clock::now();
-    const bool presented = m_swapChain.Present();
-    m_cpuFrameTiming.present = CpuTiming::MillisecondsSince(presentStart);
+    // FG.2: the swap chain presents (as before), or the Frame Generation present thread receives the composite.
+    const bool presented = CompletePresentation(presentationTarget);
     m_cpuFrameTiming.presentReturn = CpuTiming::Clock::now();
 
     m_cpuFrameTiming.presentationReturned = true;
@@ -15780,6 +16323,9 @@ void Renderer::Shutdown()
 
     Log::Info("Renderer shutdown: releasing ray tracing scene resources.");
     m_rayTracingScene.Shutdown();
+    m_blasMemoryPool.Shutdown();
+    // The final drain is the full-idle point at which texture heaps may go back to the OS.
+    TextureMemoryAllocator::Trim();
     Log::Info("Renderer shutdown: ray tracing resources released.");
     m_textureThumbnails.ClearAfterGPUDrain();
 
@@ -15806,6 +16352,9 @@ void Renderer::Shutdown()
 
     Log::Info("Renderer shutdown: releasing renderer resources...");
 
+    // FG.2: the present thread stops (presenting what was submitted; the frame queue is drained) before the swap chain goes.
+    m_framePresenter.Shutdown();
+    m_frameGenerationPresentation = false;
     m_swapChain.Shutdown();
     m_gpuTimestampProfiler.Shutdown();
     m_commandContext.Shutdown();
@@ -15882,6 +16431,17 @@ void Renderer::Shutdown()
         m_volumetricShaders->Shutdown();
         m_volumetricShaders.reset();
     }
+
+    // ReSTIR PT's pipeline worker is joined the same way; after the join no job uses the prepared set, which is released
+    // here when it was never adopted (the pass releases its own references below).
+    if(m_restirPtPipelineWorker)
+    {
+        m_restirPtPipelineWorker->Shutdown();
+        m_restirPtPipelineWorker.reset();
+    }
+
+    ReleasePreparedReSTIRPTPipelines();
+    m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::NotSubmitted;
 
     m_volumetricState = VolumetricState::NotRequested;
     m_volumetricHoldThisFrame = false;
@@ -17058,6 +17618,10 @@ bool Renderer::PreprocessEnvironment(EnvironmentMap& environment)
 
     diffuseIrradiancePass.Execute(commandList, environment.GetSourceTexture(), environment.GetDiffuseIrradiance());
 
+    // A placed cube starts undefined: discard it before its first draw (TextureMemoryAllocator.h). The source was
+    // activated before its upload.
+    TextureMemoryAllocator::RecordActivation(commandList, environment.GetCubemap().GetResource(),
+        environment.GetCubemap().GetSubresourceState(0));
     equirectangularToCubemapPass.Execute(commandList, environment.GetSourceTexture(), environment.GetCubemap());
 
     ggxMultiscatterIrradiancePass.Execute(commandList, environment.GetSourceTexture(), m_brdfIntegrationLUT,

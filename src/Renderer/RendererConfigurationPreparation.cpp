@@ -15,6 +15,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <filesystem>
+#include <memory>
+#include <optional>
 
 #include "Core/Log.h"
 #include "Debug/TransitionTiming.h"
@@ -141,6 +144,46 @@ PreparationStep Renderer::PrepareConfiguration(const ConfigurationIdentity& iden
         }
     }
 
+    // ReSTIR PT Enhanced (Editor-only): its compute pipelines, prepared on their own worker (usually in the background while
+    // Path Tracing was presented) and adopted here, and its radiance cache's NVIDIA SHARC libraries (the cache-feedback set
+    // its SHARC gate selects), so the switching frame creates no pipeline and renders the cache from its first frame.
+    if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT && !m_packagedRuntime)
+    {
+        if(due(16u))
+        {
+            ShaderLibraryPreparation pipelines = PrepareReSTIRPTPipelines();
+
+            if(pipelines.state == ShaderLibraryPreparationState::Ready && !EnsureReSTIRPT())
+            {
+                pipelines.state = ShaderLibraryPreparationState::Failed;
+                pipelines.diagnostic = m_restirPtPass.GetFailure();
+            }
+
+            note("ReSTIR PT pipelines", pipelines, 16u);
+        }
+
+        if(m_restirPtSettings.sharc && NvidiaSharcCapabilityFailure().empty() && due(32u))
+        {
+            PathTraceLibraryNeeds cacheNeeds = GetPathTraceLibraryNeeds(mode, identity.denoiser, true);
+            cacheNeeds.radianceCacheImplementation = PathTraceRadianceCacheImplementation::Nvidia;
+            note("ReSTIR PT radiance cache libraries", PrepareDxrLibraries(cacheNeeds), 32u);
+        }
+    }
+
+    // Lighting Mode switch hitch: a request for Ray Reconstruction has its input-preparation pipelines built on the pipeline
+    // worker, so its first frame creates none (the PSR variant alone took about a second there with a cold driver cache).
+    if(RequestsRayReconstructionInputs(identity) && due(64u))
+    {
+        note("Ray Reconstruction input pipelines", PrepareRrInputPipelines(), 64u);
+    }
+
+    // Lighting Mode switch hitch: the NRD Hybrid instance of a request that denoises with it is created ahead of the switch
+    // (about 50 ms in the switching frame otherwise), its SDK part on a thread of its own.
+    if(RequestsNrdHybridInstance(identity) && due(128u))
+    {
+        note("NRD Hybrid instance", PrepareNrdHybridDenoiser(identity), 128u);
+    }
+
     // M0c.5 Stage 5.5: a request for DLSS waits for NGX, initialized on its own thread from here or from InitializeProject (the
     // presented configuration keeps rendering, so enabling DLSS mid-session no longer stalls a frame). The switching frame
     // then sizes the scene once, at NGX's extent. A failed NGX is not a preparation failure: as before, DLSS is unavailable and
@@ -213,6 +256,17 @@ float Renderer::EstimatePreparationProgress(const ConfigurationIdentity& identit
     expectedSets |= identity.denoiser != m_pathTraceDenoiserMode ? 1u : 0u;
     expectedSets |= identity.sharc ? 2u : 0u;
     expectedSets |= identity.psrChain != 0 ? 8u : 0u;
+
+    // ReSTIR PT Enhanced's pipelines and, with its radiance cache on, the cache's libraries (PrepareConfiguration).
+    if(identity.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT && !m_packagedRuntime)
+    {
+        const bool nvidiaSharcUsable = m_sharcNvidiaCapabilityFailure && m_sharcNvidiaCapabilityFailure->empty();
+        expectedSets |= 16u;
+        expectedSets |= m_restirPtSettings.sharc && nvidiaSharcUsable ? 32u : 0u;
+    }
+
+    expectedSets |= RequestsRayReconstructionInputs(identity) ? 64u : 0u;
+    expectedSets |= RequestsNrdHybridInstance(identity) ? 128u : 0u;
     const int setCount = std::popcount(expectedSets);
     const int readySets = std::popcount(expectedSets & m_preparedSteps);
     const double units = static_cast<double>(libraries.size() + static_cast<std::size_t>(setCount));
@@ -236,6 +290,16 @@ const RenderingConfiguration& Renderer::SelectPresentedConfiguration(const Rende
         preparation.PresentInitial(requested);
     }
 
+    // ReSTIR PT Enhanced (Editor-only): its pipelines are prepared in the background once a path-traced configuration is
+    // presented (its estimator is offered there) and the startup request is done, so a later switch to it finds them
+    // ready. Only their worker runs (no GPU resource is created until ReSTIR PT is requested); a poll is cheap.
+    const ConfigurationPreparationStatus& status = preparation.GetStatus();
+
+    if(!m_packagedRuntime && !status.startupPreparing && status.presented.lightingMode != RendererLightingMode::Legacy)
+    {
+        PrepareReSTIRPTPipelines();
+    }
+
     // The previous switching frame: if the renderer could not activate the presented mode (it fell back in that recording),
     // the configuration presented before it is restored rather than leaving a partial one presented.
     if(preparation.IsSwitchPendingFirstFrame())
@@ -255,10 +319,15 @@ const RenderingConfiguration& Renderer::SelectPresentedConfiguration(const Rende
 
     if(identity == preparation.GetStatus().presented)
     {
+        // A background NRD Hybrid creation whose request was withdrawn is completed once it finishes, so NRD retention
+        // tracks (and in time retires) the instance like any other.
+        PollNrdHybridCreation(false);
         preparation.PresentSameIdentity(requested);
         return Presented();
     }
 
+    // Not part of the identity: the request's own Ray Reconstruction selection, for its input pipelines' preparation.
+    m_pendingRayReconstructionRequested = requested.rayReconstructionRequested;
     const bool newRequest = preparation.Request(identity, now);
 
     // A failed request keeps the presented configuration; it is attempted again after the retry interval.
@@ -388,4 +457,85 @@ void Renderer::ReleaseUnusedLegacyTextures()
     m_legacyLighting.ReleaseTextures();
     retention.resident = false;
     Log::Info("Released the unused Legacy lighting textures: the starting configuration does not render Legacy.");
+}
+
+// Ray Reconstruction (Editor only) denoises the raster-primary ReSTIR modes' extraction, so only their requests with a
+// denoiser and the RR selection prepare its input pipelines.
+bool Renderer::RequestsRayReconstructionInputs(const ConfigurationIdentity& identity) const
+{
+    return m_pendingRayReconstructionRequested && !m_packagedRuntime && IsRasterPrimaryReSTIRMode(identity.lightingMode) &&
+        identity.denoiser != PathTraceDenoiserMode::Off;
+}
+
+// The raster-primary ReSTIR modes denoise with the NRD Hybrid instance unless Ray Reconstruction replaces it (RR frames
+// never run NRD).
+bool Renderer::RequestsNrdHybridInstance(const ConfigurationIdentity& identity) const
+{
+    return IsRasterPrimaryReSTIRMode(identity.lightingMode) && identity.denoiser == PathTraceDenoiserMode::NrdHybrid &&
+        !RequestsRayReconstructionInputs(identity);
+}
+
+// Lighting Mode switch hitch: the Ray Reconstruction input pipelines, built on the pipeline worker (with its own
+// ShaderLibrary) and adopted here on the renderer thread, so the first RR frame creates none. Ready as well when they
+// cannot be prepared (no worker, or the job failed): the first RR frame then creates them as before and reports a failure
+// itself, so this step never fails a configuration.
+ShaderLibraryPreparation Renderer::PrepareRrInputPipelines()
+{
+    ShaderLibraryPreparation result{};
+    result.state = ShaderLibraryPreparationState::Ready;
+
+    if(m_rrPipelinePreparationDone || m_rrInputPreparationPass.HasPipelines() || !m_pipelineWorkerRunning ||
+        !m_pipelineWorker || m_shaderLibrary.IsPackaged())
+    {
+        return result;
+    }
+
+    const std::string key = "Ray Reconstruction input pipelines";
+    const RayTracingPipelineJobState state = m_pipelineWorker->GetState(key);
+
+    if(state == RayTracingPipelineJobState::Completed)
+    {
+        const std::optional<RayTracingPipelineOutcome> outcome = m_pipelineWorker->TakeCompleted(key);
+
+        // Nothing in the prepared set was ever bound; it is published only here, on the renderer thread.
+        if(outcome && outcome->succeeded && outcome->device == m_graphicsDevice.GetRayTracingDevice() &&
+            m_rrPreparedPipelines)
+        {
+            m_rrInputPreparationPass.AdoptPrepared(*m_rrPreparedPipelines);
+        }
+
+        m_rrPreparedPipelines.reset();
+        m_rrPipelinePreparationDone = true;
+        return result;
+    }
+
+    if(state == RayTracingPipelineJobState::None)
+    {
+        auto prepared = std::make_shared<RrInputPreparationPass::PreparedPipelines>();
+        const std::filesystem::path shaderRoot = m_shaderLibrary.GetShaderRoot();
+        // Read only by the job (free-threaded device methods); Shutdown joins the worker before the device is released.
+        ID3D12Device* device = m_graphicsDevice.GetDevice();
+        RayTracingPipelineRequest request{};
+        request.key = key;
+        request.device = m_graphicsDevice.GetRayTracingDevice();
+        request.prepareAuxiliary = [prepared, shaderRoot, device]()
+        {
+            ShaderLibrary shaders;
+            const bool ready = shaders.Initialize(shaderRoot) &&
+                RrInputPreparationPass::PreparePipelines(device, shaders, *prepared);
+            shaders.Shutdown();
+            return ready;
+        };
+
+        if(!m_pipelineWorker->Submit(std::move(request)))
+        {
+            m_rrPipelinePreparationDone = true;
+            return result;
+        }
+
+        m_rrPreparedPipelines = std::move(prepared);
+    }
+
+    result.state = ShaderLibraryPreparationState::PreparingPipelines;
+    return result;
 }

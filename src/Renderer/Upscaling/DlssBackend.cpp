@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <iterator>
+#include <limits>
 #include <system_error>
 #include <utility>
 
@@ -23,12 +25,31 @@
 #if defined(ENGINE_HAS_DLSS_RR)
 #include <nvsdk_ngx_helpers_dlssd_d3d.h>
 #endif
+#if defined(ENGINE_HAS_DLSS_FG)
+#include <nvsdk_ngx_helpers_dlssg_d3d.h>
+#endif
 #endif
 
 namespace
 {
     // RR.1A: the production Ray Reconstruction runtime NGX loads from beside the executable (RR guide 2.1, 4.2).
     constexpr const char* RayReconstructionRuntimeName = "nvngx_dlssd.dll";
+    // FG.1: the production Frame Generation runtime, likewise (FG guide 1, "Feature Dynamic Libraries").
+    constexpr const char* FrameGenerationRuntimeName = "nvngx_dlssg.dll";
+
+    const char* FeatureName(DlssFeatureKind kind) noexcept
+    {
+        switch(kind)
+        {
+        case DlssFeatureKind::RayReconstruction:
+            return "DLSS Ray Reconstruction";
+        case DlssFeatureKind::FrameGeneration:
+            return "DLSS Frame Generation";
+        case DlssFeatureKind::SuperResolution:
+        default:
+            return "DLSS Super Resolution";
+        }
+    }
 
 #if defined(ENGINE_HAS_DLSS)
     // NGX logs and temporary files: Known Folder LocalAppData/Engine/NGX (empty when it cannot be created).
@@ -124,6 +145,35 @@ const char* DlssRayReconstructionAvailabilityName(DlssRayReconstructionAvailabil
     return "Unknown";
 }
 
+const char* DlssFrameGenerationAvailabilityName(DlssFrameGenerationAvailability availability) noexcept
+{
+    switch(availability)
+    {
+    case DlssFrameGenerationAvailability::NotCompiled:
+        return "Not compiled";
+    case DlssFrameGenerationAvailability::NotPermitted:
+        return "Not permitted (Editor only for now)";
+    case DlssFrameGenerationAvailability::NotInitialized:
+        return "Not initialized";
+    case DlssFrameGenerationAvailability::RuntimeMissing:
+        return "Runtime missing";
+    case DlssFrameGenerationAvailability::NgxInitializationFailed:
+        return "NGX initialization failed";
+    case DlssFrameGenerationAvailability::CapabilityQueryFailed:
+        return "Capability query failed";
+    case DlssFrameGenerationAvailability::DriverOutdated:
+        return "Driver update required";
+    case DlssFrameGenerationAvailability::Unsupported:
+        return "Unsupported";
+    case DlssFrameGenerationAvailability::FeatureInitFailed:
+        return "Feature initialization failed";
+    case DlssFrameGenerationAvailability::Available:
+        return "Available";
+    }
+
+    return "Unknown";
+}
+
 const char* DlssQualityPresetName(DlssQualityPreset preset) noexcept
 {
     switch(preset)
@@ -194,6 +244,7 @@ bool DlssBackend::RecoveryRequired() const
 {
     ResolvePendingEvaluation(m_superResolution);
     ResolvePendingEvaluation(m_rayReconstruction);
+    ResolvePendingEvaluation(m_frameGeneration);
     return m_recoveryRequired;
 }
 
@@ -231,7 +282,7 @@ void DlssBackend::ConfirmRecordingSubmitted(std::uint64_t recording, std::uint64
         return;
     }
 
-    for(FeatureSlot* slot : {&m_superResolution, &m_rayReconstruction})
+    for(FeatureSlot* slot : {&m_superResolution, &m_rayReconstruction, &m_frameGeneration})
     {
         if(slot->pendingRecording != recording)
         {
@@ -302,9 +353,7 @@ bool DlssBackend::ReleaseFeature(DlssFeatureKind kind, std::uint64_t completedFe
 
     if(!CanRelease(slot, completedFenceValue, gpuIdle, reason))
     {
-        Log::Error(std::string("DLSS: refused to release the ") +
-            (kind == DlssFeatureKind::SuperResolution ? "Super Resolution" : "Ray Reconstruction") + " feature: " + reason +
-            ".");
+        Log::Error(std::string("DLSS: refused to release the ") + FeatureName(kind) + " feature: " + reason + ".");
         return false;
     }
 
@@ -319,7 +368,8 @@ bool DlssBackend::HasFeature(DlssFeatureKind kind) const noexcept
 
 unsigned int DlssBackend::LiveFeatureCount() const noexcept
 {
-    return (m_superResolution.handle ? 1u : 0u) + (m_rayReconstruction.handle ? 1u : 0u);
+    return (m_superResolution.handle ? 1u : 0u) + (m_rayReconstruction.handle ? 1u : 0u) +
+        (m_frameGeneration.handle ? 1u : 0u);
 }
 
 bool DlssBackend::FeatureCreationNeeded(unsigned int renderWidth, unsigned int renderHeight, unsigned int outputWidth,
@@ -343,6 +393,16 @@ bool DlssBackend::RayReconstructionCreationNeeded(unsigned int renderWidth, unsi
     return !(sameExtents && (feature.active || feature.createResult != 0));
 }
 
+bool DlssBackend::FrameGenerationCreationNeeded(unsigned int outputWidth, unsigned int outputHeight, unsigned int renderWidth,
+    unsigned int renderHeight, std::uint32_t backbufferFormat) const
+{
+    const DlssFeatureStatus& feature = m_frameGeneration.status;
+    const bool sameParameters = feature.outputWidth == outputWidth && feature.outputHeight == outputHeight &&
+        feature.renderWidth == renderWidth && feature.renderHeight == renderHeight &&
+        feature.backbufferFormat == backbufferFormat;
+    return !(sameParameters && (feature.active || feature.createResult != 0));
+}
+
 #if !defined(ENGINE_HAS_DLSS)
 
 void DlssBackend::Initialize(ID3D12Device*)
@@ -352,6 +412,8 @@ void DlssBackend::Initialize(ID3D12Device*)
     m_status.detail = "DLSS backend was not built (SDK missing in AUTO, or build policy OFF).";
     m_status.rayReconstruction.availability = DlssRayReconstructionAvailability::NotCompiled;
     m_status.rayReconstruction.detail = "DLSS Ray Reconstruction was not built (it needs the DLSS backend).";
+    m_status.frameGeneration.availability = DlssFrameGenerationAvailability::NotCompiled;
+    m_status.frameGeneration.detail = "DLSS Frame Generation was not built (it needs the DLSS backend).";
     Log::Info("DLSS Super Resolution: Not compiled. " + m_status.detail);
 }
 
@@ -426,6 +488,18 @@ bool DlssBackend::EvaluateRayReconstruction(ID3D12GraphicsCommandList*, const Dl
     return false;
 }
 
+bool DlssBackend::EnsureFrameGenerationFeature(ID3D12GraphicsCommandList*, unsigned int, unsigned int, unsigned int,
+    unsigned int, std::uint32_t)
+{
+    m_frameGeneration.status.detail = "DLSS Frame Generation not compiled.";
+    return false;
+}
+
+bool DlssBackend::EvaluateFrameGeneration(ID3D12GraphicsCommandList*, const DlssFrameGenerationEvaluation&)
+{
+    return false;
+}
+
 #else
 
 DlssBackend::InitializationRequest DlssBackend::MakeInitializationRequest() const
@@ -435,6 +509,7 @@ DlssBackend::InitializationRequest DlssBackend::MakeInitializationRequest() cons
     request.rayReconstructionPermitted = m_rayReconstructionPermitted;
     request.rayReconstructionRuntimeName = rayReconstructionRuntimeNameForTesting ? *rayReconstructionRuntimeNameForTesting :
         std::string(RayReconstructionRuntimeName);
+    request.frameGenerationPermitted = m_frameGenerationPermitted;
     return request;
 }
 
@@ -448,6 +523,8 @@ void DlssBackend::Adopt(InitializationOutcome outcome, ID3D12Device* device)
     Log::Info(std::string("DLSS Ray Reconstruction: ") +
         DlssRayReconstructionAvailabilityName(m_status.rayReconstruction.availability) + ". " +
         m_status.rayReconstruction.detail);
+    Log::Info(std::string("DLSS Frame Generation: ") +
+        DlssFrameGenerationAvailabilityName(m_status.frameGeneration.availability) + ". " + m_status.frameGeneration.detail);
 }
 
 void DlssBackend::Initialize(ID3D12Device* device)
@@ -523,6 +600,23 @@ DlssBackend::InitializationOutcome DlssBackend::RunInitialize(ID3D12Device* devi
     rayReconstruction.detail = "DLSS Ray Reconstruction was not built (ENGINE_ENABLE_DLSS_RR, or its SDK files are missing).";
 #endif
 
+    // FG.1 Stage 0: the same for Frame Generation.
+    DlssFrameGenerationStatus& frameGeneration = status.frameGeneration;
+#if defined(ENGINE_HAS_DLSS_FG)
+    if(!request.frameGenerationPermitted)
+    {
+        frameGeneration.availability = DlssFrameGenerationAvailability::NotPermitted;
+        frameGeneration.detail = "Frame Generation starts in the Editor viewport; packaged games get it in a later stage.";
+    }
+    else
+    {
+        frameGeneration.runtimePresent = RuntimeBesideExecutable(FrameGenerationRuntimeName);
+    }
+#else
+    frameGeneration.availability = DlssFrameGenerationAvailability::NotCompiled;
+    frameGeneration.detail = "DLSS Frame Generation was not built (ENGINE_ENABLE_DLSS_FG, or its SDK files are missing).";
+#endif
+
     const auto finish = [&](DlssAvailability availability, std::string detail)
     {
         status.availability = availability;
@@ -534,6 +628,14 @@ DlssBackend::InitializationOutcome DlssBackend::RunInitialize(ID3D12Device* devi
             rayReconstruction.availability = outcome.initialized ? DlssRayReconstructionAvailability::CapabilityQueryFailed :
                 DlssRayReconstructionAvailability::NgxInitializationFailed;
             rayReconstruction.detail = "NGX was not ready for Ray Reconstruction: " + status.detail;
+        }
+
+        // FG.1: likewise for Frame Generation.
+        if(frameGeneration.availability == DlssFrameGenerationAvailability::NotInitialized)
+        {
+            frameGeneration.availability = outcome.initialized ? DlssFrameGenerationAvailability::CapabilityQueryFailed :
+                DlssFrameGenerationAvailability::NgxInitializationFailed;
+            frameGeneration.detail = "NGX was not ready for Frame Generation: " + status.detail;
         }
 
         status.initializeMilliseconds =
@@ -650,6 +752,74 @@ DlssBackend::InitializationOutcome DlssBackend::RunInitialize(ID3D12Device* devi
         {
             decide(DlssRayReconstructionAvailability::Available, "NGX reports Ray Reconstruction available (driver minimum " +
                 std::to_string(rrMinDriverMajor) + "." + std::to_string(rrMinDriverMinor) + ").");
+        }
+    }
+#endif
+
+#if defined(ENGINE_HAS_DLSS_FG)
+    // FG.1 Stage 3c: Frame Generation capability, the FrameGeneration.* parameters and DLSSG.MultiFrameCountMax
+    // (nvsdk_ngx_defs_dlssg.h; FG guide 4).
+    if(frameGeneration.availability == DlssFrameGenerationAvailability::NotInitialized)
+    {
+        int fgNeedsUpdatedDriver = 0;
+        unsigned int fgMinDriverMajor = 0;
+        unsigned int fgMinDriverMinor = 0;
+        int fgAvailable = 0;
+        int fgFeatureInitResult = 0;
+        unsigned int fgMultiFrameCountMax = 0;
+        const bool fgDriverKnown = NVSDK_NGX_SUCCEED(
+            parameters->Get(NVSDK_NGX_Parameter_FrameGeneration_NeedsUpdatedDriver, &fgNeedsUpdatedDriver));
+        parameters->Get(NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMajor, &fgMinDriverMajor);
+        parameters->Get(NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMinor, &fgMinDriverMinor);
+        const bool fgAvailableKnown =
+            NVSDK_NGX_SUCCEED(parameters->Get(NVSDK_NGX_Parameter_FrameGeneration_Available, &fgAvailable));
+        const bool fgInitResultKnown = NVSDK_NGX_SUCCEED(
+            parameters->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult, &fgFeatureInitResult));
+        parameters->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &fgMultiFrameCountMax);
+        frameGeneration.needsUpdatedDriver = fgDriverKnown && fgNeedsUpdatedDriver != 0;
+        frameGeneration.minDriverVersionMajor = fgMinDriverMajor;
+        frameGeneration.minDriverVersionMinor = fgMinDriverMinor;
+        frameGeneration.available = fgAvailableKnown && fgAvailable != 0;
+        frameGeneration.featureInitResult = fgFeatureInitResult;
+        frameGeneration.multiFrameCountMax = fgMultiFrameCountMax;
+        const auto decide = [&](DlssFrameGenerationAvailability availability, std::string detail)
+        {
+            frameGeneration.availability = availability;
+            frameGeneration.detail = std::move(detail);
+        };
+
+        // As for Ray Reconstruction, the missing runtime is the actionable reason and is reported first.
+        if(!frameGeneration.runtimePresent)
+        {
+            decide(DlssFrameGenerationAvailability::RuntimeMissing, std::string(FrameGenerationRuntimeName) +
+                " is not next to the executable.");
+        }
+        else if(frameGeneration.needsUpdatedDriver)
+        {
+            decide(DlssFrameGenerationAvailability::DriverOutdated, "Requires driver " + std::to_string(fgMinDriverMajor) +
+                "." + std::to_string(fgMinDriverMinor) + " or newer.");
+        }
+        else if(!fgAvailableKnown)
+        {
+            decide(DlssFrameGenerationAvailability::CapabilityQueryFailed, "FrameGeneration.Available capability query failed.");
+        }
+        else if(!frameGeneration.available)
+        {
+            decide(DlssFrameGenerationAvailability::Unsupported,
+                "FrameGeneration.Available is 0 (an RTX 40-series GPU or newer is required).");
+        }
+        else if(fgInitResultKnown && NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(fgFeatureInitResult)))
+        {
+            // The FG guide's UI rules name Windows' hardware-accelerated GPU scheduling as a reason it fails to initialize.
+            decide(DlssFrameGenerationAvailability::FeatureInitFailed, "FrameGeneration.FeatureInitResult is " +
+                Hex(static_cast<std::uint32_t>(fgFeatureInitResult)) +
+                " (check that Windows' hardware-accelerated GPU scheduling is on).");
+        }
+        else
+        {
+            decide(DlssFrameGenerationAvailability::Available, "NGX reports Frame Generation available (driver minimum " +
+                std::to_string(fgMinDriverMajor) + "." + std::to_string(fgMinDriverMinor) + ", multi-frame count maximum " +
+                std::to_string(fgMultiFrameCountMax) + "; Engine uses 2x).");
         }
     }
 #endif
@@ -932,8 +1102,7 @@ void DlssBackend::AbandonFeatureCreation(DlssFeatureKind kind, const std::string
     slot.status.createResult = slot.status.createResult != 0 && NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(
         slot.status.createResult)) ? slot.status.createResult : 0xFFFFFFFDu;
     slot.status.detail = detail;
-    Log::Error(std::string(kind == DlssFeatureKind::SuperResolution ? "DLSS Super Resolution" : "DLSS Ray Reconstruction") +
-        ": creation abandoned: " + detail);
+    Log::Error(std::string(FeatureName(kind)) + ": creation abandoned: " + detail);
 }
 
 bool DlssBackend::Evaluate(ID3D12GraphicsCommandList* commandList, const DlssEvaluation& evaluation)
@@ -1340,6 +1509,188 @@ bool DlssBackend::QueryRayReconstructionMemory(std::uint64_t& bytes)
 #endif
 }
 
+bool DlssBackend::EnsureFrameGenerationFeature(ID3D12GraphicsCommandList* lifecycleList, unsigned int outputWidth,
+    unsigned int outputHeight, unsigned int renderWidth, unsigned int renderHeight, std::uint32_t backbufferFormat)
+{
+    FeatureSlot& slot = m_frameGeneration;
+    DlssFeatureStatus& feature = slot.status;
+
+    if(RecoveryRequired())
+    {
+        return false;
+    }
+
+    if(!FrameGenerationCreationNeeded(outputWidth, outputHeight, renderWidth, renderHeight, backbufferFormat))
+    {
+        return feature.active;
+    }
+
+    if(slot.handle)
+    {
+        Log::Error("DLSS Frame Generation: a feature for other parameters is still live; it must be released before creation.");
+        return false;
+    }
+
+    feature = {};
+    feature.renderWidth = renderWidth;
+    feature.renderHeight = renderHeight;
+    feature.outputWidth = outputWidth;
+    feature.outputHeight = outputHeight;
+    feature.backbufferFormat = backbufferFormat;
+
+#if defined(ENGINE_HAS_DLSS_FG)
+    const bool validExtents = outputWidth != 0 && outputHeight != 0 && renderWidth != 0 && renderHeight != 0;
+
+    if(m_status.frameGeneration.availability != DlssFrameGenerationAvailability::Available || !lifecycleList ||
+        !validExtents)
+    {
+        feature.createResult = 0xFFFFFFFFu;
+        feature.detail = std::string("Frame Generation is not available: ") +
+            DlssFrameGenerationAvailabilityName(m_status.frameGeneration.availability) + ".";
+        return false;
+    }
+
+    if(!EnsureParameters(slot, "DLSS Frame Generation"))
+    {
+        return false;
+    }
+
+    // FG guide 5: the output (back-buffer) extent and format, and the extent depth and motion vectors are rendered at (the
+    // DLSS input extent). Engine's extents are fixed per feature, so no dynamic resolution.
+    NVSDK_NGX_DLSSG_Create_Params create{};
+    create.Width = outputWidth;
+    create.Height = outputHeight;
+    create.NativeBackbufferFormat = backbufferFormat;
+    create.RenderWidth = renderWidth;
+    create.RenderHeight = renderHeight;
+    create.DynamicResolutionScaling = false;
+
+    NVSDK_NGX_Handle* handle = nullptr;
+    const NVSDK_NGX_Result created = NGX_D3D12_CREATE_DLSSG(lifecycleList, 1, 1, &handle,
+        static_cast<NVSDK_NGX_Parameter*>(slot.parameters), &create);
+    feature.createResult = static_cast<std::uint32_t>(created);
+
+    if(NVSDK_NGX_FAILED(created) || !handle)
+    {
+        feature.detail = "NGX_D3D12_CREATE_DLSSG returned " + Hex(created) + ".";
+        Log::Error("DLSS Frame Generation: " + feature.detail);
+        return false;
+    }
+
+    slot.handle = handle;
+    slot.creationPending = true;
+
+    if(std::exchange(failNextCreationForTesting, false))
+    {
+        feature.detail = "diagnostic: creation reported failed after NGX created the feature.";
+        return false;
+    }
+
+    feature.active = true;
+    feature.detail = "Created (2x).";
+    Log::Info("DLSS Frame Generation feature created: " + std::to_string(outputWidth) + "x" + std::to_string(outputHeight) +
+        " output (format " + std::to_string(backbufferFormat) + "), " + std::to_string(renderWidth) + "x" +
+        std::to_string(renderHeight) + " depth and motion vectors.");
+    return true;
+#else
+    (void)lifecycleList;
+    feature.createResult = 0xFFFFFFFFu;
+    feature.detail = "DLSS Frame Generation not compiled.";
+    return false;
+#endif
+}
+
+bool DlssBackend::EvaluateFrameGeneration(ID3D12GraphicsCommandList* commandList,
+    const DlssFrameGenerationEvaluation& evaluation)
+{
+#if defined(ENGINE_HAS_DLSS_FG)
+    FeatureSlot& slot = m_frameGeneration;
+
+    if(!slot.status.active || !slot.handle || !commandList || slot.creationPending)
+    {
+        return false;
+    }
+
+    // RR.1A: an instance awaiting its restart is never evaluated.
+    if(RecoveryRequired())
+    {
+        slot.status.detail = "NGX recovery pending after a discarded evaluation.";
+        return false;
+    }
+
+    const bool reset = evaluation.reset || EvaluationNeedsReset(DlssFeatureKind::FrameGeneration);
+
+    // Stage 1: the resources (FG guide 6). The real frame is presented from Engine's own composite, so no OutputReal.
+    NVSDK_NGX_D3D12_DLSSG_Eval_Params resources{};
+    resources.pBackbuffer = evaluation.backbuffer;
+    resources.pDepth = evaluation.depth;
+    resources.pMVecs = evaluation.motionVectors;
+    resources.pHudless = evaluation.hudless;
+    resources.pOutputInterpFrame = evaluation.output;
+
+    // Stage 2: the engine data. 2x: one generated frame per real frame. Engine's motion vectors are render-extent pixels,
+    // previous minus current, jitter excluded, camera motion included; depth is not inverted (cleared to 1).
+    NVSDK_NGX_DLSSG_Opt_Eval_Params options{};
+    options.multiFrameCount = 1;
+    options.multiFrameIndex = 1;
+    std::memcpy(options.cameraViewToClip, evaluation.cameraViewToClip, sizeof(options.cameraViewToClip));
+    std::memcpy(options.clipToCameraView, evaluation.clipToCameraView, sizeof(options.clipToCameraView));
+    std::memcpy(options.clipToPrevClip, evaluation.clipToPrevClip, sizeof(options.clipToPrevClip));
+    std::memcpy(options.prevClipToClip, evaluation.prevClipToClip, sizeof(options.prevClipToClip));
+
+    // No lens distortion: the identity.
+    for(int index = 0; index < 4; ++index)
+    {
+        options.clipToLensClip[index][index] = 1.0f;
+    }
+
+    options.mvecScale[0] = 1.0f;
+    options.mvecScale[1] = 1.0f;
+    std::memcpy(options.cameraPos, evaluation.cameraPosition, sizeof(options.cameraPos));
+    std::memcpy(options.cameraUp, evaluation.cameraUp, sizeof(options.cameraUp));
+    std::memcpy(options.cameraRight, evaluation.cameraRight, sizeof(options.cameraRight));
+    std::memcpy(options.cameraFwd, evaluation.cameraForward, sizeof(options.cameraFwd));
+    options.cameraNear = evaluation.cameraNear;
+    options.cameraFar = evaluation.cameraFar;
+    options.cameraFOV = evaluation.cameraFieldOfView;
+    options.cameraAspectRatio = evaluation.cameraAspectRatio;
+    options.depthInverted = false;
+    options.cameraMotionIncluded = true;
+    options.reset = reset;
+    // No motion vector is ever "invalid" in Engine's buffers; the largest float never occurs in them.
+    options.motionVectorsInvalidValue = (std::numeric_limits<float>::max)();
+    options.mvecsSubrectSize = {evaluation.renderWidth, evaluation.renderHeight};
+    options.depthSubrectSize = {evaluation.renderWidth, evaluation.renderHeight};
+    lastFrameGenerationResetForTesting = reset;
+
+    const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSSG(commandList, static_cast<NVSDK_NGX_Handle*>(slot.handle),
+        static_cast<NVSDK_NGX_Parameter*>(slot.parameters), &resources, &options);
+    slot.status.evaluateResult = static_cast<std::uint32_t>(result);
+
+    if(NVSDK_NGX_FAILED(result))
+    {
+        slot.historyInvalid = true;
+        const std::string detail = "NGX_D3D12_EVALUATE_DLSSG returned " + Hex(result) + ".";
+
+        if(slot.status.detail != detail)
+        {
+            Log::Error("DLSS Frame Generation: " + detail);
+        }
+
+        slot.status.detail = detail;
+        return false;
+    }
+
+    slot.status.detail = "Active (2x).";
+    RecordPendingEvaluation(slot, commandList);
+    return true;
+#else
+    (void)commandList;
+    (void)evaluation;
+    return false;
+#endif
+}
+
 void DlssBackend::Shutdown()
 {
     // M0c.5 Stage 5.5: an initialization still running is waited for and adopted, so the NGX instance it creates is released
@@ -1351,7 +1702,7 @@ void DlssBackend::Shutdown()
         Log::Info("DLSS: NGX shutdown; releasing " + std::to_string(LiveFeatureCount()) + " live feature(s).");
     }
 
-    for(FeatureSlot* slot : {&m_superResolution, &m_rayReconstruction})
+    for(FeatureSlot* slot : {&m_superResolution, &m_rayReconstruction, &m_frameGeneration})
     {
         ReleaseSlot(*slot, false);
 

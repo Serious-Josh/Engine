@@ -83,6 +83,7 @@ bool RayTracingSceneResources::Initialize(
 
         bottomLevelDescription.geometries.push_back(geometryDescription);
         bottomLevelDescription.buildPreference = RayTracingAccelerationStructureBuildPreference::FastTrace;
+        bottomLevelDescription.memoryPool = m_blasMemoryPool;
 
         auto bottomLevel = std::make_unique<BottomLevelAccelerationStructure>();
 
@@ -347,6 +348,7 @@ bool RayTracingSceneResources::RebuildMeshBLASInternal(
     description.geometries.push_back(geometry);
 
     description.buildPreference = RayTracingAccelerationStructureBuildPreference::FastTrace;
+    description.memoryPool = m_blasMemoryPool;
 
     auto& bottomLevel = *m_blasRegistry.bottomLevels[bottomLevelIndex];
 

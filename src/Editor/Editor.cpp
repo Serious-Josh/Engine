@@ -1520,8 +1520,9 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
             return type == AssetType::Mesh ? "Unavailable mesh reference" : "Unavailable material reference";
         }
 
+        // The view is rebuilt every frame; the cache keeps the file checks to one per asset per interval.
         const auto path = record->relativePath.generic_string();
-        return ProjectAssetResolver::Resolve(paths, registry, *id).status == AssetAvailability::Available ?
+        return m_assetAvailability.Find(paths, registry, *id) == AssetAvailability::Available ?
             record->relativePath.stem().generic_string() : "Unavailable: " + path;
     };
 
@@ -1593,6 +1594,8 @@ void Editor::Draw(
     m_assetBrowser.SetIcons(debugUI.GetEditorIcons());
     m_assetBrowser.SetSceneMembership(&m_sceneMembership);
     m_inspectorPanel.SetIcons(debugUI.GetEditorIcons());
+    m_assetAvailability.BeginFrame();
+    m_inspectorPanel.SetAssetAvailability(&m_assetAvailability);
     Scene& scene = demoScene.GetScene();
     const std::string activeSceneName(sceneManager.GetActiveSceneName());
     const auto* dragScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
@@ -4297,11 +4300,11 @@ bool Editor::UpdateSceneHistorySession(const IDemoScene& demoScene, const Projec
     const std::string& name)
 {
     std::error_code error;
-    const auto project = std::filesystem::canonical(paths.GetRoot(), error);
+    const std::filesystem::path project = m_historyProjectRoot.Resolve(paths.GetRoot(), error);
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
 
     if(error || (owner && (owner->GetPersistentSceneID().empty() ||
-        std::filesystem::canonical(owner->GetProjectRoot(), error) != project || error)))
+        m_historySceneProjectRoot.Resolve(owner->GetProjectRoot(), error) != project || error)))
     {
         ClearSceneHistory();
         ReportSceneHistoryFailure("Cannot establish the current project/scene identity; replay is disabled.");

@@ -38,11 +38,22 @@ struct RenderObject
             return {*hierarchyWorld, previousHierarchyWorld.value_or(*hierarchyWorld)};
         }
 
-        const Matrix4 current = presentationPose
+        return {GetPresentationModel(), previousHierarchyWorld.value_or(
+            previousPresentedModel.value_or(previousTransform.GetModelMatrix()))};
+    }
+
+    // The current model of GetPresentationTransform alone, for per-frame readers such as Editor overlays: the previous
+    // model costs a second matrix composition that they never use.
+    Matrix4 GetPresentationModel() const
+    {
+        if (hierarchyWorld)
+        {
+            return *hierarchyWorld;
+        }
+
+        return presentationPose
             ? Physics::ComposeRuntimeModelMatrix(*presentationPose, transform.scale)
             : (runtimeLocal ? runtimeLocal->GetModelMatrix() : transform.GetModelMatrix());
-        return {current, previousHierarchyWorld.value_or(
-            previousPresentedModel.value_or(previousTransform.GetModelMatrix()))};
     }
 
     // Effective runtime borrows, not authored overrides. The document retains

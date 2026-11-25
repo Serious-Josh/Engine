@@ -26,6 +26,10 @@ namespace
     constexpr std::pair<ProjectToneMapper, std::string_view> kToneMappers[] = {
         {ProjectToneMapper::AgX, "agx"},
         {ProjectToneMapper::GT7, "gt7"}};
+    constexpr std::pair<ProjectReflexMode, std::string_view> kReflexModes[] = {
+        {ProjectReflexMode::Off, "off"},
+        {ProjectReflexMode::On, "on"},
+        {ProjectReflexMode::OnBoost, "onBoost"}};
     constexpr std::pair<ProjectReflectionDenoiser, std::string_view> kReflectionDenoisers[] = {
         {ProjectReflectionDenoiser::Nrd, "nrd"},
         {ProjectReflectionDenoiser::Native, "native"}};
@@ -254,6 +258,10 @@ namespace
         volumetrics.Name("quality", settings.volumetrics.quality, kVolumetricQualities);
         volumetrics.Name("resolutionBasis", settings.volumetrics.resolutionBasis, kVolumetricResolutionBases);
 
+        // NVIDIA Reflex and (FG.3) DLSS Frame Generation: an older file has neither group, so both stay off.
+        rendering.Child("latency").Name("reflex", settings.latency.reflex, kReflexModes);
+        rendering.Child("frameGeneration").Bool("enabled", settings.frameGeneration.enabled);
+
         auto& legacy = settings.legacy;
         const auto legacyReader = rendering.Child("legacy");
         legacyReader.Name("reflectionDenoiser", legacy.reflectionDenoiser, kReflectionDenoisers);
@@ -373,6 +381,12 @@ bool ValidateProjectSettings(ProjectSettings& settings, std::vector<std::string>
     {
         Repair(rendering.volumetrics.resolutionBasis, defaults.volumetrics.resolutionBasis,
             "rendering.volumetrics.resolutionBasis was invalid; using internal.", warnings, valid);
+    }
+
+    if(!IsKnown(kReflexModes, rendering.latency.reflex))
+    {
+        Repair(rendering.latency.reflex, defaults.latency.reflex, "rendering.latency.reflex was invalid; using off.", warnings,
+            valid);
     }
 
     auto& legacy = rendering.legacy;
@@ -512,6 +526,11 @@ std::string_view ToSerializedName(ProjectVolumetricResolutionBasis value)
     return NameOf(kVolumetricResolutionBases, value);
 }
 
+std::string_view ToSerializedName(ProjectReflexMode value)
+{
+    return NameOf(kReflexModes, value);
+}
+
 namespace ProjectSettingsFile
 {
     LoadedProjectSettings Parse(std::string_view text)
@@ -600,6 +619,12 @@ namespace ProjectSettingsFile
         auto& volumetrics = ObjectMember(rendering, "volumetrics");
         volumetrics["quality"] = ToSerializedName(source.volumetrics.quality);
         volumetrics["resolutionBasis"] = ToSerializedName(source.volumetrics.resolutionBasis);
+
+        auto& latency = ObjectMember(rendering, "latency");
+        latency["reflex"] = ToSerializedName(source.latency.reflex);
+
+        auto& frameGeneration = ObjectMember(rendering, "frameGeneration");
+        frameGeneration["enabled"] = source.frameGeneration.enabled;
 
         auto& legacy = ObjectMember(rendering, "legacy");
         legacy["reflectionDenoiser"] = ToSerializedName(source.legacy.reflectionDenoiser);

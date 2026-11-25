@@ -69,29 +69,63 @@ void Editor::BuildViewportIcons(const IDemoScene& demoScene, const EditorIcons& 
     }
 
     const auto projection = camera.GetProjectionMatrix() * camera.GetViewMatrix();
-    const auto& documentObjects = owner->m_runtime->GetFileScene().GetDocument().objects;
-    const auto* activeListener = FindActiveAudioListener(documentObjects);
+    const auto& fileScene = owner->m_runtime->GetFileScene();
+    const auto& documentObjects = fileScene.GetDocument().objects;
+    const ViewportIconSourceKey sourceKey{&scene, owner->GetRuntimeIdentity(), scene.GetStructureRevision(),
+        fileScene.GetEditRevision(), documentObjects.data(), documentObjects.size(), m_showCameraIcons, m_showLightIcons,
+        m_showAudioIcons};
 
-    for(const auto& object : documentObjects)
+    // Every document edit (components, the enabled listener) changes the edit revision; structure changes and runtime
+    // replacement change the runtime slots, which the other key fields cover.
+    if(m_viewportIconSourceKey != sourceKey)
     {
-        const bool showCamera = object.camera && m_showCameraIcons;
-        const bool showLight = object.light && m_showLightIcons;
-        const bool showSource = object.audioSource && m_showAudioIcons;
-        const bool showListener = object.audioListener && m_showAudioIcons;
+        m_viewportIconSources.clear();
+        const auto* activeListener = FindActiveAudioListener(documentObjects);
 
-        if(!showCamera && !showLight && !showSource && !showListener)
+        for(const auto& object : documentObjects)
+        {
+            const bool showCamera = object.camera && m_showCameraIcons;
+            const bool showLight = object.light && m_showLightIcons;
+            const bool showSource = object.audioSource && m_showAudioIcons;
+            const bool showListener = object.audioListener && m_showAudioIcons;
+
+            if(!showCamera && !showLight && !showSource && !showListener)
+            {
+                continue;
+            }
+
+            const auto found = mapping.idToRuntimeIndex.find(object.id);
+
+            if(found == mapping.idToRuntimeIndex.end())
+            {
+                continue;
+            }
+
+            ViewportIconSource source;
+            source.objectIndex = found->second;
+            source.audioSource = showSource;
+            source.audioListener = showListener;
+            source.activeListener = &object == activeListener;
+
+            if(showCamera || showLight)
+            {
+                source.cameraOrLight = SceneObjectIcon(showCamera, showLight ? &*object.light : nullptr);
+            }
+
+            m_viewportIconSources.push_back(source);
+        }
+
+        m_viewportIconSourceKey = sourceKey;
+    }
+
+    for(const auto& source : m_viewportIconSources)
+    {
+        if(source.objectIndex >= objects.size())
         {
             continue;
         }
 
-        const auto found = mapping.idToRuntimeIndex.find(object.id);
-
-        if(found == mapping.idToRuntimeIndex.end() || found->second >= objects.size())
-        {
-            continue;
-        }
-
-        const auto model = objects[found->second].GetPresentationTransform().currentModel;
+        const auto model = objects[source.objectIndex].GetPresentationModel();
         const auto anchor = ViewportIcons::WorldAnchor(model);
 
         if(!anchor)
@@ -105,7 +139,7 @@ void Editor::BuildViewportIcons(const IDemoScene& demoScene, const EditorIcons& 
         const auto addIcon = [&](EditorIcon artwork)
         {
             ViewportIcons::Icon candidate;
-            candidate.objectIndex = found->second;
+            candidate.objectIndex = source.objectIndex;
             candidate.artwork = artwork;
 
             if(!ViewportIcons::Project(projection, *anchor, m_viewportImage.position, m_viewportImage.size,
@@ -122,21 +156,21 @@ void Editor::BuildViewportIcons(const IDemoScene& demoScene, const EditorIcons& 
             return true;
         };
 
-        if(showCamera || showLight)
+        if(source.cameraOrLight)
         {
-            addIcon(SceneObjectIcon(showCamera, showLight ? &*object.light : nullptr));
+            addIcon(*source.cameraOrLight);
         }
 
-        if(showSource)
+        if(source.audioSource)
         {
             addIcon(EditorIcon::AudioSource);
         }
 
-        if(showListener && addIcon(EditorIcon::AudioListener))
+        if(source.audioListener && addIcon(EditorIcon::AudioListener))
         {
             const auto& icon = m_viewportIcons.back();
 
-            if(&object == activeListener)
+            if(source.activeListener)
             {
                 m_viewportActiveListener = icon.objectIndex;
             }
@@ -157,7 +191,7 @@ void Editor::BuildViewportIcons(const IDemoScene& demoScene, const EditorIcons& 
                     const float shift = (icon.minimum.x + icon.maximum.x) * 0.5f - start->x;
                     m_viewportListenerFacings.push_back({ImVec2(start->x + shift, start->y),
                         ImVec2(end->x + shift, end->y),
-                        &object == activeListener});
+                        source.activeListener});
                 }
             }
         }
@@ -229,7 +263,9 @@ void Editor::DrawViewportTools(IDemoScene& scene, const EditorIcons& icons, bool
 
     DrawTransformGizmo(scene, m_viewportImage.size.x, m_viewportImage.size.y);
     // Gizmo manipulation may update an anchor, so rebuild after it, on every frame.
+    EditorPhaseTiming::Scope iconListPhase(PhaseTiming(), EditorPhaseTiming::Phase::TailViewportIconList);
     BuildViewportIcons(scene, icons);
+    iconListPhase.End();
     HandleViewportSelection(scene, m_viewportImage.size.x, m_viewportImage.size.y, viewportWasFocused);
 
     ImGui::Begin("Scene Viewport", nullptr, flags);
@@ -259,25 +295,37 @@ void Editor::DrawViewportTools(IDemoScene& scene, const EditorIcons& icons, bool
             facing.active ? IM_COL32(110, 230, 110, 255) : IM_COL32(160, 160, 160, 220), outline * 2.0f);
     }
 
-    for(const auto& icon : m_viewportIcons)
     {
-        const ImVec2 size(icon.maximum.x - icon.minimum.x, icon.maximum.y - icon.minimum.y);
-        const bool selected = icon.objectIndex == m_selectedObject ||
-            std::find(m_selectedObjects.begin(), m_selectedObjects.end(), icon.objectIndex) != m_selectedObjects.end();
-        const bool over = hovered && *hovered == icon.objectIndex;
-        const bool activeListener = icon.artwork == EditorIcon::AudioListener && m_viewportActiveListener == icon.objectIndex;
-        const ImU32 tint = selected ? IM_COL32(255, 205, 90, 255) :
-            over ? IM_COL32(120, 220, 255, 255) :
-            activeListener ? IM_COL32(110, 230, 110, 255) : IM_COL32(235, 235, 235, 240);
+        EditorPhaseTiming::Scope iconDrawingPhase(PhaseTiming(), EditorPhaseTiming::Phase::TailViewportIconDrawing);
 
-        // A narrow dark halo keeps the light/tinted outline legible on bright scene pixels.
-        for(const auto offset : {ImVec2(-outline, 0), ImVec2(outline, 0), ImVec2(0, -outline), ImVec2(0, outline)})
+        // A sorted copy answers each icon's selection test in log time; a linear search grows with icons x selection.
+        std::vector<size_t> sortedSelection(m_selectedObjects.begin(), m_selectedObjects.end());
+        std::sort(sortedSelection.begin(), sortedSelection.end());
+
+        // One atlas binding for all the icons: otherwise every icon switches the texture and back, opening a draw command
+        // each time. The batch ends with this block, before the clip rectangle is popped and the channels merge.
+        const EditorIcons::Batch iconBatch(icons, *draw);
+
+        for(const auto& icon : m_viewportIcons)
         {
-            icons.Draw(*draw, icon.artwork, ImVec2(icon.minimum.x + offset.x, icon.minimum.y + offset.y),
-                size, IM_COL32(10, 10, 10, 230));
-        }
+            const ImVec2 size(icon.maximum.x - icon.minimum.x, icon.maximum.y - icon.minimum.y);
+            const bool selected = icon.objectIndex == m_selectedObject ||
+                std::binary_search(sortedSelection.begin(), sortedSelection.end(), icon.objectIndex);
+            const bool over = hovered && *hovered == icon.objectIndex;
+            const bool activeListener = icon.artwork == EditorIcon::AudioListener && m_viewportActiveListener == icon.objectIndex;
+            const ImU32 tint = selected ? IM_COL32(255, 205, 90, 255) :
+                over ? IM_COL32(120, 220, 255, 255) :
+                activeListener ? IM_COL32(110, 230, 110, 255) : IM_COL32(235, 235, 235, 240);
 
-        icons.Draw(*draw, icon.artwork, icon.minimum, size, tint);
+            // A narrow dark halo keeps the light/tinted outline legible on bright scene pixels.
+            for(const auto offset : {ImVec2(-outline, 0), ImVec2(outline, 0), ImVec2(0, -outline), ImVec2(0, outline)})
+            {
+                icons.Draw(*draw, icon.artwork, ImVec2(icon.minimum.x + offset.x, icon.minimum.y + offset.y),
+                    size, IM_COL32(10, 10, 10, 230));
+            }
+
+            icons.Draw(*draw, icon.artwork, icon.minimum, size, tint);
+        }
     }
 
     draw->PopClipRect();

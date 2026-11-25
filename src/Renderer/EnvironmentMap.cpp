@@ -7,6 +7,7 @@
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/ImageLoader.h"
 #include "Renderer/ResourceUploader.h"
+#include "Renderer/TextureMemoryAllocator.h"
 
 #include <algorithm>
 #include <optional>
@@ -143,6 +144,9 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
     float radianceScale)
 {
     const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+    // The source and the cube may be placed in Engine-owned heaps: the uploader activates the source before its copy and
+    // the renderer's environment preprocessing activates the cube before its first draw.
+    const TextureMemoryAllocator::RenderablePlacementScope placement;
 
     if(source.width == 0 || source.height == 0 || source.channels != 4 ||
         source.pixels.size() != static_cast<size_t>(source.width) * source.height * 4)
@@ -338,6 +342,9 @@ bool EnvironmentMap::CreateResourcesForUpload(ID3D12Device* device, unsigned int
         return false;
     }
 
+    // The source and the cube are large render-target textures: they may be placed in Engine-owned heaps, and
+    // Renderer::RecordEnvironmentPreparation activates them before their first use.
+    const TextureMemoryAllocator::RenderablePlacementScope placement;
     m_importanceWidth = width;
     m_importanceHeight = height;
     m_importanceTotalWeight = totalWeight;

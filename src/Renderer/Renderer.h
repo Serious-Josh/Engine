@@ -55,6 +55,7 @@
 
 #include "Shader/ShaderLibrary.h"
 
+#include "RayTracing/BLASMemoryPool.h"
 #include "RayTracing/RayTracingSceneResources.h"
 
 #include "Passes/ToneMapPass.h"
@@ -64,6 +65,8 @@
 #include "Passes/ReSTIRPTPass.h"
 #include "Passes/AutoExposurePass.h"
 #include "Upscaling/DlssBackend.h"
+#include "Latency/ReflexLatency.h"
+#include "Presentation/FramePresenter.h"
 #include "Passes/DeferredLightingPass.h"
 #include "Passes/BRDFIntegrationPass.h"
 #include "Passes/GGXAverageAlbedoPass.h"
@@ -1084,6 +1087,45 @@ class Renderer
         return m_cpuFrameTiming;
     }
 
+    // FG.2: the frame-in-flight slot (0 or 1) that indexes per-frame resources, recordings and fences. It used to be read
+    // from the swap chain's back-buffer index; Frame Generation presents twice per frame, so the renderer owns it now.
+    unsigned int GetFrameSlot() const noexcept
+    {
+        return m_frameSlot;
+    }
+
+    // FG.2: switches between ordinary presentation (the swap chain on the frame queue presents every frame) and the Frame
+    // Generation present path (FramePresenter). Only between frames; drains both queues and recreates the swap chain. False
+    // leaves ordinary presentation (or, if even that cannot be restored, stops rendering as a failed resize does).
+    bool SetFrameGenerationPresentation(bool enabled);
+
+    bool IsFrameGenerationPresentationActive() const noexcept
+    {
+        return m_frameGenerationPresentation;
+    }
+
+    // FG.3: the saved DLSS Frame Generation toggle, from Engine before each Editor frame. Render applies it between frames
+    // (the present path follows it while Frame Generation is available); packaged games never request it.
+    // ENGINE_FRAME_GENERATION=1 (diagnostics) requests it whatever is saved.
+    void SetFrameGenerationRequested(bool requested);
+
+    FramePresenter::Statistics GetFramePresentationStatistics() const
+    {
+        return m_framePresenter.GetStatistics();
+    }
+
+    // NVIDIA Reflex Low Latency (RendererLatency.cpp). Engine::Frame calls BeginLatencyFrame once per frame before it samples
+    // input (the driver's sleep point), MarkLatencyInputSampled after the message pump, and MarkLatencyRenderSubmitStart
+    // before Render; Render marks its Present. With ReflexMode::Off none of them calls NVAPI.
+    void BeginLatencyFrame(ReflexMode mode);
+    void MarkLatencyInputSampled();
+    void MarkLatencyRenderSubmitStart();
+
+    const ReflexStatus& GetReflexStatus() const noexcept
+    {
+        return m_reflexLatency.GetStatus();
+    }
+
     // CPU-only diagnostics, independent of asynchronous activation.
     static constexpr bool IsFrameHitchDiagnosticsEnabled()
     {
@@ -2042,10 +2084,103 @@ private:
     void CommitGeometryUploadSubmission(bool executed);
     void CollectGeometryUploadRetirements();
     void ReleaseGeometryUploads() noexcept;
+    // Makes freed BLAS ranges reusable once the frame queue has completed past them (BLASMemoryPool::Collect).
+    void CollectBLASMemory();
+    // The same for the texture heaps (TextureMemoryAllocator::Collect).
+    void CollectTextureMemory();
 
     GraphicsDevice m_graphicsDevice;
 
     SwapChain m_swapChain;
+
+    // FG.2: the frame-in-flight slot (GetFrameSlot). While the swap chain presents every frame, it is re-read from the swap
+    // chain after each Present, Initialize and Resize, so it is exactly the back-buffer index the per-frame resources used
+    // before; the Frame Generation present path, which presents twice per frame, advances it itself.
+    unsigned int m_frameSlot = 0;
+
+    void SyncFrameSlotToSwapChain() noexcept
+    {
+        m_frameSlot = m_swapChain.GetCurrentBackBufferIndex();
+    }
+
+    // FG.2: DLSS Frame Generation's present path (RendererPresentation.cpp). While active, every frame ends in one of the
+    // presenter's composites and its thread presents it from a three-buffer swap chain on its own queue; the render thread
+    // then never touches the swap chain. m_windowHandle recreates the swap chain when the path switches.
+    FramePresenter m_framePresenter;
+    bool m_frameGenerationPresentation = false;
+    void* m_windowHandle = nullptr;
+    bool m_framePresentationFailureLogged = false;
+    // FG.2 diagnostics (ENGINE_FG_PRESENT_TEST): frames since the test started.
+    std::uint64_t m_framePresentationTestFrames = 0;
+
+    // Where a frame's final image goes, and the state it waits in between frames.
+    struct PresentationTarget
+    {
+        ID3D12Resource* resource = nullptr;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+        D3D12_RESOURCE_STATES idleState = D3D12_RESOURCE_STATE_PRESENT;
+        // The presenter's composite; none for the swap chain's current back buffer.
+        std::optional<unsigned int> composite;
+        // FG.3: a second composite for the generated frame (a scene frame that runs DLSS Frame Generation), and whether this
+        // recording rendered it (otherwise only the real frame is presented).
+        std::optional<unsigned int> generatedComposite;
+        ID3D12Resource* generatedResource = nullptr;
+        D3D12_CPU_DESCRIPTOR_HANDLE generatedRtv{};
+        bool hudlessRecorded = false;
+        bool generatedRecorded = false;
+    };
+
+    // FG.3: DLSS Frame Generation (RendererPresentation.cpp). The saved toggle (Engine, every Editor frame), whether this
+    // frame's evaluation ran, why not, and the generated viewport image and HUD-less copy (output extent, RGBA8).
+    bool m_frameGenerationRequested = false;
+    // Diagnostics only: replaces the request SetFrameGenerationRequested receives (timing harnesses switch it per scene).
+    std::optional<bool> m_frameGenerationRequestForTesting;
+    bool m_frameGenerationEvaluatedLastFrame = false;
+    std::string m_frameGenerationInactiveReason;
+    // The next evaluation resets Frame Generation's history (it was off, the path restarted, or the feature was recreated).
+    bool m_frameGenerationResetPending = true;
+    RenderTarget m_frameGenerationOutput;
+    RenderTarget m_frameGenerationHudless;
+    // The output extent the images were last created for, and whether that failed (not retried for the same extent).
+    unsigned int m_frameGenerationImageAttemptWidth = 0;
+    unsigned int m_frameGenerationImageAttemptHeight = 0;
+    bool m_frameGenerationImagesFailed = false;
+
+    // A new output extent, or images released while the extent stayed (Frame Generation switched off and on again).
+    bool FrameGenerationImagesNeeded() const noexcept
+    {
+        const bool sameExtent = m_frameGenerationImageAttemptWidth == m_outputWidth &&
+            m_frameGenerationImageAttemptHeight == m_outputHeight;
+
+        if(!sameExtent)
+        {
+            return true;
+        }
+
+        return !m_frameGenerationImagesFailed && m_frameGenerationOutput.GetResource() == nullptr;
+    }
+
+    bool RecreateSwapChain(ID3D12CommandQueue* queue, unsigned int bufferCount);
+    bool HasPresentationTarget() const;
+    // withGeneratedFrame: a scene frame, which also takes a composite for its generated frame while Frame Generation runs.
+    bool AcquirePresentationTarget(PresentationTarget& target, bool withGeneratedFrame = false);
+    // Whether this frame should run DLSS Frame Generation: requested, available, and the present path on.
+    bool IsFrameGenerationRunning() const;
+    // Before the Editor overlays: the HUD-less copy of the final scene image (a Frame Generation frame only).
+    void RecordFrameGenerationHudless(ID3D12GraphicsCommandList* commandList, PresentationTarget& target);
+    // After the overlays: the generated viewport image into m_frameGenerationOutput. False: no generated frame (the
+    // reason is in m_frameGenerationInactiveReason).
+    bool RecordFrameGeneration(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex, const RenderView& frameView,
+        const Matrix4& previousViewProjection, const PresentationTarget& target);
+    // After the real frame's UI: the same UI over the generated image, into the generated composite.
+    void RecordGeneratedFrameUi(ID3D12GraphicsCommandList* commandList, const PresentationTarget& target,
+        const D3D12_VIEWPORT& viewport, const D3D12_RECT& scissor, const float clearColor[4]);
+    // After the frame's recording was submitted: the swap chain presents it, or the present thread receives it.
+    bool PresentTarget(const PresentationTarget& target);
+    // PresentTarget for a scene frame, inside the CPU timing and NVIDIA Reflex present markers.
+    bool CompletePresentation(const PresentationTarget& target);
+    // Between frames: switches the present path to follow the Frame Generation request (FG.3) or the FG.2 diagnostics.
+    void ApplyFramePresentationRequest();
 
     ReferenceRayCounts m_referenceRayCounts;
     CommandContext m_commandContext;
@@ -2132,6 +2267,12 @@ private:
     bool m_restirPtUiStagnancy = false;
     // Optimization B1b: the Editor's last applied firefly replacement setting.
     bool m_restirPtUiFirefly = false;
+    // Residual boiling P1: the Editor's last applied mirror-chain x1 sampling setting.
+    bool m_restirPtUiMirrorX1 = false;
+    // Residual boiling §5d option 2: the Editor's last applied direct-light reservoir setting.
+    bool m_restirPtUiDirectReservoir = false;
+    // Wall boiling: the Editor's last applied light-traced bounce setting.
+    bool m_restirPtUiLightBounce = false;
     bool m_psrGuideOnlyLastFrame = false;
 
     BRDFIntegrationPass m_brdfIntegrationPass;
@@ -2145,7 +2286,11 @@ private:
     bool EnsureLegacyLightingExtent();
 
     // M0c.2 / M0c.3: the residency policy shared by the Legacy and Path Tracing resource owners (ModeResourceResidency.h).
-    // An inactive mode keeps its resources this long after the last frame that used them before they may retire.
+    // An inactive mode keeps its resources until DXGI reports memory pressure (or its owner's own rule makes them due),
+    // not after a grace period: releasing hundreds of MiB of GPU-used memory can hang the next first traversals of new
+    // acceleration structures on the RTX 4080 with driver 621.01 (Documentation/Rendering/
+    // FgTiming_ManyLight_Switch_Hangs.md), and VRAM is not the bottleneck. AIR's storage and vector views follow the same
+    // rule. ModeResourceGracePeriod remains the time a mode counts as recently used.
     static constexpr std::chrono::seconds ModeResourceGracePeriod{5};
 
     enum class ModeResourceDecision
@@ -2324,6 +2469,31 @@ private:
     bool m_restirPtReGIRLastFrame = false;
     bool m_restirPtFrameThisFrame = false;
     bool EnsureReSTIRPT();
+    // ReSTIR PT's pipelines are prepared on a pipeline worker of their own (ReSTIRPTPass::PreparePipelines), started once the
+    // Editor presents a path-traced configuration or by a request for ReSTIR PT Enhanced, and adopted by EnsureReSTIRPT
+    // before the switch, so neither the switch nor ReSTIR PT's first frame creates a pipeline on the render thread (the
+    // driver needs seconds for them). The prepared set belongs to the job until the job is taken (Prepared).
+    enum class ReSTIRPTPipelinePreparation
+    {
+        NotSubmitted,
+        Preparing,
+        // The job is taken: m_restirPtPreparedPipelines holds its set (or its failure) until EnsureReSTIRPT adopts it.
+        Prepared,
+        // No worker could take the job: EnsureReSTIRPT creates the pipelines itself, blocking.
+        Synchronous
+    };
+
+    static constexpr const char* ReSTIRPTPipelineJobKey = "ReSTIR PT pipelines";
+    // Non-blocking: submits the job, takes it once complete. Ready when EnsureReSTIRPT will not wait for a worker.
+    ShaderLibraryPreparation PrepareReSTIRPTPipelines();
+    bool SubmitReSTIRPTPipelines();
+    void TakeReSTIRPTPipelines();
+    // Only while no job uses the set (it was taken, or the worker was joined).
+    void ReleasePreparedReSTIRPTPipelines();
+    ReSTIRPTPipelinePreparation m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::NotSubmitted;
+    std::shared_ptr<ReSTIRPTPreparedPipelines> m_restirPtPreparedPipelines;
+    std::unique_ptr<RayTracingPipelineWorker> m_restirPtPipelineWorker;
+    std::chrono::steady_clock::time_point m_restirPtPipelinesRequested{};
     bool m_restirPtSamplingFailureLogged = false;
     // M5.1-4 (M5.2 prerequisite): this frame's per-instance transforms (by TLAS InstanceID = render-object index) and the
     // original reconnection criteria's minimum distance (2% of the smallest dimension of the scene's world bounds), from
@@ -2335,8 +2505,21 @@ private:
         D3D12_GPU_VIRTUAL_ADDRESS constantsAddress, D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
         const FrameLighting& frameLighting, const PathTraceReferenceSettings& settings, const Matrix4& view,
         const Matrix4& projection, bool extract, bool rawExtraction);
-    // M5.2: the signature the B frame's reservoirs are computed against (temporal history reuse requires a match).
-    ReSTIRPTHistorySignature MakeReSTIRPTHistorySignature(const PathTraceReferenceSettings& settings) const;
+    // M5.2: the signature the B frame's reservoirs are computed against (temporal history reuse requires a match). Lights
+    // enter by structure (count, stable IDs, types) and the lighting epoch, not by value: a moved or changed light keeps
+    // history (its samples are re-evaluated with the current light at shift time).
+    ReSTIRPTHistorySignature MakeReSTIRPTHistorySignature(const PathTraceReferenceSettings& settings,
+        const FrameLighting& frameLighting) const;
+    // History through lighting changes (residual boiling follow-up; consistent with SHARC's ApplySharcLightingDiscontinuities):
+    // compares this frame's lighting with the committed ReSTIR PT frame's (FrameLighting.h DetectLightingDiscontinuities).
+    // A global discontinuity advances m_restirPtLightingEpoch (part of the signature: history is dropped); local ones are
+    // returned as world-space spheres inside which temporal reuse is refused this frame. Sets the pending lighting.
+    std::vector<std::array<float, 4>> DetectReSTIRPTLightingDiscontinuities(const FrameLighting& frameLighting);
+    // The lighting of the committed ReSTIR PT frame (moved from the pending one at CommitFrame; the pending one is dropped
+    // when the frame is abandoned), and the count of global lighting discontinuities.
+    std::shared_ptr<const FrameLighting> m_restirPtCommittedLighting;
+    std::shared_ptr<const FrameLighting> m_restirPtPendingLighting;
+    std::uint64_t m_restirPtLightingEpoch = 0;
     // M5.2: why the most recent B frame did or did not read history (diagnostics and the harness).
     ReSTIRPTHistoryDecision m_restirPtHistoryDecision = ReSTIRPTHistoryDecision::NoCommittedFrame;
 
@@ -2764,6 +2947,12 @@ private:
     NrdPathTracePreparePass m_nrdHybridPreparePass;
 
     bool EnsureNrdHybridDenoiser();
+    // Lighting Mode switch hitch: the hybrid instance of a pending request, created ahead of its switch (its SDK part on
+    // the instance's own creation thread, NrdDenoiser::BeginInitialize), and the non-blocking completion of that creation.
+    bool RequestsNrdHybridInstance(const ConfigurationIdentity& identity) const;
+    ShaderLibraryPreparation PrepareNrdHybridDenoiser(const ConfigurationIdentity& identity);
+    NrdDenoiser::CreationProgress PollNrdHybridCreation(bool wait);
+    void ReportNrdHybridCreated();
     void ReleaseNrdHybridDenoiser();
     void ReportNrdHybridUnavailable(const std::string& reason);
     // As RELAX's (NRD.RELAX.4): Begin does everything fallible before anything is recorded; Record records preparation,
@@ -3183,6 +3372,9 @@ private:
     // RR.1A: the last Ray Reconstruction readout published (logged on change only).
     std::string m_rayReconstructionPublishedState;
     std::string m_rayReconstructionPublishedDetail;
+    // FG.1: the last Frame Generation readout published (logged on change only).
+    std::string m_frameGenerationPublishedState;
+    std::string m_frameGenerationPublishedDetail;
 
     // UPSCALING.2C output-extent targets of the diagnostic presentation resolve: HDR colour (tone mapping's input),
     // selection mask (the outline's) and depth (the outline's and the Editor overlays'). Allocated only while the render
@@ -3196,6 +3388,10 @@ private:
     // final GPU drain and before the device is released. Features are created on demand.
     DlssBackend m_dlssBackend;
 
+    // NVIDIA Reflex's sleep mode and latency markers on m_graphicsDevice. It makes no NVAPI call once the device is released
+    // (the frame loop has stopped by then), and sleep mode ends with the device, so Shutdown needs no step for it.
+    ReflexLatency m_reflexLatency;
+
     // UPSCALING.3B DLSS input preparation (RendererOptions::dlssInputPreparation). Switching it releases or creates
     // nothing else and requests an upscaler history reset; the pass's textures follow the render extent.
     void ApplyDlssInputPreparation(bool requested);
@@ -3205,6 +3401,14 @@ private:
     // that extracted and prepared the DLSS inputs while m_rrInputPreparationForTesting is set; its targets are allocated
     // only then and released on resize and when preparation stops (SetRrInputPreparationForTesting).
     RrInputPreparationPass m_rrInputPreparationPass;
+    // Lighting Mode switch hitch: the pass's pipelines, prepared on the pipeline worker while a configuration that requests
+    // Ray Reconstruction is pending (PrepareRrInputPipelines), and that request's own Ray Reconstruction selection (the
+    // presented configuration's is what SetRayReconstructionRequested receives).
+    std::shared_ptr<RrInputPreparationPass::PreparedPipelines> m_rrPreparedPipelines;
+    bool m_rrPipelinePreparationDone = false;
+    bool m_pendingRayReconstructionRequested = false;
+    bool RequestsRayReconstructionInputs(const ConfigurationIdentity& identity) const;
+    ShaderLibraryPreparation PrepareRrInputPipelines();
     bool m_rrInputPreparationForTesting = false;
     // Adds the PSR throughput target (RrInputPreparation.hlsl).
     bool m_rrInputDiagnosticsForTesting = false;
@@ -3458,6 +3662,9 @@ private:
     Texture m_brdfIntegrationLUT;
     Texture m_ggxAverageAlbedoLUT;
 
+    // Session-lifetime BLAS result memory (BLASMemoryPool.h): declared before the scene resources, whose BLASes and
+    // candidate pins hold its ranges, and shut down only after their final Shutdown.
+    BLASMemoryPool m_blasMemoryPool;
     RayTracingSceneResources m_rayTracingScene;
 
     bool m_geometryUpdateFailed = false;

@@ -4,6 +4,7 @@
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/ResourceUploader.h"
 #include "Core/Log.h"
+#include "imgui_internal.h"
 #include <algorithm>
 #include <cstring>
 
@@ -102,10 +103,24 @@ void EditorIcons::Draw(ImDrawList& draw, EditorIcon icon, ImVec2 origin, ImVec2 
 
     if(!m_heap || !entry.width || !entry.height)
     {
-        // Stable and allocation-free, including when the entire icon directory is unavailable.
+        // Stable and allocation-free, including when the entire icon directory is unavailable. The rectangle samples the
+        // font atlas's white pixel, so a batch's atlas binding is lifted around it.
+        const bool batched = m_heap && draw._CmdHeader.TexRef == ImTextureRef(GetAtlasTexture());
+
+        if(batched)
+        {
+            draw.PopTexture();
+        }
+
         const float size = (std::min)(bounds.x, bounds.y) * 0.7f;
         const ImVec2 start(origin.x + (bounds.x - size) * 0.5f, origin.y + (bounds.y - size) * 0.5f);
         draw.AddRect(start, ImVec2(start.x + size, start.y + size), tint, size * 0.1f);
+
+        if(batched)
+        {
+            draw.PushTexture(GetAtlasTexture());
+        }
+
         return;
     }
 
@@ -114,6 +129,27 @@ void EditorIcons::Draw(ImDrawList& draw, EditorIcon icon, ImVec2 origin, ImVec2 
     const ImVec2 start(origin.x + (bounds.x - size.x) * 0.5f, origin.y + (bounds.y - size.y) * 0.5f);
     const ImVec2 uv0(float(index * Cell + 2) / (Cell * Count), 2.0f / Cell);
     const ImVec2 uv1(float(index * Cell + 2 + entry.width) / (Cell * Count), float(2 + entry.height) / Cell);
-    draw.AddImage(static_cast<ImTextureID>(m_heap->GetGPUHandle(m_atlas.GetDescriptorIndex()).ptr),
-        start, ImVec2(start.x + size.x, start.y + size.y), uv0, uv1, tint);
+    draw.AddImage(GetAtlasTexture(), start, ImVec2(start.x + size.x, start.y + size.y), uv0, uv1, tint);
+}
+
+ImTextureID EditorIcons::GetAtlasTexture() const
+{
+    return static_cast<ImTextureID>(m_heap->GetGPUHandle(m_atlas.GetDescriptorIndex()).ptr);
+}
+
+EditorIcons::Batch::Batch(const EditorIcons& icons, ImDrawList& draw) : m_draw(draw)
+{
+    if(icons.m_heap)
+    {
+        m_draw.PushTexture(icons.GetAtlasTexture());
+        m_bound = true;
+    }
+}
+
+EditorIcons::Batch::~Batch()
+{
+    if(m_bound)
+    {
+        m_draw.PopTexture();
+    }
 }

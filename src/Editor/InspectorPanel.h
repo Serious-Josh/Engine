@@ -22,6 +22,8 @@ class ProjectPaths;
 class ProjectAssetRegistry;
 class Renderer;
 class EditorIcons;
+class AssetAvailabilityCache;
+enum class AssetAvailability;
 
 struct SceneMaterialSlotInspectorView
 {
@@ -56,6 +58,13 @@ class InspectorPanel
 {
 public:
     void SetIcons(const EditorIcons& icons) { m_icons = &icons; }
+
+    // The Editor's availability cache for the labels and previews drawn every frame (not owned); null resolves every call.
+    void SetAssetAvailability(AssetAvailabilityCache* cache) noexcept
+    {
+        m_assetAvailability = cache;
+    }
+
     const std::optional<MaterialPreviewRequest>& GetPreviewRequest();
     std::optional<std::string> TakeMaterialLocateRequest();
     void SetMaterialLocateStatus(std::string status) { m_materialLocateStatus=std::move(status); }
@@ -117,6 +126,7 @@ private:
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
     friend class ScriptWorkflowVerification;
+    friend class EditorCpuVerification;
 #endif
     // M4: an Acoustic Material selected in the Asset Browser. Same autosave and leave rules as a visual material; m_record
     // holds its registration, and m_material stays empty, so no visual preview or texture logic runs.
@@ -242,6 +252,28 @@ private:
     void PruneTexturePickerRequests(bool all = false);
     void DrawTextureGrid(TextureSlot slot, const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
+
+    // The picker's folder contents: the child folders and the registered textures inside the canonical Textures folder.
+    // Scanning canonicalizes every entry (tens of microseconds each), so a scan is kept until the folder, the Textures
+    // directory or the texture choices change, or TexturePickerRescanInterval passes (changes made outside the Editor).
+    struct TexturePickerListing
+    {
+        std::filesystem::path texturesDirectory;
+        std::filesystem::path folder;
+        std::uint64_t choicesGeneration = 0;
+        std::chrono::steady_clock::time_point scannedAt{};
+
+        bool texturesAvailable = false;
+        bool readError = false;
+        std::vector<std::filesystem::path> folders;
+        // Indices into m_textureChoices, in its order.
+        std::vector<std::size_t> textures;
+    };
+
+    static constexpr std::chrono::seconds TexturePickerRescanInterval{2};
+    const TexturePickerListing& GetTexturePickerListing(const ProjectPaths& paths);
+    AssetAvailability ResolveAvailability(const ProjectPaths& paths, const ProjectAssetRegistry& registry, const AssetID& id);
+
     bool DrawTextureTile(const AssetRecord& texture, float extent, bool selected,
         const ProjectPaths& paths, const ProjectAssetRegistry& registry);
 
@@ -278,6 +310,10 @@ private:
 
     std::vector<AssetRecord> m_texturePickerRegistry;
     std::vector<AssetRecord> m_textureChoices;
+    // Incremented whenever m_textureChoices is replaced or cleared, so listing indices never outlive it.
+    std::uint64_t m_textureChoicesGeneration = 0;
+    std::optional<TexturePickerListing> m_texturePickerListing;
+    AssetAvailabilityCache* m_assetAvailability = nullptr;
     std::optional<TexturePickerIdentity> m_texturePicker;
     std::map<std::string, TexturePickerRequest> m_texturePickerRequests;
     std::string m_texturePickerError;

@@ -223,3 +223,27 @@ RenderingConfiguration ResolveRenderingConfiguration(const RenderingSettings& se
 
     return configuration;
 }
+
+bool IsFrameGenerationRequested(const RenderingSettings& settings)
+{
+    return settings.frameGeneration.enabled;
+}
+
+ReflexMode ResolveReflexMode(const RenderingSettings& settings)
+{
+    if(IsFrameGenerationRequested(settings))
+    {
+        return ReflexMode::On;
+    }
+
+    switch(settings.latency.reflex)
+    {
+    case ProjectReflexMode::On:
+        return ReflexMode::On;
+    case ProjectReflexMode::OnBoost:
+        return ReflexMode::OnBoost;
+    case ProjectReflexMode::Off:
+    default:
+        return ReflexMode::Off;
+    }
+}

@@ -1,6 +1,7 @@
 #include <cassert>
 #include "Debug/MemoryRegistry.h"
 #include "RayTracingSceneResources.h"
+#include "BLASMemoryPool.h"
 
 #include "Renderer/CommandContext.h"
 #include "Renderer/DescriptorHeap.h"
@@ -161,7 +162,8 @@ struct RayTracingSceneResources::CandidateState
         const BottomLevelAccelerationStructure* blas = nullptr;
         ComPtr<ID3D12Resource> vertices;
         ComPtr<ID3D12Resource> indices;
-        ComPtr<ID3D12Resource> blasResource;
+        // Pins the BLAS result: its pool range or committed buffer stays allocated while the candidate holds it.
+        std::shared_ptr<const BLASMemoryAllocation> blasMemory;
         D3D12_GPU_VIRTUAL_ADDRESS blasAddress = 0;
         unsigned int vertexDescriptor = UINT_MAX;
         unsigned int indexDescriptor = UINT_MAX;
@@ -519,7 +521,7 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
         if (registered != m_blasRegistry.meshToBottomLevel.end())
         {
             dependency.blas = state.blasPointers[registered->second];
-            dependency.blasResource = dependency.blas->GetResource();
+            dependency.blasMemory = dependency.blas->GetResultAllocation();
             dependency.blasAddress = dependency.blas->GetGPUAddress();
         }
         else
@@ -900,6 +902,7 @@ bool RayTracingSceneResources::RecordReplacementCandidate(ID3D12Device5* device,
         RayTracingBottomLevelDescription description;
         description.geometries.push_back({state.newMeshes[index], true});
         description.buildPreference = RayTracingAccelerationStructureBuildPreference::FastTrace;
+        description.memoryPool = m_blasMemoryPool;
 
         auto& bottomLevel = *state.newBLAS[index];
 
@@ -911,7 +914,7 @@ bool RayTracingSceneResources::RecordReplacementCandidate(ID3D12Device5* device,
 
     for (auto& dependency : state.dependencies)
     {
-        dependency.blasResource = dependency.blas->GetResource();
+        dependency.blasMemory = dependency.blas->GetResultAllocation();
         dependency.blasAddress = dependency.blas->GetGPUAddress();
     }
 

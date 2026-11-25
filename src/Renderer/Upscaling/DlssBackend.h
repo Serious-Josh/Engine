@@ -59,6 +59,33 @@ enum class DlssRayReconstructionAvailability
 
 const char* DlssRayReconstructionAvailabilityName(DlssRayReconstructionAvailability availability) noexcept;
 
+// FG.1: what DLSS Frame Generation (NGX feature DLSS-G) can do on this machine, queried with Super Resolution on the same NGX
+// instance. Available means a Frame Generation feature may be created; nothing renders with it yet (FG.3).
+enum class DlssFrameGenerationAvailability
+{
+    // Built without ENGINE_ENABLE_DLSS_FG (or without the Super Resolution backend it needs).
+    NotCompiled,
+    // The packaged runtime: Frame Generation starts in the Editor viewport; packaged games get it in a later stage.
+    NotPermitted,
+    // Initialize has not run (or Shutdown ran).
+    NotInitialized,
+    // nvngx_dlssg.dll is not next to the executable.
+    RuntimeMissing,
+    // NGX itself was not initialized (its init failed, or the Super Resolution runtime it is gated on is missing).
+    NgxInitializationFailed,
+    // The NGX capability parameters could not be read, or FrameGeneration.Available was absent.
+    CapabilityQueryFailed,
+    // FrameGeneration.NeedsUpdatedDriver (see the minimum driver version).
+    DriverOutdated,
+    // FrameGeneration.Available is 0: an RTX 40-series GPU or newer is required.
+    Unsupported,
+    // FrameGeneration.FeatureInitResult is a failure (denied, or Windows' hardware-accelerated GPU scheduling is off).
+    FeatureInitFailed,
+    Available
+};
+
+const char* DlssFrameGenerationAvailabilityName(DlssFrameGenerationAvailability availability) noexcept;
+
 // UPSCALING.3D: the NGX Super Resolution quality modes Engine offers, whose render extents come from the NGX
 // optimal-settings query (never from fixed scale factors).
 enum class DlssQualityPreset
@@ -96,6 +123,23 @@ struct DlssRayReconstructionStatus
     std::string detail;
 };
 
+// FG.1: Frame Generation's capability, read from the same capability parameters as Super Resolution's.
+struct DlssFrameGenerationStatus
+{
+    DlssFrameGenerationAvailability availability = DlssFrameGenerationAvailability::NotInitialized;
+    // nvngx_dlssg.dll beside the executable (checked whenever Frame Generation is compiled and permitted).
+    bool runtimePresent = false;
+    // FrameGeneration.* capability parameters, valid once the capability query succeeded.
+    bool available = false;
+    bool needsUpdatedDriver = false;
+    std::uint32_t minDriverVersionMajor = 0;
+    std::uint32_t minDriverVersionMinor = 0;
+    std::int32_t featureInitResult = 0;
+    // DLSSG.MultiFrameCountMax: generated frames per rendered pair the GPU allows (1 or unset: 2x only). Engine uses 2x.
+    std::uint32_t multiFrameCountMax = 0;
+    std::string detail;
+};
+
 struct DlssStatus
 {
     DlssAvailability availability = DlssAvailability::NotInitialized;
@@ -114,6 +158,8 @@ struct DlssStatus
     std::string detail;
     // RR.1A.
     DlssRayReconstructionStatus rayReconstruction;
+    // FG.1.
+    DlssFrameGenerationStatus frameGeneration;
 };
 
 // UPSCALING.3C: the DLSS Super Resolution feature of one render/output extent pair; RR.1A: also the Ray Reconstruction
@@ -129,6 +175,8 @@ struct DlssFeatureStatus
     int perfQuality = -1;
     // UPSCALING.3D: the preset the feature was requested for (-1: none, the first mode whose range holds the extent).
     int requestedPreset = -1;
+    // FG.1: the back-buffer DXGI_FORMAT a Frame Generation feature was created for (0 for the other features).
+    std::uint32_t backbufferFormat = 0;
     // Raw NVSDK_NGX_Result values of the last creation and evaluation (0: not called).
     std::uint32_t createResult = 0;
     std::uint32_t evaluateResult = 0;
@@ -191,18 +239,54 @@ struct DlssRayReconstructionEvaluation
     bool reset = false;
 };
 
-// RR.1A: the two NGX features Engine can own. At most one holds GPU resources at a time (the caller releases the other
-// before creating one; FeatureCreationNeeded / ReleaseFeature).
+// FG.3: one 2x Frame Generation evaluation (FG guide 6; NVSDK_NGX_D3D12_DLSSG_Eval_Params). Inputs in
+// NON_PIXEL_SHADER_RESOURCE, the generated frame in UNORDERED_ACCESS, as for the other features.
+struct DlssFrameGenerationEvaluation
+{
+    // The real frame's final image: display-ready SDR at the feature's output extent and back-buffer format.
+    ID3D12Resource* backbuffer = nullptr;
+    // Hardware depth and DLSS motion vectors at the render extent (the inputs Super Resolution and Ray Reconstruction read).
+    ID3D12Resource* depth = nullptr;
+    ID3D12Resource* motionVectors = nullptr;
+    // Optional: the image before the Editor overlays, so Frame Generation treats the overlays as UI (null: none drawn).
+    ID3D12Resource* hudless = nullptr;
+    // The generated frame: same extent and format as backbuffer.
+    ID3D12Resource* output = nullptr;
+    unsigned int renderWidth = 0;
+    unsigned int renderHeight = 0;
+    // NGX's camera matrices: row-major storage for row vectors (v * M), without jitter. Engine's column-vector matrices
+    // are passed transposed (as NRD's are).
+    float cameraViewToClip[4][4]{};
+    float clipToCameraView[4][4]{};
+    float clipToPrevClip[4][4]{};
+    float prevClipToClip[4][4]{};
+    float cameraPosition[3]{};
+    float cameraUp[3]{};
+    float cameraRight[3]{};
+    float cameraForward[3]{};
+    float cameraNear = 0.0f;
+    float cameraFar = 0.0f;
+    // Vertical field of view in radians; aspect = width / height.
+    float cameraFieldOfView = 0.0f;
+    float cameraAspectRatio = 0.0f;
+    // The caller's history discontinuity. EvaluateFrameGeneration adds its own (EvaluationNeedsReset).
+    bool reset = false;
+};
+
+// RR.1A: the NGX features Engine can own. Super Resolution and Ray Reconstruction never hold GPU resources at the same time
+// (the caller releases the other before creating one; FeatureCreationNeeded / ReleaseFeature). FG.1: Frame Generation runs
+// after either of them on the final image, so its feature lives beside whichever is active.
 enum class DlssFeatureKind
 {
     SuperResolution,
-    RayReconstruction
+    RayReconstruction,
+    FrameGeneration
 };
 
 // UPSCALING.3A: owns the NGX SDK instance for one D3D12 device: initialization, the DLSS Super Resolution capability
 // query and shutdown; UPSCALING.3C: the DLSS Super Resolution feature (creation, evaluation, release); RR.1A: Ray
-// Reconstruction's capability and feature slot. Every NGX call in Engine goes through this class. Not thread-safe (NGX is
-// not); the render thread owns it.
+// Reconstruction's capability and feature slot; FG.1: Frame Generation's. Every NGX call in Engine goes through this class.
+// Not thread-safe (NGX is not); the render thread owns it.
 //
 // RR.1A NGX lifecycle (Documentation/Rendering/DLSS_Ray_Reconstruction_RR1A.md):
 //  - Creation records on a lifecycle command list that the caller submits on the frame queue right away
@@ -223,6 +307,8 @@ public:
 
     // RR.1A: before Initialize. False (the packaged runtime) reports Ray Reconstruction NotPermitted without querying it.
     void SetRayReconstructionPermitted(bool permitted) noexcept { m_rayReconstructionPermitted = permitted; }
+    // FG.1: likewise for Frame Generation (Editor viewport first; packaged games in a later stage).
+    void SetFrameGenerationPermitted(bool permitted) noexcept { m_frameGenerationPermitted = permitted; }
 
     // Once per device, after it is created. Never fails the caller: every outcome is reported through GetStatus. A
     // second call without Shutdown is ignored. M0c.5 Stage 5.5: completes (waits for) an initialization BeginInitialize
@@ -328,6 +414,19 @@ public:
     // NGX_DLSSD_GET_STATS: VRAM NGX holds for Ray Reconstruction (every instance, plus its cache). False when unavailable.
     bool QueryRayReconstructionMemory(std::uint64_t& bytes);
 
+    // FG.1 Frame Generation feature slot, with the RR.1A lifecycle (creation on a lifecycle list confirmed or abandoned by the
+    // caller, release only after GPU completion). One feature per output extent, render extent and back-buffer format
+    // (NVSDK_NGX_DLSSG_Create_Params); a change needs a release and a new creation. Evaluation is FG.3.
+    bool FrameGenerationCreationNeeded(unsigned int outputWidth, unsigned int outputHeight, unsigned int renderWidth,
+        unsigned int renderHeight, std::uint32_t backbufferFormat) const;
+    bool EnsureFrameGenerationFeature(ID3D12GraphicsCommandList* lifecycleList, unsigned int outputWidth,
+        unsigned int outputHeight, unsigned int renderWidth, unsigned int renderHeight, std::uint32_t backbufferFormat);
+    const DlssFeatureStatus& GetFrameGenerationFeatureStatus() const noexcept { return m_frameGeneration.status; }
+    // FG.3: records one generated frame on commandList (the frame recording), with the RR.1A bookkeeping: pending until
+    // ConfirmRecordingSubmitted, a discarded or unconfirmed one sets RecoveryRequired. NGX leaves the command list's state
+    // undefined; the caller restores it.
+    bool EvaluateFrameGeneration(ID3D12GraphicsCommandList* commandList, const DlssFrameGenerationEvaluation& evaluation);
+
     // The live NGX feature handles (0 after Shutdown), for lifecycle verification.
     unsigned int LiveFeatureCount() const noexcept;
 
@@ -345,6 +444,8 @@ public:
     bool lastEvaluationResetForTesting = false;
     // Diagnostics only (RR.1C): the InReset of the last recorded Ray Reconstruction evaluation.
     bool lastRayReconstructionResetForTesting = false;
+    // Diagnostics only (FG.3): the reset of the last recorded Frame Generation evaluation.
+    bool lastFrameGenerationResetForTesting = false;
     // Diagnostics only (RR.1C): the next Ray Reconstruction evaluation reports failure without calling NGX.
     bool failNextRayReconstructionEvaluationForTesting = false;
 
@@ -379,11 +480,29 @@ private:
     void ReleaseSlot(FeatureSlot& slot, bool freeMemory);
     FeatureSlot& Slot(DlssFeatureKind kind) noexcept
     {
-        return kind == DlssFeatureKind::SuperResolution ? m_superResolution : m_rayReconstruction;
+        switch(kind)
+        {
+        case DlssFeatureKind::RayReconstruction:
+            return m_rayReconstruction;
+        case DlssFeatureKind::FrameGeneration:
+            return m_frameGeneration;
+        case DlssFeatureKind::SuperResolution:
+        default:
+            return m_superResolution;
+        }
     }
     const FeatureSlot& Slot(DlssFeatureKind kind) const noexcept
     {
-        return kind == DlssFeatureKind::SuperResolution ? m_superResolution : m_rayReconstruction;
+        switch(kind)
+        {
+        case DlssFeatureKind::RayReconstruction:
+            return m_rayReconstruction;
+        case DlssFeatureKind::FrameGeneration:
+            return m_frameGeneration;
+        case DlssFeatureKind::SuperResolution:
+        default:
+            return m_superResolution;
+        }
     }
 
     // M0c.5 Stage 5.5: everything Initialize decides, computed without touching this object (so on any thread).
@@ -399,6 +518,7 @@ private:
         std::string projectId;
         bool rayReconstructionPermitted = true;
         std::string rayReconstructionRuntimeName;
+        bool frameGenerationPermitted = true;
     };
 
     static InitializationOutcome RunInitialize(ID3D12Device* device, const InitializationRequest& request);
@@ -411,9 +531,11 @@ private:
     ID3D12Device* m_device = nullptr;
     bool m_initialized = false;
     bool m_rayReconstructionPermitted = true;
+    bool m_frameGenerationPermitted = true;
     // RR.1A: RecoveryRequired (set while resolving a pending evaluation, hence mutable).
     mutable bool m_recoveryRequired = false;
     DlssStatus m_status;
     FeatureSlot m_superResolution;
     FeatureSlot m_rayReconstruction;
+    FeatureSlot m_frameGeneration;
 };

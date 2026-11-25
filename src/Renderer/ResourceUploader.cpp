@@ -1,5 +1,6 @@
 #include "ResourceUploader.h"
 #include "Debug/MemoryRegistry.h"
+#include "Renderer/TextureMemoryAllocator.h"
 #include "Debug/StreamingTelemetry.h"
 #include "Core/Log.h"
 #ifdef _DEBUG
@@ -289,6 +290,7 @@ bool ResourceUploader::UploadTexture(
     destinationLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     destinationLocation.SubresourceIndex = 0;
 
+    TextureMemoryAllocator::RecordActivation(m_commandList, destination, D3D12_RESOURCE_STATE_COPY_DEST);
     m_commandList->CopyTextureRegion(&destinationLocation, 0, 0, 0, &source, nullptr);
 
     return FinishUpload(uploadBuffer);
@@ -466,6 +468,9 @@ bool ResourceUploader::UploadTexture(
         uploadBuffer->Release();
         return false;
     }
+
+    // A placed texture is activated before the copies that initialize it (TextureMemoryAllocator.h).
+    TextureMemoryAllocator::RecordActivation(m_commandList, destination, D3D12_RESOURCE_STATE_COPY_DEST);
 
     for (unsigned int index = 0; index < subresourceCount; ++index)
     {

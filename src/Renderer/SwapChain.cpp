@@ -15,14 +15,16 @@ bool SwapChain::Initialize(
     ID3D12CommandQueue* commandQueue,
     void* windowHandle,
     unsigned int width,
-    unsigned int height)
+    unsigned int height,
+    unsigned int bufferCount)
 {
-    if (!factory || !device || !commandQueue || !windowHandle)
+    if (!factory || !device || !commandQueue || !windowHandle || bufferCount < 2 || bufferCount > MaximumBufferCount)
     {
         return false;
     }
 
     m_device = device;
+    m_bufferCount = bufferCount;
 
     m_width = width;
     m_height = height;
@@ -37,7 +39,7 @@ bool SwapChain::Initialize(
     swapChainDescription.SampleDesc.Count = 1;
     swapChainDescription.SampleDesc.Quality = 0;
     swapChainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swapChainDescription.BufferCount = 2;
+    swapChainDescription.BufferCount = m_bufferCount;
 
     swapChainDescription.Scaling = DXGI_SCALING_STRETCH;
     swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -65,7 +67,7 @@ bool SwapChain::Initialize(
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDescription{};
 
-    heapDescription.NumDescriptors = 2;
+    heapDescription.NumDescriptors = m_bufferCount;
 
     heapDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     heapDescription.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
@@ -105,7 +107,7 @@ bool SwapChain::Resize(
         }
     }
 
-    HRESULT result = m_swapChain->ResizeBuffers(2, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+    HRESULT result = m_swapChain->ResizeBuffers(m_bufferCount, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
 
     if (FAILED(result))
     {
@@ -151,6 +153,7 @@ void SwapChain::Shutdown()
 
     m_rtvDescriptorSize = 0;
 
+    m_bufferCount = 0;
     m_currentBackBuffer = 0;
     m_width = 0;
     m_height = 0;
@@ -160,7 +163,7 @@ bool SwapChain::CreateBackBufferViews()
 {
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
 
-    for (UINT index = 0; index < 2; ++index)
+    for (UINT index = 0; index < m_bufferCount; ++index)
     {
         HRESULT result = m_swapChain->GetBuffer(index, IID_PPV_ARGS(&m_backBuffers[index]));
 
@@ -172,7 +175,8 @@ bool SwapChain::CreateBackBufferViews()
             return false;
         }
 
-        m_backBuffers[index]->SetName(index == 0 ? L"Back Buffer 0" : L"Back Buffer 1");
+        const std::wstring name = L"Back Buffer " + std::to_wstring(index);
+        m_backBuffers[index]->SetName(name.c_str());
 
         m_device->CreateRenderTargetView(m_backBuffers[index], nullptr, rtvHandle);
 

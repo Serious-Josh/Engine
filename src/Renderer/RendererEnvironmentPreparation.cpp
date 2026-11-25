@@ -1,5 +1,6 @@
 #include "Renderer.h"
 #include "Renderer/BuiltinEnvironment.h"
+#include "Renderer/TextureMemoryAllocator.h"
 #include "Scene/SceneDocument.h"
 #include "Debug/MemoryRegistry.h"
 #include "Debug/StreamingTelemetry.h"
@@ -380,6 +381,14 @@ void Renderer::RecordEnvironmentPreparation(ID3D12GraphicsCommandList* commandLi
 
     if(job.stage == EnvironmentPreparationStage::Copy)
     {
+        // Placed environment textures start undefined: activate them before the first copy or draw
+        // (TextureMemoryAllocator.h; each is activated once).
+        for(Texture* texture : {&environment.GetSourceTexture(), &environment.GetCubemap(),
+                &environment.GetDiffuseIrradiance(), &environment.GetGGXMultiscatterIrradiance()})
+        {
+            TextureMemoryAllocator::RecordActivation(commandList, texture->GetResource(), texture->GetSubresourceState(0));
+        }
+
         // Mip 0 rows, then the CDFs, at most the copy budget per frame. The texture is in COPY_DEST since creation; the
         // COMMON buffers promote to COPY_DEST and decay back to COMMON when this frame's submission completes.
         std::uint64_t copied = 0;

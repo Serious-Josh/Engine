@@ -1,9 +1,32 @@
 #include "Renderer.h"
+#include "Renderer/TextureMemoryAllocator.h"
 #include "Scene/FileSceneRuntime.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Debug/StreamingTelemetry.h"
 
 #include <exception>
+
+void Renderer::CollectBLASMemory()
+{
+    if (!m_commandContextInitialized)
+    {
+        return;
+    }
+
+    m_blasMemoryPool.Collect(m_commandContext.GetSubmissionLifetime(), m_commandContext.GetLastSubmissionFenceValue(),
+        m_commandContext.GetCompletedFenceValue());
+}
+
+void Renderer::CollectTextureMemory()
+{
+    if (!m_commandContextInitialized)
+    {
+        return;
+    }
+
+    TextureMemoryAllocator::Collect(m_commandContext.GetSubmissionLifetime(),
+        m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+}
 
 size_t Renderer::ReclaimIdleEditorDescriptors()
 {

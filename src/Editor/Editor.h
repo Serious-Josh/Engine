@@ -11,6 +11,7 @@
 #include "ViewportMarquee.h"
 #include "AssetBrowser.h"
 #include "EditorWorkspace.h"
+#include "EditorFilesystemCache.h"
 #include "BackgroundTasksUI.h"
 #include "InspectorPanel.h"
 #include "SceneHierarchyPanel.h"
@@ -758,6 +759,11 @@ private:
 
     // A memoisation only (no observable state), so the const read paths can use it.
     mutable InspectionCache m_inspectionCache;
+    // Availability of the assets the Inspector names and previews, shared with m_inspectorPanel (ResolveObjectInspection is const).
+    mutable AssetAvailabilityCache m_assetAvailability;
+    // UpdateSceneHistorySession runs every frame; the two project roots it compares are canonicalized only when they change.
+    CanonicalPathCache m_historyProjectRoot;
+    CanonicalPathCache m_historySceneProjectRoot;
     bool InspectSelection(const FileBackedDemoScene& owner, SceneObjectMetadata& metadata, SceneObjectDocument& object) const;
     std::optional<SceneObjectMetadata> SelectedObjectMetadata(const FileBackedDemoScene& owner) const;
     std::optional<std::optional<std::size_t>> m_compositeSaveRequest;
@@ -797,6 +803,7 @@ private:
     friend class CompositeWorldEditorVerification;
     friend class DemoWorldEditorVerification;
     friend class CompositePlacementStress;
+    friend class EditorCpuVerification;
     friend class RenderingVerification;
     friend class GamePlayGPUVerification;
     friend class MemoryRegistryVerification;
@@ -1083,6 +1090,36 @@ private:
     std::uint64_t m_viewportIconRuntime = 0;
     std::uint64_t m_viewportIconRevision = 0;
     int m_viewportIconFrame = -1;
+
+    // The objects that show viewport icons and their artwork. Finding them scans every document object and hashes each
+    // icon object's id, so the list is kept until the document, its structure or the icon toggles change; positions are
+    // still read every frame.
+    struct ViewportIconSource
+    {
+        size_t objectIndex = 0;
+        std::optional<EditorIcon> cameraOrLight;
+        bool audioSource = false;
+        bool audioListener = false;
+        bool activeListener = false;
+    };
+
+    struct ViewportIconSourceKey
+    {
+        const Scene* scene = nullptr;
+        std::uint64_t runtimeIdentity = 0;
+        std::uint64_t structureRevision = 0;
+        std::uint64_t editRevision = 0;
+        const void* documentObjects = nullptr;
+        size_t documentObjectCount = 0;
+        bool cameraIcons = false;
+        bool lightIcons = false;
+        bool audioIcons = false;
+
+        bool operator==(const ViewportIconSourceKey&) const = default;
+    };
+
+    std::vector<ViewportIconSource> m_viewportIconSources;
+    std::optional<ViewportIconSourceKey> m_viewportIconSourceKey;
     void BuildViewportIcons(const IDemoScene& scene, const EditorIcons& icons);
     std::optional<size_t> PickViewportIcon(const IDemoScene& scene, ImVec2 mouse) const;
     void DrawViewportTools(IDemoScene& scene, const EditorIcons& icons, bool viewportWasFocused);

@@ -5,10 +5,13 @@
 
 #include <Windows.h>
 
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace
@@ -236,6 +239,17 @@ void EnvironmentPreparationJob::Run(ID3D12Device* device)
         DiscardEnvironment(result);
         result.error = "Environment preparation failed.";
     }
+
+#ifndef NDEBUG
+    // Scene-switch hang repro aid (Debug only, optional; Documentation/Rendering/FgTiming_ManyLight_Switch_Hangs.md):
+    // ENGINE_DIAG_ENVIRONMENT_WORKER_DELAY_MS lengthens the worker, so the environment change (and the release of the
+    // previous environment) lands just before the next scene switch, as in the runs whose worker took about 1.4 s. With
+    // committed textures (ENGINE_TEXTURE_HEAP_POOL=0) that makes the short repro hang in about 95% of warm runs.
+    if(const char* delay = std::getenv("ENGINE_DIAG_ENVIRONMENT_WORKER_DELAY_MS"); delay && *delay)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::strtoul(delay, nullptr, 10)));
+    }
+#endif
 
     result.workerNanoseconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());

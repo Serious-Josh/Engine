@@ -19,6 +19,9 @@
 
 #include "../LightSampling.hlsli"
 
+// The local lighting discontinuity regions one frame carries (ReSTIRPTMaxDiscontinuityRegions, ReSTIRPTPass.h).
+#define RESTIR_PT_MAX_DISCONTINUITY_REGIONS 16
+
 cbuffer RestirPtConstants : register(b2)
 {
     // Raw UAV of the reservoirs (RESTIR_PT_RESERVOIR_BYTES per pixel), 0xFFFFFFFF when none is stored.
@@ -114,6 +117,12 @@ cbuffer RestirPtConstants : register(b2)
     uint restirPtDiagnosticFlags;
     // M5.6 C7 reinvestigation: {alpha, minCap, threshold} of the duplication response (all 0: the original).
     float3 restirPtDuplicationResponse;
+
+    // History through lighting changes: local lighting discontinuities since the committed frame (centre xyz, radius w);
+    // temporal reuse is refused at surfaces inside them (RestirPtInDiscontinuityRegion).
+    uint restirPtDiscontinuityCount;
+    uint3 restirPtDiscontinuityPadding;
+    float4 restirPtDiscontinuityRegions[RESTIR_PT_MAX_DISCONTINUITY_REGIONS];
 #if defined(RESTIR_PT_SHARC)
 
     // The SHARC radiance cache at x3: this frame's NVIDIA SHARC buffers (raw UAVs; capacity 0: no cache this frame, and
@@ -213,6 +222,11 @@ static const uint RESTIR_PT_FLAG_OUTPUT_SUM = 1u << 9;
 static const uint RESTIR_PT_FLAG_SELF_SHIFT = 1u << 10;
 // T-2.1 diagnostic: shift from the in-register (unquantized) reconnection data instead of the stored reservoir words.
 static const uint RESTIR_PT_FLAG_SELF_SHIFT_UNQUANTIZED = 1u << 11;
+// Residual boiling, research report §5d option 2 (experimental; extraction frames only): the reservoir resamples the path
+// tree's direct candidates (k <= 2) only; its bounce candidates (k >= 3) are summed into a fresh estimate that the last pass
+// adds at shading (passed on in the extraction textures). No decorrelation swap in this mode; firefly replacement shows
+// the fresh direct estimate (passed on in the output texture) in place of a reused direct firefly.
+static const uint RESTIR_PT_FLAG_DIRECT_RESERVOIR = 1u << 12;
 // T-2.1 round 3 quantization decomposition (stored-word runs): use the in-register rcWi, or the in-register barycentrics,
 // in place of the stored field (everything else from the stored words).
 static const uint RESTIR_PT_FLAG_SHIFT_EXACT_DIRECTION = 1u << 13;
@@ -543,17 +557,6 @@ static const uint RESTIR_PT_REGIR_HEADER_BYTES = 64u;
 static const uint RESTIR_PT_REGIR_MAGIC = 0x52654749u;
 // M5.6 O0.2: the light map's table-indexed p_1 (RestirPtReGIRLights.hlsl; ReSTIRPTPass::ReGIRLightCapacity x 8 bytes in).
 static const uint RESTIR_PT_REGIR_TABLE_P1 = 131072u * 8u;
-// ReGIR architecture investigation (experimental): the list sampler's 32-byte proposal records (RestirPtReGIRLights.hlsl).
-static const uint RESTIR_PT_REGIR_COMPACT = 131072u * 12u;
-
-float3 RestirPtOctDecode(uint packed)
-{
-    const float2 folded = float2(packed & 65535u, packed >> 16u) * (2.0f / 65535.0f) - 1.0f;
-    float3 direction = float3(folded, 1.0f - abs(folded.x) - abs(folded.y));
-    const float t = saturate(-direction.z);
-    direction.xy += float2(direction.x >= 0.0f ? -t : t, direction.y >= 0.0f ? -t : t);
-    return normalize(direction);
-}
 static const uint RESTIR_PT_DIMENSION_STREAM = 200u;
 // M5.2: the temporal neighbour's reprojection jitter (two dimensions at vertex 0).
 static const uint RESTIR_PT_DIMENSION_TEMPORAL = 240u;
@@ -844,6 +847,9 @@ struct RestirPtStream
     // Plain path tracing (reservoir off): every candidate's contribution / survival.
     float3 sum;
     float3 diffuseSum;
+    // RESTIR_PT_FLAG_DIRECT_RESERVOIR: the bounce candidates' (k >= 3) contribution / survival, kept out of the reservoir.
+    float3 bounceSum;
+    float3 bounceDiffuseSum;
 };
 
 RestirPtCandidate RestirPtMakeCandidate(float3 contribution, float3 diffuse, float survival, uint length, uint endClass,
@@ -877,6 +883,8 @@ RestirPtStream RestirPtEmptyStream()
     stream.selected = RestirPtMakeCandidate(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f), 1.0f, 0u, 0u, 0u);
     stream.sum = float3(0.0f, 0.0f, 0.0f);
     stream.diffuseSum = float3(0.0f, 0.0f, 0.0f);
+    stream.bounceSum = float3(0.0f, 0.0f, 0.0f);
+    stream.bounceDiffuseSum = float3(0.0f, 0.0f, 0.0f);
     return stream;
 }
 
@@ -916,6 +924,16 @@ void RestirPtStreamCandidate(inout RestirPtStream stream, RestirPtCandidate cand
     const float candidateWeight = candidate.sourceWeight / candidate.survival;
     stream.sum += candidate.contribution * candidateWeight;
     stream.diffuseSum += candidate.diffuse * candidateWeight;
+
+    // Direct-reservoir mode: bounce light is this frame's fresh sum (each candidate already MIS-weighted, so the sum is the
+    // path tracer's unbiased estimate of it); only direct candidates compete for the reservoir.
+    if((restirPtFlags & RESTIR_PT_FLAG_DIRECT_RESERVOIR) != 0u && candidate.length >= 3u)
+    {
+        stream.bounceSum += candidate.contribution * candidateWeight;
+        stream.bounceDiffuseSum += candidate.diffuse * candidateWeight;
+        return;
+    }
+
     const float weight = target * candidateWeight;
     stream.weightSum += weight;
 
@@ -972,9 +990,10 @@ float3 RestirPtBsdfCos(PathTraceSurface surface, float3 direction, out float3 di
 }
 
 // M5.6 B3a: RestirPtUnshadowed that also returns f_all cos, the intermediate it multiplies by Li (the value RestirPtBsdfCos
-// would recompute for the same direction), so a caller keeps it instead of evaluating the BSDF again.
-float3 RestirPtUnshadowedWithBsdf(PathTraceSurface surface, PathTraceLightSample lightSample, out float3 diffuse,
-    out float3 bsdfCos)
+// would recompute for the same direction), so a caller keeps it instead of evaluating the BSDF again. The light candidate
+// loops pass the vertex's prepared BSDF terms (PathTracePrepareBSDF, once per NEE event).
+float3 RestirPtUnshadowedWithBsdfPrepared(PathTraceSurface surface, PathTraceBSDFPrepared prepared,
+    PathTraceLightSample lightSample, out float3 diffuse, out float3 bsdfCos)
 {
     diffuse = float3(0.0f, 0.0f, 0.0f);
     bsdfCos = float3(0.0f, 0.0f, 0.0f);
@@ -986,14 +1005,29 @@ float3 RestirPtUnshadowedWithBsdf(PathTraceSurface surface, PathTraceLightSample
 
     float3 diffuseValue;
     const float cosine = dot(surface.normal, lightSample.direction);
-    bsdfCos = PathTraceEvaluateBSDFLobes(surface, lightSample.direction, diffuseValue) * cosine;
+    bsdfCos = PathTraceEvaluateBSDFLobesPrepared(surface, prepared, lightSample.direction, diffuseValue) * cosine;
     const float3 value = bsdfCos * lightSample.radiance;
     diffuse = diffuseValue * cosine * lightSample.radiance;
     return value;
 }
 
-// Unshadowed f_all cos Li for a light sample, and its diffuse part.
-float3 RestirPtUnshadowed(PathTraceSurface surface, PathTraceLightSample lightSample, out float3 diffuse)
+float3 RestirPtUnshadowedWithBsdf(PathTraceSurface surface, PathTraceLightSample lightSample, out float3 diffuse,
+    out float3 bsdfCos)
+{
+    diffuse = float3(0.0f, 0.0f, 0.0f);
+    bsdfCos = float3(0.0f, 0.0f, 0.0f);
+
+    if(!lightSample.valid || !PathTraceDirectionAboveSurface(surface, lightSample.direction))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    return RestirPtUnshadowedWithBsdfPrepared(surface, PathTracePrepareBSDF(surface), lightSample, diffuse, bsdfCos);
+}
+
+// Unshadowed f_all cos Li for a light sample, and its diffuse part (prepared terms as above).
+float3 RestirPtUnshadowedPrepared(PathTraceSurface surface, PathTraceBSDFPrepared prepared, PathTraceLightSample lightSample,
+    out float3 diffuse)
 {
     diffuse = float3(0.0f, 0.0f, 0.0f);
 
@@ -1004,10 +1038,22 @@ float3 RestirPtUnshadowed(PathTraceSurface surface, PathTraceLightSample lightSa
 
     float3 diffuseValue;
     const float cosine = dot(surface.normal, lightSample.direction);
-    const float3 value = PathTraceEvaluateBSDFLobes(surface, lightSample.direction, diffuseValue) * cosine *
-        lightSample.radiance;
+    const float3 value = PathTraceEvaluateBSDFLobesPrepared(surface, prepared, lightSample.direction, diffuseValue) *
+        cosine * lightSample.radiance;
     diffuse = diffuseValue * cosine * lightSample.radiance;
     return value;
+}
+
+float3 RestirPtUnshadowed(PathTraceSurface surface, PathTraceLightSample lightSample, out float3 diffuse)
+{
+    diffuse = float3(0.0f, 0.0f, 0.0f);
+
+    if(!lightSample.valid || !PathTraceDirectionAboveSurface(surface, lightSample.direction))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    return RestirPtUnshadowedPrepared(surface, PathTracePrepareBSDF(surface), lightSample, diffuse);
 }
 
 // Audit T1-c (2026-11-23): diagnostic counters compile only when requested: RESTIR_PT_COUNTERS (ShaderCompiler adds it for
@@ -1151,6 +1197,36 @@ uint RestirPtTileBase(uint2 pixel, uint sampleIndex, uint vertex)
     return (tile % max(restirPtTileCount, 1u)) * restirPtTileSize;
 }
 
+// The adaptive light sampler's modes (restirPtRegirPadding.x; RestirPtTableLightNee in the ReGIR kernel with
+// RESTIR_PT_LIST_PROTOTYPE). RESTIR_PT_LIST_ON: the sampler is on (the Editor's "Adaptive x1 light sampling"; off: ReGIR
+// slots at every vertex). RESTIR_PT_LIST_X1_ONLY: production; without it the adaptive walk runs at every vertex (the
+// research report's upper bound, ENGINE_RESTIR_PT_LIST_MODE without "x1").
+static const uint RESTIR_PT_LIST_ON = 4u;
+static const uint RESTIR_PT_LIST_X1_ONLY = 16u;
+
+// Residual boiling P1 (experimental, restirPtRegirPadding.x bit 10, off by default): the first non-delta vertex of a camera
+// mirror chain takes x1's light sampler and candidate count (RestirPtNeeSamplingVertex).
+static const uint RESTIR_PT_MIRROR_CHAIN_X1 = 1024u;
+
+// The vertex whose light-sampling rules (sampler and candidate count) apply to table-light NEE at `vertex`: the vertex
+// itself, or 1 where P1 is on and every earlier vertex of the camera path was a delta (mirror) bounce, so this vertex is
+// what the camera sees in the mirror. `lobes` holds the sampled lobes of x1 and x2 (2 bits each, RestirPtPrefixState).
+// Proposal only: candidates keep their unbiased weights and p_1, and the RNG dimensions stay the vertex's own.
+uint RestirPtNeeSamplingVertex(uint vertex, uint lobes)
+{
+    if((restirPtRegirPadding.x & RESTIR_PT_MIRROR_CHAIN_X1) == 0u)
+    {
+        return vertex;
+    }
+
+    const uint deltaX1 = RESTIR_PT_LOBE_DELTA;
+    const uint deltaX1X2 = RESTIR_PT_LOBE_DELTA | (RESTIR_PT_LOBE_DELTA << 2u);
+    const bool mirrorAtX2 = vertex == 2u && (lobes & 3u) == deltaX1;
+    const bool mirrorAtX3 = vertex == 3u && (lobes & 15u) == deltaX1X2;
+
+    return mirrorAtX2 || mirrorAtX3 ? 1u : vertex;
+}
+
 uint RestirPtCandidatesAtVertex(uint vertex)
 {
     if((restirPtFlags & RESTIR_PT_FLAG_RIS) == 0u)
@@ -1160,6 +1236,180 @@ uint RestirPtCandidatesAtVertex(uint vertex)
 
     return max(restirPtPrimaryCandidates / (vertex * vertex), 1u);
 }
+
+// -----------------------------------------------------------------------------
+// Wall boiling (experimental, ReSTIRPTSettings::lightTracedBounce): light-traced bounce connections
+// -----------------------------------------------------------------------------
+// The paths x1 -> x2 -> L (L a point or spot table light) get a second technique beside the BSDF bounce's NEE at x2
+// (technique A: x1's lobe lambda samples omega_12, x2 is its hit, x2's NEE selects L). Technique B selects L near x1 with
+// probability w(L) / T, samples an emission direction from L, takes its first hit as x2 and connects x2 to x1 (one
+// visibility ray). Both are densities of (x2, L) in x2's area measure:
+//   p_A,lambda = P(lambda) p_lambda(omega_12) |cos theta_x2,1| / d_12^2 * s(x2),
+//   p_B        = w(L) / T * p_omega(L -> x2) |cos theta_x2,L| / d_L^2,
+// with s(x2) = min(1, M_2 / N_2), the chance that x2's uniform candidates include a given light (a fixed proxy for x2's
+// light selection: any fixed positive weighting keeps the balance heuristic's weights a partition of unity, so both
+// techniques stay unbiased). Each of x1's lobes is its own integrand (the lobes partition f), so B's sample adds, per lobe,
+// f_lambda G V f_x2 cos E / (p_A,lambda + p_B), and A's NEE at x2 is scaled by p_A,lambda / (p_A,lambda + p_B) for the lobe
+// it sampled. B samples x2 where a light actually puts its energy, so a small brightly lit patch (a light just above a
+// surface, a spot pool) reaches a distant wall every frame instead of as a rare spike. It runs only where the direct-light
+// reservoir is on (bounce light is the fresh sum, never reused), at primary surfaces, and needs the adaptive x1 walk (the
+// ReGIR kernel with the list sampler), which visits x1's whole light list and selects B's light on the way.
+// Documentation/Rendering/ReSTIR_PT_Wall_Boiling_Investigation.md.
+#if defined(RESTIR_PT_LIGHT_BOUNCE) && defined(RESTIR_PT_REGIR) && defined(RESTIR_PT_LIST_PROTOTYPE)
+#define RESTIR_PT_LIGHT_BOUNCE_ACTIVE 1
+
+// Random-number dimensions at vertex 1: the light selection's uniform, then the emission direction (two). Far above the
+// list walk's 16 + 2 member + 1.
+static const uint RESTIR_PT_DIMENSION_LIGHT_BOUNCE = 1024u;
+// Test only (restirPtRegirPadding.x bit 11, ENGINE_RESTIR_PT_LIGHT_BOUNCE_TEST=bonly): technique B alone wherever it can
+// produce the path (no MIS), to inspect its own noise; still unbiased.
+static const uint RESTIR_PT_LIGHT_BOUNCE_TEST_B_ONLY = 2048u;
+
+struct RestirPtBounceState
+{
+    // This path tree takes light-traced samples (direct-light reservoir on, depth 2 or more).
+    bool enabled;
+    // The running uniform of the one-number weighted reservoir selection over x1's light list.
+    float selectionRandom;
+    // T, the selected light (table index, or 0xFFFFFFFF) and its weight w(L).
+    float total;
+    uint light;
+    float weight;
+    // x1 and its geometric normal (the weights' inputs), and A's sampled lobe density P(lambda) p_lambda(omega_12) at x1
+    // (0 for the delta lobe, which B cannot produce).
+    float3 position;
+    float3 normal;
+    float lobePdf;
+};
+
+static RestirPtBounceState g_restirPtBounce;
+
+void RestirPtBounceBegin(uint seed, float3 position, float3 normal, bool enabled)
+{
+    g_restirPtBounce.enabled = enabled;
+    g_restirPtBounce.selectionRandom = RestirPtRandom(seed, 1u, RESTIR_PT_DIMENSION_LIGHT_BOUNCE);
+    g_restirPtBounce.total = 0.0f;
+    g_restirPtBounce.light = 0xFFFFFFFFu;
+    g_restirPtBounce.weight = 0.0f;
+    g_restirPtBounce.position = position;
+    g_restirPtBounce.normal = normal;
+    g_restirPtBounce.lobePdf = 0.0f;
+}
+
+// w(L): the light's emitted power (luminance of its intensity times its emission solid angle) over max(d^2, 1 m^2), for
+// point and spot lights that reach x1 (d < range, so every light with w > 0 is in x1's complete light list) and lie in
+// front of x1's surface; 0 otherwise.
+float RestirPtBounceLightWeight(GPULight light, float3 position, float3 normal)
+{
+    if(light.type != SCENE_LIGHT_POINT && light.type != SCENE_LIGHT_SPOT)
+    {
+        return 0.0f;
+    }
+
+    const float3 toLight = light.position - position;
+    const float distanceSquared = dot(toLight, toLight);
+    const float range = abs(light.range);
+
+    if(!(distanceSquared < range * range) || !(dot(normal, toLight) > 0.0f))
+    {
+        return 0.0f;
+    }
+
+    const float solidAngle = light.type == SCENE_LIGHT_SPOT ?
+        2.0f * PI * (1.0f - clamp(light.cosOuterCone, -1.0f, 1.0f)) : 4.0f * PI;
+    const float weight = PathTraceLuminance(light.radiance) * solidAngle / max(distanceSquared, 1.0f);
+    return weight > 0.0f && isfinite(weight) ? weight : 0.0f;
+}
+
+// One step of the weighted reservoir selection with a single uniform (each step keeps it uniform on [0, 1)), so the
+// selected light has probability w(L) / T exactly.
+void RestirPtBounceSelect(float weight, uint light)
+{
+    if(!(weight > 0.0f))
+    {
+        return;
+    }
+
+    g_restirPtBounce.total += weight;
+    const float accept = weight / g_restirPtBounce.total;
+
+    if(g_restirPtBounce.selectionRandom < accept)
+    {
+        g_restirPtBounce.light = light;
+        g_restirPtBounce.weight = weight;
+        g_restirPtBounce.selectionRandom = min(g_restirPtBounce.selectionRandom / accept, 0.99999994f);
+    }
+    else
+    {
+        g_restirPtBounce.selectionRandom = min((g_restirPtBounce.selectionRandom - accept) / (1.0f - accept),
+            0.99999994f);
+    }
+}
+
+// The emission density of a point (uniform sphere) or spot light (uniform in its outer cone) for `direction` (leaving the
+// light), as RestirPtBounceEmissionDirection samples it.
+float RestirPtBounceEmissionPdf(GPULight light, float3 direction)
+{
+    if(light.type == SCENE_LIGHT_SPOT)
+    {
+        const float cosOuter = clamp(light.cosOuterCone, -1.0f, 0.999999f);
+        return dot(direction, normalize(light.direction)) >= cosOuter ? 1.0f / (2.0f * PI * (1.0f - cosOuter)) : 0.0f;
+    }
+
+    return 1.0f / (4.0f * PI);
+}
+
+// p_B: technique B's density of (x2 = position, light) in x2's area measure; 0 where B cannot produce it.
+float RestirPtBounceLightDensity(GPULight light, float3 position, float3 geometricNormal)
+{
+    const float weight = RestirPtBounceLightWeight(light, g_restirPtBounce.position, g_restirPtBounce.normal);
+    const float3 fromLight = position - light.position;
+    const float distanceSquared = dot(fromLight, fromLight);
+    const float range = abs(light.range);
+
+    if(!(weight > 0.0f) || !(g_restirPtBounce.total > 0.0f) || !(distanceSquared > 0.0f) ||
+        !(distanceSquared < range * range))
+    {
+        return 0.0f;
+    }
+
+    const float3 direction = fromLight * rsqrt(distanceSquared);
+    return weight / g_restirPtBounce.total * RestirPtBounceEmissionPdf(light, direction) *
+        abs(dot(geometricNormal, direction)) / distanceSquared;
+}
+
+// p_A,lambda: technique A's density of (x2 = position, light) for x1's lobe density lobePdf (P(lambda) p_lambda(omega_12)),
+// with x2's selection proxy s(x2).
+float RestirPtBounceBsdfDensity(float lobePdf, float3 position, float3 geometricNormal, float selection)
+{
+    const float3 offset = position - g_restirPtBounce.position;
+    const float distanceSquared = dot(offset, offset);
+
+    if(!(distanceSquared > 0.0f))
+    {
+        return 0.0f;
+    }
+
+    return lobePdf * abs(dot(geometricNormal, offset * rsqrt(distanceSquared))) / distanceSquared * selection;
+}
+
+// Technique A's share p_A / (p_A + p_B) of one path (1 where B cannot produce it); 0 wherever B can in the B-only test.
+float RestirPtBounceShare(float bsdfDensity, float lightDensity)
+{
+    if(!(lightDensity > 0.0f))
+    {
+        return 1.0f;
+    }
+
+    if((restirPtRegirPadding.x & RESTIR_PT_LIGHT_BOUNCE_TEST_B_ONLY) != 0u)
+    {
+        return 0.0f;
+    }
+
+    const float share = bsdfDensity / (bsdfDensity + lightDensity);
+    return isfinite(share) ? share : 1.0f;
+}
+#endif
 
 // RIS over the light-tile candidates of the finite table lights: one shadow ray for the selected light (lightIndex).
 // The published NEE representation (supplemental section 5, decision D1): the RIS process is a black box, and the
@@ -1217,8 +1467,25 @@ static const uint RESTIR_PT_SMALL_LIGHT_LIMIT = 16u;
 static const uint RESTIR_PT_SMALL_LIGHT_RATIO = 3u;
 #endif
 
-float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint seed, uint vertex, uint tileBase,
-    inout uint shadowRays, out float3 diffuse, out uint lightIndex, out RestirPtNeeParts parts, out float sourceWeight)
+// A member of the adaptive x1 walk queued for its full evaluation (E1q): its list position (the selection's random-number
+// dimension), its sample count, spacing and cheap target (the RIS weight's terms), its light and type, and the light
+// sample the scan computed for it.
+struct RestirPtWalkEntry
+{
+    uint member;
+    uint count;
+    float spacing;
+    float cheap;
+    uint light;
+    uint lightType;
+    PathTraceLightSample lightSample;
+};
+
+// samplingVertex: the vertex whose sampler and candidate count apply (RestirPtNeeSamplingVertex; `vertex` itself unless P1
+// gives a mirror chain's first rough vertex x1's rules). `vertex` keeps the random-number dimensions and diagnostics.
+float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint seed, uint vertex, uint samplingVertex,
+    uint tileBase, inout uint shadowRays, out float3 diffuse, out uint lightIndex, out RestirPtNeeParts parts,
+    out float sourceWeight)
 {
     diffuse = float3(0.0f, 0.0f, 0.0f);
     lightIndex = 0xFFFFFFFFu;
@@ -1250,7 +1517,9 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
     uint waveRepeats = 0u;
 
     ByteAddressBuffer tiles = ResourceDescriptorHeap[restirPtLightTileIndex];
-    const uint candidates = RestirPtCandidatesAtVertex(vertex);
+    const uint candidates = RestirPtCandidatesAtVertex(samplingVertex);
+    // The vertex's light-independent BSDF terms, shared by every candidate evaluation below (prepare/evaluate split).
+    const PathTraceBSDFPrepared bsdfPrepared = PathTracePrepareBSDF(surface);
 
     // M5.6 O0: this point's shared ReGIR cell (RTXDI's Grid lookup of the position jittered once per event by
     // (U - 0.5) samplingJitter cellSize per axis, as the ReSTIR DI bridge does), or -1: the light tiles. A ReGIR candidate
@@ -1334,10 +1603,11 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
             const PathTraceLightSample lightSample = PathTraceSampleTableLight(tableLight, position);
             float3 candidateDiffuse;
 #if defined(RESTIR_PT_UNFUSED_BSDF)
-            const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
+            const float3 value = RestirPtUnshadowedPrepared(surface, bsdfPrepared, lightSample, candidateDiffuse);
 #else
             float3 candidateBsdfCos;
-            const float3 value = RestirPtUnshadowedWithBsdf(surface, lightSample, candidateDiffuse, candidateBsdfCos);
+            const float3 value = RestirPtUnshadowedWithBsdfPrepared(surface, bsdfPrepared, lightSample, candidateDiffuse,
+                candidateBsdfCos);
             smallBsdfCos[light] = candidateBsdfCos;
 #endif
             const float target = PathTraceLuminance(value);
@@ -1348,35 +1618,29 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
     }
 #endif
 
-    // ReGIR architecture investigation (experimental, RESTIR_PT_LIST_PROTOTYPE: ENGINE_RESTIR_PT_LIST_PROTOTYPE=1, ReGIR kernel
-    // only): candidates from a per-receiver proposal over the M4.1 light grid's list for this point (the nominal list of
-    // its cell, which holds every binned light reaching the point, plus the wide pool), q(l) = t(l) / T with the cheap target
-    // t = luminance(incident radiance) max(n . omega, 0.05) for lights that reach the point above its surface (0 otherwise;
-    // positive wherever the full target is). M candidates are drawn systematically (stratified: candidate k at
-    // (k + xi) T / M of the cumulative targets); a light drawn n times is evaluated once with weight n p_hat / (M q), which
-    // is the stratified RIS estimate (unbiased: each stratum's candidate has density M q on its stratum). p_1 for the
-    // integrand stays the table's global probability (as direct fetch). No ReGIR slots, window or fallback.
+    // The adaptive light sampler (default since the user decision of 2026-11-23; RESTIR_PT_LIST_PROTOTYPE, ReGIR kernel only,
+    // ENGINE_RESTIR_PT_LIST_PROTOTYPE=0 compiles it out): candidates from a per-receiver proposal over the M4.1 light grid's
+    // list for this point (the nominal list of its cell, which holds every binned light reaching the point, plus the wide
+    // pool). x1 walks the whole list with the cheap target t = luminance(incident radiance) max(n . omega, 0.05) for lights
+    // that reach the point above its surface (0 otherwise; positive wherever the full target is); deeper vertices draw M
+    // uniform members. p_1 for the integrand stays the table's global probability (as direct fetch).
     uint standardCandidates = candidates;
 #if defined(RESTIR_PT_REGIR) && defined(RESTIR_PT_LIST_PROTOTYPE)
     const LightSamplingConstants listSampling = LightSamplingLoadConstants(restirPtLightSamplingIndex);
 
-    // Experiment modes (restirPtRegirPadding.x): bit 2 list proposals on; bit 3 single pass (one light by weighted reservoir
-    // sampling over the cheap targets, q = t / T exactly, no second pass); bit 4 list at x1 only (deeper vertices use the
-    // light tiles: the slots are not built); bit 5 list only where ReGIR has no cell (outside the window, slots built).
     const uint listMode = restirPtRegirPadding.x;
-    const bool listVertex = (listMode & 16u) == 0u || vertex == 1u;
-    const bool listFallbackOnly = (listMode & 32u) != 0u;
+    const bool listSampler = (listMode & RESTIR_PT_LIST_ON) != 0u;
+    const bool listVertex = (listMode & RESTIR_PT_LIST_X1_ONLY) == 0u || samplingVertex == 1u;
+    const bool listsAvailable = restirPtLightSamplingIndex != 0xFFFFFFFFu && restirPtRegirLightsIndex != 0xFFFFFFFFu &&
+        listSampling.valid != 0u && listSampling.tableLightCount == sceneLightCount;
 
-    const bool deepReGIR = (listMode & 64u) != 0u;
-    const bool deepUniform = (listMode & 128u) != 0u;
-
-    if((listMode & 4u) != 0u && !listVertex && !deepReGIR)
+    // Deeper vertices never draw ReGIR slots: the light tiles unless the uniform list draw below takes over.
+    if(listSampler && !listVertex)
     {
         regirCell = -1;
     }
 
-    if((listMode & 4u) != 0u && !listVertex && deepUniform && restirPtLightSamplingIndex != 0xFFFFFFFFu &&
-        restirPtRegirLightsIndex != 0xFFFFFFFFu && listSampling.valid != 0u && listSampling.tableLightCount == sceneLightCount)
+    if(listSampler && !listVertex && listsAvailable)
     {
         // Deeper vertices: the M candidates drawn uniformly from the receiver's cell list and the wide pool (members N,
         // each drawn with the realized probability LightSamplingUniformProbability), RIS weight p_hat / (M q).
@@ -1398,7 +1662,7 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
             const GPULight candidateLight = SceneLightLoad(sceneLightBufferIndex, light);
             const PathTraceLightSample lightSample = PathTraceSampleTableLight(candidateLight, position);
             float3 candidateDiffuse;
-            const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
+            const float3 value = RestirPtUnshadowedPrepared(surface, bsdfPrepared, lightSample, candidateDiffuse);
             const float target = PathTraceLuminance(value);
 
             if(!(target > 0.0f) || !all(isfinite(value)))
@@ -1428,11 +1692,9 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
         }
     }
 
-    if((listMode & 4u) != 0u && listVertex && (!listFallbackOnly || regirCell < 0) &&
-        restirPtLightSamplingIndex != 0xFFFFFFFFu && restirPtRegirLightsIndex != 0xFFFFFFFFu && listSampling.valid != 0u &&
-        listSampling.tableLightCount == sceneLightCount && (listMode & 256u) != 0u)
+    if(listSampler && listVertex && listsAvailable)
     {
-        // Adaptive systematic sampling in one pass (bit 8): member l (cheap target t_l > 0, in list order) is crossed with
+        // Adaptive systematic sampling in one pass: member l (cheap target t_l > 0, in list order) is crossed with
         // the spacing s_l = (T_{l-1} + t_l) (N / l) / M, the running extrapolation of the total, which depends only on the
         // members before it. The phase phi in [0, 1) (units of the current spacing) starts uniform and stays uniform from
         // member to member (a rotation mod 1), so member l receives c_l = number of k >= 0 with (phi + k) s_l < t_l samples
@@ -1447,98 +1709,111 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
         regirCell = pools.cellIndex >= 0 ? pools.cellIndex : 0;
         float cumulative = 0.0f;
         float phase = RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS);
-        // Experiment: ENGINE_RESTIR_PT_LIST_M (bits 16-23) overrides M; bit 9 uses the 32-byte proposal records (hard range
-        // cutoff, precomputed luminance, cone only for spots; positive wherever the light's incident radiance is).
-        const uint listCandidates = ((listMode >> 16u) & 255u) != 0u ? (listMode >> 16u) & 255u : candidates;
-        const bool compactRecords = (listMode & 512u) != 0u;
-        ByteAddressBuffer records = ResourceDescriptorHeap[restirPtRegirLightsIndex];
 
-        for(uint member = 0u; member < members; ++member)
+        // Deferred full evaluation (initial-sampling E1q): the cheap scan stays in lockstep across the wave; each lane queues
+        // the members that receive samples (up to two), and one full-evaluation round runs whenever a lane's queue is full
+        // or a lane has finished its list, popping the oldest entry of every lane that holds one. A wave then evaluates
+        // about as often as its busiest lane samples members, instead of once for every member that any lane samples. Each
+        // lane still evaluates its own members in list order with the same arithmetic and random numbers, so the selection
+        // is unchanged.
+        RestirPtWalkEntry queueFront = (RestirPtWalkEntry)0;
+        RestirPtWalkEntry queueBack = (RestirPtWalkEntry)0;
+        uint queued = 0u;
+        uint member = 0u;
+
+        [loop]
+        while(member < members || queued != 0u)
         {
-            const uint light = member < nominal ?
-                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + member) * 4u) :
-                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (member - nominal) * 16u + 12u);
-            float cheap = 0.0f;
-            GPULight candidateLight = (GPULight)0;
-            PathTraceLightSample lightSample = (PathTraceLightSample)0;
-
-            if(compactRecords)
+            if(member < members)
             {
-                const uint4 head = records.Load4(RESTIR_PT_REGIR_COMPACT + light * 32u);
-                const float3 toLight = asfloat(head.xyz) - position;
-                const float distanceSquared = dot(toLight, toLight);
-                const float range = asfloat(head.w);
+                const uint light = member < nominal ?
+                    structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + member) * 4u) :
+                    structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (member - nominal) * 16u + 12u);
+                const GPULight candidateLight = SceneLightLoad(sceneLightBufferIndex, light);
+                const PathTraceLightSample lightSample = PathTraceSampleTableLight(candidateLight, position);
+                const float cheap = lightSample.valid && PathTraceDirectionAboveSurface(surface, lightSample.direction) ?
+                    PathTraceLuminance(lightSample.radiance) * max(dot(surface.normal, lightSample.direction), 0.05f) :
+                    0.0f;
 
-                if(distanceSquared < range * range && distanceSquared > 0.0f)
+#if defined(RESTIR_PT_LIGHT_BOUNCE_ACTIVE)
+                // Wall boiling: the light-traced bounce's light, selected over x1's whole list on the way (every member is
+                // visited here, so T is exact).
+                if(vertex == 1u && g_restirPtBounce.enabled)
                 {
-                    const float3 direction = toLight * rsqrt(distanceSquared);
+                    RestirPtBounceSelect(RestirPtBounceLightWeight(candidateLight, position, surface.geometricNormal),
+                        light);
+                }
+#endif
 
-                    if(PathTraceDirectionAboveSurface(surface, direction))
+                // Members without a cheap target take no part in the sampler.
+                uint count = 0u;
+                float spacing = 0.0f;
+
+                if(cheap > 0.0f && isfinite(cheap))
+                {
+                    cumulative += cheap;
+                    spacing = cumulative * (float(members) / float(member + 1u)) / float(candidates);
+                    const float span = cheap / spacing;
+                    // Samples at (phase + k) spacing for k >= 0 below cheap; the next member's phase is
+                    // (phase + count) - span.
+                    count = span > phase ? uint(ceil(span - phase)) : 0u;
+                    phase = frac(phase + float(count) - span);
+                }
+
+                if(count != 0u)
+                {
+                    RestirPtWalkEntry entry;
+                    entry.member = member;
+                    entry.count = count;
+                    entry.spacing = spacing;
+                    entry.cheap = cheap;
+                    entry.light = light;
+                    entry.lightType = candidateLight.type;
+                    entry.lightSample = lightSample;
+
+                    if(queued == 0u)
                     {
-                        const uint4 tail = records.Load4(RESTIR_PT_REGIR_COMPACT + light * 32u + 16u);
-                        cheap = asfloat(tail.x) / max(distanceSquared, 1.0e-4f) * max(dot(surface.normal, direction), 0.05f);
-                        const float inverseWidth = asfloat(tail.w);
+                        queueFront = entry;
+                    }
+                    else
+                    {
+                        queueBack = entry;
+                    }
 
-                        if(inverseWidth > 0.0f)
-                        {
-                            const float factor = saturate((dot(-direction, RestirPtOctDecode(tail.y)) - asfloat(tail.z)) *
-                                inverseWidth);
-                            cheap *= factor * factor;
-                        }
+                    ++queued;
+                }
+
+                ++member;
+            }
+
+            const bool listDone = member >= members;
+
+            if(WaveActiveAnyTrue(queued == 2u || (listDone && queued != 0u)) && queued != 0u)
+            {
+                const RestirPtWalkEntry entry = queueFront;
+                queueFront = queueBack;
+                --queued;
+
+                float3 candidateDiffuse;
+                const float3 value = RestirPtUnshadowedPrepared(surface, bsdfPrepared, entry.lightSample, candidateDiffuse);
+                const float target = PathTraceLuminance(value);
+
+                if(target > 0.0f && all(isfinite(value)))
+                {
+                    const float weight = float(entry.count) * target * entry.spacing / entry.cheap;
+                    weightSum += weight;
+
+                    if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * entry.member + 1u) * weightSum <=
+                        weight)
+                    {
+                        selectedTarget = target;
+                        selectedValue = value;
+                        selectedDiffuse = candidateDiffuse;
+                        selectedSample = entry.lightSample;
+                        selectedTable = entry.lightType == SCENE_LIGHT_POINT || entry.lightType == SCENE_LIGHT_SPOT;
+                        lightIndex = entry.light;
                     }
                 }
-            }
-            else
-            {
-                candidateLight = SceneLightLoad(sceneLightBufferIndex, light);
-                lightSample = PathTraceSampleTableLight(candidateLight, position);
-                cheap = lightSample.valid && PathTraceDirectionAboveSurface(surface, lightSample.direction) ?
-                    PathTraceLuminance(lightSample.radiance) * max(dot(surface.normal, lightSample.direction), 0.05f) : 0.0f;
-            }
-
-            if(!(cheap > 0.0f) || !isfinite(cheap))
-            {
-                continue;
-            }
-
-            cumulative += cheap;
-            const float spacing = cumulative * (float(members) / float(member + 1u)) / float(listCandidates);
-            const float span = cheap / spacing;
-            // Samples at (phase + k) spacing for k >= 0 below cheap; the next member's phase is (phase + count) - span.
-            const uint count = span > phase ? uint(ceil(span - phase)) : 0u;
-            phase = frac(phase + float(count) - span);
-
-            if(count == 0u)
-            {
-                continue;
-            }
-
-            if(compactRecords)
-            {
-                candidateLight = SceneLightLoad(sceneLightBufferIndex, light);
-                lightSample = PathTraceSampleTableLight(candidateLight, position);
-            }
-
-            float3 candidateDiffuse;
-            const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
-            const float target = PathTraceLuminance(value);
-
-            if(!(target > 0.0f) || !all(isfinite(value)))
-            {
-                continue;
-            }
-
-            const float weight = float(count) * target * spacing / cheap;
-            weightSum += weight;
-
-            if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * member + 1u) * weightSum <= weight)
-            {
-                selectedTarget = target;
-                selectedValue = value;
-                selectedDiffuse = candidateDiffuse;
-                selectedSample = lightSample;
-                selectedTable = candidateLight.type == SCENE_LIGHT_POINT || candidateLight.type == SCENE_LIGHT_SPOT;
-                lightIndex = light;
             }
         }
 
@@ -1547,161 +1822,6 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
             ByteAddressBuffer regirLights = ResourceDescriptorHeap[restirPtRegirLightsIndex];
             selectedSourcePdf = asfloat(regirLights.Load(RESTIR_PT_REGIR_TABLE_P1 + lightIndex * 4u));
             selectedTarget = selectedSourcePdf > 0.0f ? selectedTarget : 0.0f;
-        }
-    }
-    else if((listMode & 4u) != 0u && listVertex && (!listFallbackOnly || regirCell < 0) &&
-        restirPtLightSamplingIndex != 0xFFFFFFFFu && restirPtRegirLightsIndex != 0xFFFFFFFFu && listSampling.valid != 0u &&
-        listSampling.tableLightCount == sceneLightCount && (listMode & 8u) != 0u)
-    {
-        // Single pass: weighted reservoir sampling of one light in proportion to its cheap target t, then its full target.
-        standardCandidates = 0u;
-        const LightSamplingPools pools = LightSamplingPoolsAt(listSampling, position);
-        ByteAddressBuffer structures = LightSamplingBuffer(listSampling);
-        const uint nominal = pools.cell.nominalCount;
-        const uint members = nominal + pools.wideCount;
-        regirCell = pools.cellIndex >= 0 ? pools.cellIndex : 0;
-        float total = 0.0f;
-        float chosenCheap = 0.0f;
-        uint chosen = 0xFFFFFFFFu;
-        PathTraceLightSample chosenSample = (PathTraceLightSample)0;
-        uint chosenType = 0u;
-
-        for(uint member = 0u; member < members; ++member)
-        {
-            const uint light = member < nominal ?
-                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + member) * 4u) :
-                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (member - nominal) * 16u + 12u);
-            const GPULight memberLight = SceneLightLoad(sceneLightBufferIndex, light);
-            const PathTraceLightSample memberSample = PathTraceSampleTableLight(memberLight, position);
-            const float cheap = memberSample.valid && PathTraceDirectionAboveSurface(surface, memberSample.direction) ?
-                PathTraceLuminance(memberSample.radiance) * max(dot(surface.normal, memberSample.direction), 0.05f) : 0.0f;
-
-            if(!(cheap > 0.0f))
-            {
-                continue;
-            }
-
-            total += cheap;
-
-            if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * member + 1u) * total < cheap)
-            {
-                chosen = light;
-                chosenCheap = cheap;
-                chosenSample = memberSample;
-                chosenType = memberLight.type;
-            }
-        }
-
-        if(chosen != 0xFFFFFFFFu && total > 0.0f && isfinite(total))
-        {
-            float3 candidateDiffuse;
-            const float3 value = RestirPtUnshadowed(surface, chosenSample, candidateDiffuse);
-            const float target = PathTraceLuminance(value);
-
-            if(target > 0.0f && all(isfinite(value)))
-            {
-                // M = 1: the RIS weight is p_hat / q, q = t / T.
-                weightSum = target * total / chosenCheap;
-                selectedTarget = target;
-                selectedValue = value;
-                selectedDiffuse = candidateDiffuse;
-                selectedSample = chosenSample;
-                selectedTable = chosenType == SCENE_LIGHT_POINT || chosenType == SCENE_LIGHT_SPOT;
-                lightIndex = chosen;
-                ByteAddressBuffer regirLights = ResourceDescriptorHeap[restirPtRegirLightsIndex];
-                selectedSourcePdf = asfloat(regirLights.Load(RESTIR_PT_REGIR_TABLE_P1 + lightIndex * 4u));
-                selectedTarget = selectedSourcePdf > 0.0f ? selectedTarget : 0.0f;
-            }
-        }
-    }
-    else if((listMode & 4u) != 0u && listVertex && (!listFallbackOnly || regirCell < 0) &&
-        restirPtLightSamplingIndex != 0xFFFFFFFFu && restirPtRegirLightsIndex != 0xFFFFFFFFu && listSampling.valid != 0u &&
-        listSampling.tableLightCount == sceneLightCount)
-    {
-        standardCandidates = 0u;
-        const LightSamplingPools pools = LightSamplingPoolsAt(listSampling, position);
-        ByteAddressBuffer structures = LightSamplingBuffer(listSampling);
-        const uint nominal = pools.cell.nominalCount;
-        const uint members = nominal + pools.wideCount;
-        regirCell = pools.cellIndex >= 0 ? pools.cellIndex : 0;
-        float total = 0.0f;
-
-        for(uint member = 0u; member < members; ++member)
-        {
-            const uint light = member < nominal ?
-                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + member) * 4u) :
-                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (member - nominal) * 16u + 12u);
-            const PathTraceLightSample cheapSample = PathTraceSampleTableLight(SceneLightLoad(sceneLightBufferIndex, light),
-                position);
-            total += cheapSample.valid && PathTraceDirectionAboveSurface(surface, cheapSample.direction) ?
-                PathTraceLuminance(cheapSample.radiance) * max(dot(surface.normal, cheapSample.direction), 0.05f) : 0.0f;
-        }
-
-        if(total > 0.0f && isfinite(total))
-        {
-            const float xi = RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS);
-            const float step = total / float(candidates);
-            float cumulative = 0.0f;
-            uint emitted = 0u;
-
-            for(uint member = 0u; member < members && emitted < candidates; ++member)
-            {
-                const uint light = member < nominal ?
-                    structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + member) * 4u) :
-                    structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (member - nominal) * 16u + 12u);
-                const GPULight candidateLight = SceneLightLoad(sceneLightBufferIndex, light);
-                const PathTraceLightSample lightSample = PathTraceSampleTableLight(candidateLight, position);
-                const float cheap = lightSample.valid && PathTraceDirectionAboveSurface(surface, lightSample.direction) ?
-                    PathTraceLuminance(lightSample.radiance) * max(dot(surface.normal, lightSample.direction), 0.05f) : 0.0f;
-
-                if(!(cheap > 0.0f))
-                {
-                    continue;
-                }
-
-                cumulative += cheap;
-                uint count = 0u;
-
-                while(emitted < candidates && (float(emitted) + xi) * step < cumulative)
-                {
-                    ++count;
-                    ++emitted;
-                }
-
-                if(count == 0u)
-                {
-                    continue;
-                }
-
-                float3 candidateDiffuse;
-                const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
-                const float target = PathTraceLuminance(value);
-
-                if(!(target > 0.0f) || !all(isfinite(value)))
-                {
-                    continue;
-                }
-
-                const float weight = float(count) * target * total / (float(candidates) * cheap);
-                weightSum += weight;
-
-                if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * member + 1u) * weightSum <= weight)
-                {
-                    selectedTarget = target;
-                    selectedValue = value;
-                    selectedDiffuse = candidateDiffuse;
-                    selectedSample = lightSample;
-                    selectedTable = candidateLight.type == SCENE_LIGHT_POINT || candidateLight.type == SCENE_LIGHT_SPOT;
-                    lightIndex = light;
-                }
-            }
-
-            if(selectedTarget > 0.0f)
-            {
-                ByteAddressBuffer regirLights = ResourceDescriptorHeap[restirPtRegirLightsIndex];
-                selectedSourcePdf = asfloat(regirLights.Load(RESTIR_PT_REGIR_TABLE_P1 + lightIndex * 4u));
-                selectedTarget = selectedSourcePdf > 0.0f ? selectedTarget : 0.0f;
-            }
         }
     }
 #endif
@@ -1796,10 +1916,11 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
         const PathTraceLightSample lightSample = PathTraceSampleTableLight(candidateLight, position);
         float3 candidateDiffuse;
 #if defined(RESTIR_PT_UNFUSED_BSDF)
-        const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
+        const float3 value = RestirPtUnshadowedPrepared(surface, bsdfPrepared, lightSample, candidateDiffuse);
 #else
         float3 candidateBsdfCos;
-        const float3 value = RestirPtUnshadowedWithBsdf(surface, lightSample, candidateDiffuse, candidateBsdfCos);
+        const float3 value = RestirPtUnshadowedWithBsdfPrepared(surface, bsdfPrepared, lightSample, candidateDiffuse,
+            candidateBsdfCos);
 #endif
         const float target = PathTraceLuminance(value);
 
@@ -2646,6 +2767,216 @@ RestirPtReconnection RestirPtEscapeReconnection(RestirPtPrefixState prefix, uint
     return rc;
 }
 
+#if defined(RESTIR_PT_LIGHT_BOUNCE_ACTIVE)
+// Wall boiling: the light-traced bounce's pieces (see RestirPtBounceState).
+
+// An emission direction of a point (uniform sphere) or spot light (uniform in its outer cone), and its solid-angle density.
+float3 RestirPtBounceEmissionDirection(GPULight light, float2 random, out float pdf)
+{
+    const float phi = 2.0f * PI * random.y;
+
+    if(light.type == SCENE_LIGHT_SPOT)
+    {
+        const float cosOuter = clamp(light.cosOuterCone, -1.0f, 0.999999f);
+        const float cosTheta = lerp(1.0f, cosOuter, random.x);
+        const float sinTheta = sqrt(max(1.0f - cosTheta * cosTheta, 0.0f));
+        const float3 axis = normalize(light.direction);
+        const float signZ = axis.z >= 0.0f ? 1.0f : -1.0f;
+        const float a = -1.0f / (signZ + axis.z);
+        const float b = axis.x * axis.y * a;
+        const float3 tangent = float3(1.0f + signZ * axis.x * axis.x * a, signZ * b, -signZ * axis.x);
+        const float3 bitangent = float3(b, signZ + axis.y * axis.y * a, -axis.y);
+        pdf = 1.0f / (2.0f * PI * (1.0f - cosOuter));
+        return normalize(tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + axis * cosTheta);
+    }
+
+    const float z = 1.0f - 2.0f * random.x;
+    const float r = sqrt(max(1.0f - z * z, 0.0f));
+    pdf = 1.0f / (4.0f * PI);
+    return float3(r * cos(phi), r * sin(phi), z);
+}
+
+// s(x2): the fixed proxy for x2's light selection, min(1, M_2 / N_2) (x2's candidates over its list members).
+float RestirPtBounceSelectionProxy(LightSamplingConstants sampling, bool samplingValid, float3 position)
+{
+    if(!samplingValid)
+    {
+        return 1.0f;
+    }
+
+    const LightSamplingPools pools = LightSamplingPoolsAt(sampling, position);
+    const uint members = pools.cell.nominalCount + pools.wideCount;
+    return members == 0u ? 1.0f : min(1.0f, float(RestirPtCandidatesAtVertex(2u)) / float(members));
+}
+
+// Technique A's balance-heuristic weight for its NEE at x2 (position, geometricNormal) with the selected table light;
+// 1 where B does not apply (B off for this path, the delta lobe at x1, no finite light, or B cannot produce the path).
+float RestirPtBounceMisWeight(float3 position, float3 geometricNormal, uint lightIndex, LightSamplingConstants sampling,
+    bool samplingValid)
+{
+    if(!g_restirPtBounce.enabled || !(g_restirPtBounce.total > 0.0f) || !(g_restirPtBounce.lobePdf > 0.0f) ||
+        lightIndex >= sceneLightCount)
+    {
+        return 1.0f;
+    }
+
+    const GPULight light = SceneLightLoad(sceneLightBufferIndex, lightIndex);
+    const float bsdfDensity = RestirPtBounceBsdfDensity(g_restirPtBounce.lobePdf, position, geometricNormal,
+        RestirPtBounceSelectionProxy(sampling, samplingValid, position));
+    return RestirPtBounceShare(bsdfDensity, RestirPtBounceLightDensity(light, position, geometricNormal));
+}
+
+// The visibility of x1 -> x2, ignoring x2's own triangle (as RestirPtReconnectionVisible), up to 0.999 of the distance.
+bool RestirPtBounceVisible(float3 position, float3 geometricNormal, float3 vertexPosition, uint vertexInstance,
+    uint vertexPrimitive)
+{
+    const float3 origin = PathTraceOffsetRayOrigin(position, geometricNormal);
+    const float3 toVertex = vertexPosition - origin;
+    const float distance = length(toVertex);
+
+    if(!(distance > 0.0f))
+    {
+        return false;
+    }
+
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = toVertex / distance;
+    ray.TMin = 0.0f;
+    ray.TMax = distance * 0.999f;
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+    RESTIR_PT_TRACE_INLINE(query, RAY_FLAG_FORCE_NON_OPAQUE, ray);
+
+    while(query.Proceed())
+    {
+        if(query.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+        {
+            const bool ownTriangle = query.CandidateInstanceID() == vertexInstance &&
+                query.CandidatePrimitiveIndex() == vertexPrimitive;
+
+            if(!ownTriangle)
+            {
+                query.CommitNonOpaqueTriangleHit();
+            }
+        }
+    }
+
+    return query.CommittedStatus() == COMMITTED_NOTHING;
+}
+
+// Technique B's sample for the primary surface (surface, position): the balance-heuristic-weighted contribution of the
+// path x1 -> x2 -> L (and its diffuse part), 0 when B has no light or its connection fails.
+float3 RestirPtLightTracedBounce(PathTraceSurface surface, float3 position, uint seed, LightSamplingConstants sampling,
+    bool samplingValid, inout uint continuationRays, inout uint shadowRays, out float3 diffuse, out uint lightIndex)
+{
+    diffuse = float3(0.0f, 0.0f, 0.0f);
+    lightIndex = g_restirPtBounce.light;
+
+    if(!g_restirPtBounce.enabled || !(g_restirPtBounce.total > 0.0f) || lightIndex >= sceneLightCount)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    const GPULight light = SceneLightLoad(sceneLightBufferIndex, lightIndex);
+    float emissionPdf;
+    const float3 emission = RestirPtBounceEmissionDirection(light,
+        float2(RestirPtRandom(seed, 1u, RESTIR_PT_DIMENSION_LIGHT_BOUNCE + 1u),
+        RestirPtRandom(seed, 1u, RESTIR_PT_DIMENSION_LIGHT_BOUNCE + 2u)), emissionPdf);
+
+    RayDesc ray;
+    ray.Origin = light.position;
+    ray.Direction = emission;
+    ray.TMin = 0.0f;
+    ray.TMax = abs(light.range);
+
+    PathTracePayload payload;
+    payload.hitDistance = -1.0f;
+    payload.geometricNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.uv = float2(0.0f, 0.0f);
+    payload.materialIndex = 0u;
+    RestirPtHitIdentity identity;
+    RestirPtTraceInline(ray, payload, identity);
+    ++continuationRays;
+
+    if(payload.hitDistance < 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    const float3 vertexPosition = light.position + emission * payload.hitDistance;
+    const float3 offset = vertexPosition - position;
+    const float distanceSquared = dot(offset, offset);
+
+    if(!(distanceSquared > 1.0e-8f))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    const float3 toVertex = offset * rsqrt(distanceSquared);
+    PathTraceSurface vertex;
+
+    // x2 seen from x1 (its two-sided normals face x1), as technique A's bounce from x1 builds it.
+    if(!PathTraceDirectionAboveSurface(surface, toVertex) || !PathTraceBuildSurface(payload, toVertex, vertex))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    // x2's light term f_x2 cos E, exactly as A's NEE at x2 evaluates it for this light (0 when x1 and the light are on
+    // different sides of x2).
+    float3 vertexDiffuse;
+    const float3 lit = RestirPtUnshadowed(vertex, PathTraceSampleTableLight(light, vertexPosition), vertexDiffuse);
+
+    if(!(PathTraceLuminance(lit) > 0.0f) || !all(isfinite(lit)))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    const float lightDensity = RestirPtBounceLightDensity(light, vertexPosition, vertex.geometricNormal);
+
+    if(!(lightDensity > 0.0f))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    float3 cosineDiffuse;
+    float3 glossyDiffuse;
+    const float3 cosineValue = RestirPtEvaluateLobe(surface, RESTIR_PT_LOBE_COSINE, toVertex, cosineDiffuse);
+    const float3 glossyValue = RestirPtEvaluateLobe(surface, RESTIR_PT_LOBE_GGX, toVertex, glossyDiffuse);
+    // Test only (ENGINE_RESTIR_PT_LIGHT_BOUNCE_TEST=bonly): technique A's densities left out (B alone, no MIS).
+    const bool lightOnly = (restirPtRegirPadding.x & RESTIR_PT_LIGHT_BOUNCE_TEST_B_ONLY) != 0u;
+    const float selection = RestirPtBounceSelectionProxy(sampling, samplingValid, vertexPosition);
+    const float cosineDensity = lightOnly ? 0.0f : RestirPtBounceBsdfDensity(
+        RestirPtLobeProbability(surface, RESTIR_PT_LOBE_COSINE) * RestirPtLobePdf(surface, RESTIR_PT_LOBE_COSINE, toVertex),
+        vertexPosition, vertex.geometricNormal, selection);
+    const float glossyDensity = lightOnly ? 0.0f : RestirPtBounceBsdfDensity(
+        RestirPtLobeProbability(surface, RESTIR_PT_LOBE_GGX) * RestirPtLobePdf(surface, RESTIR_PT_LOBE_GGX, toVertex),
+        vertexPosition, vertex.geometricNormal, selection);
+
+    ++shadowRays;
+
+    if(!RestirPtBounceVisible(position, surface.geometricNormal, vertexPosition, identity.instance, identity.primitive))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    // f_lambda cos_x1 |cos_x2,1| / d^2 V f_x2 cos E, over the lobe's combined density.
+    const float3 geometry = lit * (dot(surface.normal, toVertex) * abs(dot(vertex.geometricNormal, toVertex)) /
+        distanceSquared);
+    const float3 contribution = cosineValue * geometry / (cosineDensity + lightDensity) +
+        glossyValue * geometry / (glossyDensity + lightDensity);
+    diffuse = cosineDiffuse * geometry / (cosineDensity + lightDensity);
+
+    if(!all(isfinite(contribution)) || !all(isfinite(diffuse)))
+    {
+        diffuse = float3(0.0f, 0.0f, 0.0f);
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    return contribution;
+}
+#endif
+
 RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTraceRasterFirstVertex firstVertex, uint seed)
 {
     RestirPtTreeResult result;
@@ -2677,6 +3008,14 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
     const LightSamplingConstants sampling = LightSamplingLoadConstants(restirPtLightSamplingIndex);
     const bool samplingValid = restirPtLightSamplingIndex != 0xFFFFFFFFu && sampling.valid != 0u &&
         sampling.tableLightCount == sceneLightCount;
+
+#if defined(RESTIR_PT_LIGHT_BOUNCE_ACTIVE)
+    // Wall boiling: light-traced bounce samples only where bounce light is the fresh sum (the direct-light reservoir, set
+    // on extraction frames only) and paths reach x2's NEE.
+    RestirPtBounceBegin(seed, firstVertex.position, firstVertex.surface.geometricNormal,
+        (restirPtFlags & RESTIR_PT_FLAG_DIRECT_RESERVOIR) != 0u && (restirPtFlags & RESTIR_PT_FLAG_RESERVOIR) != 0u &&
+        maxPathDepth >= 2u);
+#endif
 
     PathTraceSurface surface = firstVertex.surface;
     // M5.4 C4: this path tree's Eq. 5 threshold (its own camera and primary hit).
@@ -2715,12 +3054,23 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
             // Finite table lights: RIS over the light tile.
             float sourceWeight;
             float3 contribution = RestirPtTableLightNee(surface, position, seed, vertex,
-                RestirPtTileBase(pixel, sampleIndex, vertex), result.shadowRays, diffuse, lightIndex, parts, sourceWeight);
+                RestirPtNeeSamplingVertex(vertex, prefix.lobes), RestirPtTileBase(pixel, sampleIndex, vertex),
+                result.shadowRays, diffuse, lightIndex, parts, sourceWeight);
 
             if(primary && (restirPtFlags & RESTIR_PT_FLAG_INJECT_CANDIDATE_NAN) != 0u && RestirPtInjectedPixel(pixel))
             {
                 contribution = asfloat(0x7FC00000u).xxx;
             }
+
+#if defined(RESTIR_PT_LIGHT_BOUNCE_ACTIVE)
+            // Wall boiling: technique A's share of the path x1 -> x2 -> light against the light-traced bounce. (Carrying the
+            // share inside x2's RIS target instead measured no gain: raw noise -0.2%.)
+            if(vertex == 2u)
+            {
+                contribution *= RestirPtBounceMisWeight(position, surface.geometricNormal, lightIndex, sampling,
+                    samplingValid);
+            }
+#endif
 
             RestirPtCandidate tableCandidate = RestirPtWithReconnection(RestirPtMakeCandidate(throughput * contribution,
                 primary ? diffuse : throughput * contribution * diffuseShare, survival, vertex + 1u, RESTIR_PT_END_TABLE,
@@ -2730,6 +3080,24 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
             RestirPtStreamCandidate(result.stream, tableCandidate,
                 RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_STREAM));
             vertexNee += throughput * contribution * sourceWeight;
+
+#if defined(RESTIR_PT_LIGHT_BOUNCE_ACTIVE)
+            // Wall boiling: technique B's sample of x1 -> x2 -> light (the light was selected by the x1 walk above). A
+            // bounce candidate (k = 3), so it joins the fresh bounce sum; it has no reconnection data (never reused).
+            if(primary)
+            {
+                float3 bounceDiffuse;
+                uint bounceLight;
+                const float3 bounce = RestirPtLightTracedBounce(surface, position, seed, sampling, samplingValid,
+                    result.continuationRays, result.shadowRays, bounceDiffuse, bounceLight);
+
+                if(any(bounce > 0.0f))
+                {
+                    RestirPtStreamCandidate(result.stream, RestirPtMakeCandidate(bounce, bounceDiffuse, 1.0f, 3u,
+                        RESTIR_PT_END_TABLE, bounceLight), 0.0f);
+                }
+            }
+#endif
 
             // Directional table lights: enumerated, each its own delta sample and domain.
             const uint directionalCount = samplingValid ? min(sampling.directionalCount, 8u) : 0u;
@@ -2810,6 +3178,13 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
         {
             diffuseShare = RestirPtDiffuseShare(lobeSample);
             result.primarySpecular = lobeSample.lobe != RESTIR_PT_LOBE_COSINE;
+
+#if defined(RESTIR_PT_LIGHT_BOUNCE_ACTIVE)
+            // Wall boiling: technique A's lobe density at x1 for x2's MIS weight (0 for the delta lobe).
+            g_restirPtBounce.lobePdf = lobeSample.lobe == RESTIR_PT_LOBE_DELTA ? 0.0f :
+                RestirPtLobeProbability(surface, lobeSample.lobe) *
+                RestirPtLobePdf(surface, lobeSample.lobe, lobeSample.direction);
+#endif
         }
 
         // M5.1-4: the sampled lobes at x1 and x2 (pathFlags bits 20-23), and x_k's continuation once x_k is this vertex.
@@ -3148,11 +3523,35 @@ bool RestirPtTemporalCompatible(PathTraceRasterFirstVertex firstVertex, RestirPt
         abs(previous.linearDepth - expectedPreviousDepth) < 0.1f * abs(expectedPreviousDepth);
 }
 
+// History through lighting changes: whether a surface lies inside one of this frame's local lighting discontinuities (a
+// light switched or jumped since the committed frame), where history would hold the old light for tens of frames.
+bool RestirPtInDiscontinuityRegion(float3 position)
+{
+    for(uint region = 0u; region < min(restirPtDiscontinuityCount, RESTIR_PT_MAX_DISCONTINUITY_REGIONS); ++region)
+    {
+        const float4 sphere = restirPtDiscontinuityRegions[region];
+        const float3 offset = position - sphere.xyz;
+
+        if(dot(offset, offset) <= sphere.w * sphere.w)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 RestirPtTemporalNeighbor RestirPtFindTemporalNeighbor(uint2 pixel, PathTraceRasterFirstVertex firstVertex, uint seed)
 {
     RestirPtTemporalNeighbor neighbor = (RestirPtTemporalNeighbor)0;
 
     if(restirPtHistoryValid == 0u || firstVertex.state <= 0)
+    {
+        return neighbor;
+    }
+
+    // A local lighting discontinuity: this surface starts again from its fresh sample (stage 0, as without history).
+    if(RestirPtInDiscontinuityRegion(firstVertex.position))
     {
         return neighbor;
     }
@@ -5555,6 +5954,10 @@ void RestirPtInitialCS(uint3 thread : SV_DispatchThreadID)
     const bool active = all(pixel < resolution);
     const bool extract = (restirPtFlags & RESTIR_PT_FLAG_EXTRACT) != 0u;
     const bool reservoirMode = (restirPtFlags & RESTIR_PT_FLAG_RESERVOIR) != 0u;
+    // Direct-reservoir mode: a later pass (temporal or resample) forms the image from the reused direct reservoir and adds
+    // the bounce sum this kernel leaves in the extraction textures.
+    const bool directReservoir = reservoirMode && extract && (restirPtFlags & RESTIR_PT_FLAG_DIRECT_RESERVOIR) != 0u;
+    const bool laterPassFormsImage = (restirPtFlags & (RESTIR_PT_FLAG_SPATIAL | RESTIR_PT_FLAG_TEMPORAL_PASS)) != 0u;
     uint continuationRays = 0u;
     uint shadowRays = 0u;
     uint candidates = 0u;
@@ -5589,6 +5992,11 @@ void RestirPtInitialCS(uint3 thread : SV_DispatchThreadID)
         const PathTraceRasterFirstVertex firstVertex = PathTraceDecodeRasterFirstVertex(pixel);
         float3 sampleSum = float3(0.0f, 0.0f, 0.0f);
         float3 diffuseSum = float3(0.0f, 0.0f, 0.0f);
+        // Direct-reservoir mode: the bounce part of sampleSum / diffuseSum (finite samples only), and the fresh (not reused)
+        // direct estimate, which the resample pass's firefly replacement shows in place of a reused firefly.
+        float3 bounceSampleSum = float3(0.0f, 0.0f, 0.0f);
+        float3 bounceDiffuseSampleSum = float3(0.0f, 0.0f, 0.0f);
+        float3 freshDirectSum = float3(0.0f, 0.0f, 0.0f);
         float hitDistanceMinimum = PATH_TRACE_HALF_MAXIMUM;
         uint hitSamples = 0u;
         uint missSamples = 0u;
@@ -5689,6 +6097,12 @@ void RestirPtInitialCS(uint3 thread : SV_DispatchThreadID)
 
                 radiance = tree.stream.selected.contribution * unbiasedContributionWeight;
                 diffuse = tree.stream.selected.diffuse * unbiasedContributionWeight;
+
+                if(directReservoir && all(isfinite(radiance)))
+                {
+                    freshDirectSum += max(radiance, 0.0f);
+                }
+
                 // M5.2: sample 0 publishes the pixel's reservoir; with temporal reuse it first resamples with history.
                 // M5.4 C1: with RESTIR_PT_FLAG_TEMPORAL_PASS the temporal pass resamples instead (this kernel stores the
                 // canonical).
@@ -5746,6 +6160,20 @@ void RestirPtInitialCS(uint3 thread : SV_DispatchThreadID)
 #endif
                 }
 #endif
+
+                // Direct-reservoir mode: the reservoir (and any in-kernel temporal result) is direct light; this frame's
+                // bounce sum completes the pixel's estimate.
+                if(directReservoir)
+                {
+                    radiance += tree.stream.bounceSum;
+                    diffuse += tree.stream.bounceDiffuseSum;
+
+                    if(all(isfinite(tree.stream.bounceSum)) && all(isfinite(tree.stream.bounceDiffuseSum)))
+                    {
+                        bounceSampleSum += tree.stream.bounceSum;
+                        bounceDiffuseSampleSum += min(max(tree.stream.bounceDiffuseSum, 0.0f), tree.stream.bounceSum);
+                    }
+                }
 
                 // F3: the stored reservoir is unchanged (above and below); only the output takes the tree's sum.
                 if((restirPtFlags & RESTIR_PT_FLAG_OUTPUT_SUM) != 0u)
@@ -5935,6 +6363,13 @@ void RestirPtInitialCS(uint3 thread : SV_DispatchThreadID)
             outputTexture[pixel] = float4(RestirPtDebugColor(selectedLength), 1.0f);
         }
 
+        // Direct-reservoir mode with a later image pass: the output texture (which that pass overwrites) carries this
+        // frame's fresh direct estimate to the resample pass's firefly replacement. Debug views 1 and 2 keep their output.
+        if(directReservoir && laterPassFormsImage && restirPtDebugView != 1u && restirPtDebugView != 2u)
+        {
+            outputTexture[pixel] = float4(min(freshDirectSum / float(samplesPerFrame), PATH_TRACE_HALF_MAXIMUM), 1.0f);
+        }
+
         if(extract)
         {
             float3 diffuseMean = float3(0.0f, 0.0f, 0.0f);
@@ -5948,6 +6383,14 @@ void RestirPtInitialCS(uint3 thread : SV_DispatchThreadID)
                 const float frameSamples = float(samplesPerFrame);
                 diffuseMean = diffuseSum / frameSamples;
                 specularMean = (sampleSum - diffuseSum) / frameSamples;
+
+                // Direct-reservoir mode with a later image pass: hand it this frame's bounce sum (that pass adds it to the
+                // reused direct light and writes the final split).
+                if(directReservoir && laterPassFormsImage)
+                {
+                    diffuseMean = bounceDiffuseSampleSum / frameSamples;
+                    specularMean = (bounceSampleSum - bounceDiffuseSampleSum) / frameSamples;
+                }
 
                 if(hitSamples > 0u)
                 {
@@ -6315,6 +6758,21 @@ void RestirPtTemporalCS(uint3 thread : SV_DispatchThreadID)
                 radiance = float3(0.0f, 0.0f, 0.0f);
             }
 
+            // Direct-reservoir mode: the reservoir is direct light; the initial kernel left this frame's bounce sum in the
+            // extraction textures. The swap below is off in this mode (restirPtDecorrelation 0).
+            const bool directReservoir = extract && firstVertex.state > 0 &&
+                (restirPtFlags & RESTIR_PT_FLAG_DIRECT_RESERVOIR) != 0u;
+            float3 directRadiance = radiance;
+            float3 bounceDiffuse = float3(0.0f, 0.0f, 0.0f);
+
+            if(directReservoir)
+            {
+                RWTexture2D<float4> bounceDiffuseTexture = ResourceDescriptorHeap[diffuseOutputIndex];
+                RWTexture2D<float4> bounceSpecularTexture = ResourceDescriptorHeap[specularOutputIndex];
+                bounceDiffuse = bounceDiffuseTexture[pixel].rgb;
+                radiance += bounceDiffuse + bounceSpecularTexture[pixel].rgb;
+            }
+
             // M5.5-B decorrelation: show the initial kernel's estimate (the extraction textures, left as they are); the
             // stored reservoir is unchanged.
             // B1a stagnancy runs in the resample pass (spatial reuse); temporal-only keeps the Uniform probability.
@@ -6348,7 +6806,22 @@ void RestirPtTemporalCS(uint3 thread : SV_DispatchThreadID)
             // Denoiser signals only, where resampling ran (elsewhere the initial kernel's split is this pixel's): the
             // selected path's x1 lobe (lambda_1) when the temporal sample won, else the canonical's diffuse share, which
             // the initial kernel wrote at its own W (rescaled to the resampled W).
-            if(extract && resampled && !decorrelated)
+            if(directReservoir)
+            {
+                // Direct-reservoir mode, every surface pixel (the textures hold only the bounce sum until now): the direct
+                // part split by the selected sample's x1 lobe (the resample pass's convention), plus the bounce split.
+                RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[diffuseOutputIndex];
+                RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[specularOutputIndex];
+                const bool directDiffuseLobe = resampled ? selectedDiffuseLobe :
+                    ((canonical.pathFlags >> RESTIR_PT_PATH_LOBES_SHIFT) & 3u) == RESTIR_PT_LOBE_COSINE;
+                float3 diffuse = (directDiffuseLobe ? directRadiance : float3(0.0f, 0.0f, 0.0f)) + bounceDiffuse;
+                diffuse = all(isfinite(diffuse)) ? min(max(diffuse, 0.0f), radiance) : float3(0.0f, 0.0f, 0.0f);
+                diffuseOutput[pixel] = float4(clamp(diffuse, -PATH_TRACE_HALF_MAXIMUM, PATH_TRACE_HALF_MAXIMUM),
+                    diffuseOutput[pixel].w);
+                specularOutput[pixel] = float4(clamp(radiance - diffuse, -PATH_TRACE_HALF_MAXIMUM, PATH_TRACE_HALF_MAXIMUM),
+                    specularOutput[pixel].w);
+            }
+            else if(extract && resampled && !decorrelated)
             {
                 RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[diffuseOutputIndex];
                 RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[specularOutputIndex];
@@ -6780,12 +7253,24 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID, uint3 groupTh
         // B1b: a firefly is decorrelated with probability 1.
         const float decorrelationProbability = RestirPtDecorrelationProbability(pixel, finalState > 0 ? finalPathFlags : 0u);
 
+        const bool directReservoir = (restirPtFlags & RESTIR_PT_FLAG_DIRECT_RESERVOIR) != 0u;
+
         if(extract && finalState > 0 && (firefly || RestirPtDecorrelate(pixel, decorrelationProbability)))
         {
             RWTexture2D<float4> initialDiffuse = ResourceDescriptorHeap[diffuseOutputIndex];
             RWTexture2D<float4> initialSpecular = ResourceDescriptorHeap[specularOutputIndex];
             float3 initialDiffuseValue = initialDiffuse[pixel].rgb;
             float3 initialRadiance = initialDiffuseValue + initialSpecular[pixel].rgb;
+
+            // Direct-reservoir mode (fireflies only; the decorrelation probability is 0): the replacement is this frame's
+            // fresh direct estimate, which the initial kernel left in the output texture (the extraction textures hold the
+            // bounce sum, added below). Its diffuse split follows the replaced reused value's, channel by channel.
+            if(directReservoir)
+            {
+                initialRadiance = max(outputTexture[pixel].rgb, 0.0f);
+                initialDiffuseValue = initialRadiance * select(radiance > 0.0f, saturate(diffuse / max(radiance, 1.0e-30f)),
+                    0.0f);
+            }
 
             // RTXDI's bias reduction (fireflyReplacementBiasReduction, bound 15): for a new firefly (age 0) the replacement
             // may not exceed 15 x the replaced value, so one firefly is not traded for a brighter one.
@@ -6801,6 +7286,17 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID, uint3 groupTh
 
             diffuse = initialDiffuseValue;
             radiance = initialRadiance;
+        }
+
+        // Direct-reservoir mode: the final reservoir (or its firefly replacement) is direct light; add this frame's bounce
+        // sum, which the initial kernel left in the extraction textures (the decorrelation swap is off in this mode).
+        if(extract && finalState > 0 && directReservoir)
+        {
+            RWTexture2D<float4> bounceDiffuseTexture = ResourceDescriptorHeap[diffuseOutputIndex];
+            RWTexture2D<float4> bounceSpecularTexture = ResourceDescriptorHeap[specularOutputIndex];
+            const float3 bounceDiffuse = bounceDiffuseTexture[pixel].rgb;
+            radiance += bounceDiffuse + bounceSpecularTexture[pixel].rgb;
+            diffuse += bounceDiffuse;
         }
 
         // The image (spatial reuse requires one sample per frame; the initial kernel skipped these writes).

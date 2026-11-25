@@ -109,6 +109,7 @@ FetchContent_MakeAvailable(nlohmann_json)
 include(cmake/AgilitySDK.cmake)
 include(cmake/DXC.cmake)
 include(cmake/DLSS.cmake)
+include(cmake/NVAPI.cmake)
 include(cmake/FMOD.cmake)
 include(cmake/SteamAudio.cmake)
 
@@ -330,6 +331,8 @@ add_library(EngineCore OBJECT
     src/Renderer/RenderingConfiguration.cpp
     src/Renderer/RenderingConfigurationApply.cpp
     src/Renderer/Upscaling/DlssBackend.cpp
+    src/Renderer/Latency/ReflexLatency.cpp
+    src/Renderer/Presentation/FramePresenter.cpp
     src/Renderer/Displacement/DisplacementUpdateState.cpp
     src/Renderer/Displacement/DisplacementUpdateCoordinator.cpp
     src/Renderer/Displacement/DisplacementCommandRecorder.cpp
@@ -391,14 +394,18 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/GGXAverageAlbedoPass.cpp
     src/Renderer/Passes/GGXMultiscatterIrradiancePass.cpp
     src/Renderer/RayTracing/BottomLevelAccelerationStructure.cpp
+    src/Renderer/RayTracing/BLASMemoryPool.cpp
     src/Renderer/RayTracing/TopLevelAccelerationStructure.cpp
     src/Renderer/RayTracing/RayTracingPipeline.cpp
     src/Renderer/RayTracing/ShaderTable.cpp
     src/Renderer/RayTracing/RayTracingSceneResources.cpp
     src/Renderer/RayTracing/RayTracingMembershipCandidate.cpp
     src/Renderer/RendererMembershipCandidate.cpp
+    src/Renderer/TextureMemoryAllocator.cpp
     src/Renderer/RendererEnvironmentPreparation.cpp
     src/Renderer/RendererGeometryUploads.cpp
+    src/Renderer/RendererLatency.cpp
+    src/Renderer/RendererPresentation.cpp
     src/Renderer/Passes/RayTracedShadowPass.cpp
     src/Renderer/Passes/PathTraceReferencePass.cpp
     src/Renderer/Passes/PathTraceSpatialPass.cpp
@@ -1054,6 +1061,8 @@ engine_deploy_dlss(Engine)
 engine_deploy_dlss(EngineRuntime)
 # RR.1A: DLSS Ray Reconstruction's runtime beside the Editor only (never EngineRuntime, Build Game's source).
 engine_deploy_dlss_rr(Engine)
+# FG.1: DLSS Frame Generation's runtime beside the Editor only, until packaged games get Frame Generation.
+engine_deploy_dlss_fg(Engine)
 # Both executables start audio. The Editor uses FMOD's logging DLLs in Debug; EngineRuntime, whose directory Build Game
 # deploys games from, always uses the production DLLs (cmake/FMOD.cmake, ENGINE_FMOD_LOGGING).
 set_target_properties(Engine PROPERTIES ENGINE_FMOD_LOGGING ON)
@@ -1067,6 +1076,7 @@ engine_deploy_steamaudio(EngineRuntime)
 # Agility SDK D3D12 headers take precedence over the Windows SDK copies.
 target_include_directories(EngineCore BEFORE PUBLIC "${ENGINE_AGILITY_SDK_INCLUDE_DIR}")
 engine_configure_dlss(EngineCore)
+engine_configure_nvapi(EngineCore)
 target_compile_definitions(EngineCore PRIVATE ENGINE_AGILITY_SDK_VERSION=${ENGINE_AGILITY_SDK_VERSION}
     ENGINE_AGILITY_SDK_PACKAGE_VERSION="${ENGINE_AGILITY_SDK_PACKAGE_VERSION}")
 

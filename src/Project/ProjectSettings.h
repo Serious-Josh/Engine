@@ -185,6 +185,32 @@ struct VolumetricRenderingSettings
     bool operator==(const VolumetricRenderingSettings&) const = default;
 };
 
+// NVIDIA Reflex Low Latency, NVIDIA's three user-facing modes. Off (the default) is Engine's behaviour before Reflex.
+enum class ProjectReflexMode
+{
+    Off,
+    On,
+    OnBoost
+};
+
+// Mode-independent. DLSS Frame Generation runs Reflex at On whatever is saved here (ResolveReflexMode); the saved choice
+// applies again when Frame Generation is off.
+struct LatencyRenderingSettings
+{
+    ProjectReflexMode reflex = ProjectReflexMode::Off;
+
+    bool operator==(const LatencyRenderingSettings&) const = default;
+};
+
+// FG.3: DLSS Frame Generation (2x), mode-independent. Editor viewport only for now: built games keep the setting and ignore
+// it until packaged Frame Generation exists. Serialized as rendering.frameGeneration.enabled; an older file keeps it off.
+struct FrameGenerationRenderingSettings
+{
+    bool enabled = false;
+
+    bool operator==(const FrameGenerationRenderingSettings&) const = default;
+};
+
 struct RenderingSettings
 {
     ProjectLightingMode lightingMode = ProjectLightingMode::Legacy;
@@ -194,6 +220,9 @@ struct RenderingSettings
     PathTracingRenderingSettings pathTracing;
     // R1.3: mode-independent.
     VolumetricRenderingSettings volumetrics;
+    // Serialized as rendering.latency; an older file keeps Off.
+    LatencyRenderingSettings latency;
+    FrameGenerationRenderingSettings frameGeneration;
 
     bool operator==(const RenderingSettings&) const = default;
 };
@@ -243,6 +272,7 @@ std::string_view ToSerializedName(ProjectPathTraceDenoiserView value);
 std::string_view ToSerializedName(ProjectPathTraceDenoiserSignal value);
 std::string_view ToSerializedName(ProjectVolumetricQuality value);
 std::string_view ToSerializedName(ProjectVolumetricResolutionBasis value);
+std::string_view ToSerializedName(ProjectReflexMode value);
 
 // ProjectSettings.json as loaded: the effective settings, why they look the way they do, and the
 // retained document whose unknown members a later save writes back.

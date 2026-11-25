@@ -46,6 +46,10 @@ namespace EditorPhaseTiming
         Tail,
         TailViewportTools,
         TailGizmo,
+        // Added after the original phases so their indices stay stable.
+        TailViewportIconList,
+        TailViewportIconDrawing,
+        AssetBrowserTextureThumbnails,
         Count
     };
 
@@ -58,7 +62,8 @@ namespace EditorPhaseTiming
         "object metadata lookup", "mesh/material labels", "material slot labels", "inspector", "transform controls",
         "component controls", "physics controls", "trigger collider controls", "character controller controls",
         "camera controls", "light controls", "add component controls", "material revisions", "modals/viewport",
-        "scene inspector window", "tail (camera/undo/tools)", "viewport tools", "transform gizmo"};
+        "scene inspector window", "tail (camera/undo/tools)", "viewport tools", "transform gizmo", "viewport icon list",
+        "viewport icon drawing", "texture thumbnail lookups"};
 
     // The enclosing phase of each phase; Count marks Draw itself and Draw's direct (top-level) phases use Draw.
     inline constexpr std::array<Phase, PhaseCount> Parent = {Phase::Count, Phase::Draw, Phase::Draw, Phase::Draw,
@@ -67,7 +72,8 @@ namespace EditorPhaseTiming
         Phase::InspectionObjectView, Phase::Draw, Phase::Inspector, Phase::Inspector, Phase::InspectorComponents,
         Phase::InspectorComponents, Phase::InspectorComponents, Phase::InspectorComponents,
         Phase::InspectorComponents, Phase::InspectorComponents, Phase::Draw, Phase::Draw, Phase::Draw, Phase::Draw,
-        Phase::Tail, Phase::TailViewportTools};
+        Phase::Tail, Phase::TailViewportTools, Phase::TailViewportTools, Phase::TailViewportTools,
+        Phase::AssetBrowserContents};
 
     struct Frame
     {

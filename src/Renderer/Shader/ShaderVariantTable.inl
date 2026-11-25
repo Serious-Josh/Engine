@@ -640,6 +640,11 @@
 {"ReSTIRPT/RestirPtInitialReGIR.hlsl", "PathTraceReference.hlsl",
     "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
     "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+// Wall boiling (experimental, ReSTIRPTSettings::lightTracedBounce): the ReGIR kernel with light-traced bounce connections
+// compiled in (RESTIR_PT_LIGHT_BOUNCE); the rows above carry none of its code.
+{"ReSTIRPT/RestirPtInitialReGIRLightBounce.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1 RESTIR_PT_LIGHT_BOUNCE=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
 // M5.2 C0: test-only variants of the same kernel, isolated so production B never compiles their state (it lowered
 // occupancy): the T-2.1 self-shift and its diagnostics (RESTIR_PT_DIAGNOSTICS), and the reconnection visibility bench
 // (RESTIR_PT_VISIBILITY_BENCH). ReSTIRPTPass selects one only when its diagnostic setting is on.

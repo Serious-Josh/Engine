@@ -428,7 +428,7 @@ bool MeshResidencyPublication::Prepare(Renderer& renderer, const FileSceneRuntim
         } // Release source pins before command recording/submission.
 
         auto candidate = renderer.PrepareDXRMembershipCandidate(runtime, catalog, proposals,
-            renderer.m_swapChain.GetCurrentBackBufferIndex(), error);
+            renderer.GetFrameSlot(), error);
 
         if (!candidate)
         {
@@ -479,7 +479,7 @@ MeshResidencyPublication::AcceptanceResult MeshResidencyPublication::PublishAtBo
     std::optional<MeshResidencySourcePins> sourcePins;
     RayTracingSceneResources::AdoptionEvidence evidence;
     auto readiness = CheckPrepared(renderer, runtime, catalog, m_sceneToken, *m_candidate,
-        renderer.m_swapChain.GetCurrentBackBufferIndex(), &sourcePins, &evidence);
+        renderer.GetFrameSlot(), &sourcePins, &evidence);
     AcceptanceResult result{readiness.status, std::move(readiness.message)};
     result.failedObjectID = std::move(readiness.failedObjectID);
 

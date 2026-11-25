@@ -1,4 +1,5 @@
 #include "BottomLevelAccelerationStructure.h"
+#include "BLASMemoryPool.h"
 #include "Debug/MemoryRegistry.h"
 #include "Debug/StreamingTelemetry.h"
 #include "BLASGeometryDescription.h"
@@ -199,7 +200,8 @@ bool BottomLevelAccelerationStructure::InitializeBuild(
         return false;
     }
 
-    // Requested sizes; each is a separate committed allocation (64 KiB granularity).
+    // Requested sizes: a committed scratch buffer (64 KiB granularity) and a result, which is a 256-byte-aligned range
+    // of a BLAS memory pool block, or a committed buffer of its own without a pool.
     StreamingTelemetry::Add(StreamingTelemetry::Metric::BlasAllocations, 2);
     StreamingTelemetry::Add(StreamingTelemetry::Metric::BlasResultBytes, prebuildInfo.ResultDataMaxSizeInBytes);
     StreamingTelemetry::Add(StreamingTelemetry::Metric::BlasScratchBytes, prebuildInfo.ScratchDataSizeInBytes);
@@ -235,32 +237,30 @@ bool BottomLevelAccelerationStructure::InitializeBuild(
 
     MemoryRegistry::TrackResource(m_scratchResource, MemoryCategory::AccelerationStructures);
 
-    resourceDescription.Width = prebuildInfo.ResultDataMaxSizeInBytes;
+    std::string allocationError;
+    m_result = BLASMemoryPool::Allocate(description.memoryPool, device, prebuildInfo.ResultDataMaxSizeInBytes,
+                                        allocationError);
 
-    result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
-                                             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
-                                             IID_PPV_ARGS(&m_resource));
-
-    if (FAILED(result))
+    if (!m_result)
     {
-        Log::Error("Failed to allocate BLAS result resource. HRESULT: " + std::to_string(result));
+        Log::Error(allocationError);
         Shutdown();
         return false;
     }
-
-    MemoryRegistry::TrackResource(m_resource, MemoryCategory::AccelerationStructures);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDescription{};
     buildDescription.Inputs = buildInputs;
     buildDescription.ScratchAccelerationStructureData = m_scratchResource->GetGPUVirtualAddress();
 
-    buildDescription.DestAccelerationStructureData = m_resource->GetGPUVirtualAddress();
+    buildDescription.DestAccelerationStructureData = m_result->GetGPUAddress();
 
     commandList->BuildRaytracingAccelerationStructure(&buildDescription, 0, nullptr);
 
+    // The barrier names the container buffer, so it also orders this build before builds or traversals of other BLASes
+    // in the same pool block, which is what NVIDIA's guidance asks for.
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    barrier.UAV.pResource = m_resource;
+    barrier.UAV.pResource = m_result->GetResource();
 
     commandList->ResourceBarrier(1, &barrier);
 
@@ -272,7 +272,7 @@ bool BottomLevelAccelerationStructure::Rebuild(
     ID3D12GraphicsCommandList4* commandList,
     const RayTracingBottomLevelDescription& description)
 {
-    if (!device || !commandList || !m_resource || m_retirementLifetime == 0)
+    if (!device || !commandList || !m_result || m_retirementLifetime == 0)
     {
         return false;
     }
@@ -295,15 +295,14 @@ bool BottomLevelAccelerationStructure::Rebuild(
         return false;
     }
 
-    std::swap(m_resource, replacement.m_resource);
+    std::swap(m_result, replacement.m_result);
     std::swap(m_scratchResource, replacement.m_scratchResource);
 
     // Retain the previous BLAS resources until the renderer
     // establishes that the GPU has finished using them.
 
-    m_retiredBatches.push_back({{m_retirementLifetime, batchID}, replacement.m_resource,
+    m_retiredBatches.push_back({{m_retirementLifetime, batchID}, std::move(replacement.m_result),
         replacement.m_scratchResource});
-    replacement.m_resource = nullptr;
     replacement.m_scratchResource = nullptr;
 
     replacement.Shutdown();
@@ -315,13 +314,9 @@ void BottomLevelAccelerationStructure::ReleaseRetiredResources()
 {
     StreamingTelemetry::Add(StreamingTelemetry::Metric::BlasRetirementReleases, m_retiredBatches.size());
 
+    // Clearing the batches drops their result references.
     for (const RetiredBatch& batch : m_retiredBatches)
     {
-        if (batch.result)
-        {
-            batch.result->Release();
-        }
-
         if (batch.scratch)
         {
             batch.scratch->Release();
@@ -358,11 +353,6 @@ bool BottomLevelAccelerationStructure::ReleaseRetirementBatch(
     // Validation proves exactly one batch; never select an arbitrary batch.
     const RetiredBatch& batch = m_retiredBatches.front();
 
-    if (batch.result)
-    {
-        batch.result->Release();
-    }
-
     if (batch.scratch)
     {
         batch.scratch->Release();
@@ -384,19 +374,25 @@ void BottomLevelAccelerationStructure::Shutdown()
         m_scratchResource = nullptr;
     }
 
-    if (m_resource)
-    {
-        m_resource->Release();
-        m_resource = nullptr;
-    }
+    m_result.reset();
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS BottomLevelAccelerationStructure::GetGPUAddress() const
 {
-    if (!m_resource)
+    if (!m_result)
     {
         return 0;
     }
 
-    return m_resource->GetGPUVirtualAddress();
+    return m_result->GetGPUAddress();
+}
+
+ID3D12Resource* BottomLevelAccelerationStructure::GetResource() const
+{
+    if (!m_result)
+    {
+        return nullptr;
+    }
+
+    return m_result->GetResource();
 }

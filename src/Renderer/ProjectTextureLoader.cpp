@@ -3,6 +3,7 @@
 #include "Renderer/ProjectTextureLoader.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/ResourceUploader.h"
+#include "Renderer/TextureMemoryAllocator.h"
 #include "Renderer/ImageLoader.h"
 #include "Renderer/DDSLoader.h"
 #include <algorithm>
@@ -505,6 +506,9 @@ PreparedTextureUpload::RecordResult PreparedTextureUpload::Record(ID3D12Device* 
         m_generation = generation;
         m_slot = slot;
         m_state = State::Recorded; // All fallible preparation finished before the first command.
+
+        // A placed texture is activated before the copies that initialize every subresource (TextureMemoryAllocator.h).
+        TextureMemoryAllocator::RecordActivation(commands, m_texture.GetResource(), D3D12_RESOURCE_STATE_COPY_DEST);
 
         for(unsigned int index = 0; index < count; ++index)
         {

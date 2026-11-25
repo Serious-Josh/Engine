@@ -84,6 +84,43 @@ namespace
         }
     };
 
+    // Diagnostics: ENGINE_REFLEX_MODE=off|on|onBoost replaces the saved NVIDIA Reflex mode for this session, for an Off/On
+    // comparison without editing ProjectSettings.json. Frame Generation's lock still applies over it.
+    std::optional<ProjectReflexMode> GetReflexModeOverrideForTesting()
+    {
+        static const std::optional<ProjectReflexMode> requested = []() -> std::optional<ProjectReflexMode>
+        {
+            const char* value = std::getenv("ENGINE_REFLEX_MODE");
+
+            if(!value)
+            {
+                return std::nullopt;
+            }
+
+            const std::string name(value);
+
+            if(name == "off")
+            {
+                return ProjectReflexMode::Off;
+            }
+
+            if(name == "on")
+            {
+                return ProjectReflexMode::On;
+            }
+
+            if(name == "onBoost")
+            {
+                return ProjectReflexMode::OnBoost;
+            }
+
+            Log::Warning("ENGINE_REFLEX_MODE must be off, on or onBoost; ignoring '" + name + "'.");
+            return std::nullopt;
+        }();
+
+        return requested;
+    }
+
     std::string ProjectPathText(const std::filesystem::path& path)
     {
         const auto text = path.u8string();
@@ -1957,6 +1994,7 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
             }
 
             m_packagedRequestedLightingMode = rendering.rendering.lightingMode;
+            m_packagedRenderingSettings = rendering.rendering;
             m_packagedRenderingConfiguration = ResolveRenderingConfiguration(rendering.rendering);
             Log::Info("Packaged rendering settings: " + std::string(PackagedRenderingSettings::Describe(rendering.source)) +
                 "; requested " + std::string(ToSerializedName(rendering.rendering.lightingMode)) + " lighting, " +
@@ -3013,6 +3051,8 @@ void Engine::Run()
         }
 
         CpuTiming::FrameSample sample = m_renderer.GetCpuFrameTiming();
+        // Frame() slept here before Render, so this frame's Reflex sleep belongs to its sample.
+        sample.reflexSleep = m_renderer.GetReflexStatus().lastSleepMilliseconds;
 
         if(sample.submitted && (!hasPacingFrame || sample.frameSerial != lastPacingFrame))
         {
@@ -3286,6 +3326,27 @@ void Engine::SampleMemoryMonitor()
     MemoryMonitor::Record(now, cpu);
 }
 
+ReflexMode Engine::GetRequestedReflexMode()
+{
+    // The packaged game's cooked settings, or the Editor's saved Project Settings, which Frame() refreshes every frame
+    // (Reflex has no Debug panel override).
+    const bool packaged = m_startup.mode == EngineStartup::Mode::PackagedRuntime;
+    RenderingSettings settings = packaged ? m_packagedRenderingSettings : m_renderer.GetDebugUI().GetEffectiveRenderingSettings();
+
+    // FG.3: built games do not run Frame Generation yet, so its saved toggle does not lock Reflex there.
+    if(packaged)
+    {
+        settings.frameGeneration.enabled = false;
+    }
+
+    if(const std::optional<ProjectReflexMode> modeOverride = GetReflexModeOverrideForTesting())
+    {
+        settings.latency.reflex = *modeOverride;
+    }
+
+    return ResolveReflexMode(settings);
+}
+
 void Engine::Frame()
 {
     // ER.1/M0c.4 diagnostics (ENGINE_ER1_TIMING only): the whole frame's CPU time, for hitches around configuration switches.
@@ -3297,6 +3358,10 @@ void Engine::Frame()
     // Exactly one audio update when this frame ends, on every return path, after gameplay and presentation and
     // independent of whether the renderer submitted anything. It never waits on GPU work.
     const Audio::FrameUpdateScope audioUpdate(m_audio);
+
+    // NVIDIA Reflex: the driver's sleep point comes first, before this frame samples input or time, so the input it reads
+    // is as fresh as possible (no NVAPI call while Reflex is off). Outside the input hitch probe, which would count the sleep.
+    m_renderer.BeginLatencyFrame(GetRequestedReflexMode());
 
     std::optional<Renderer::FrameHitchProbe> inputProbe;
 
@@ -3311,6 +3376,7 @@ void Engine::Frame()
 
     m_input.Update();
     m_window.ProcessMessages();
+    m_renderer.MarkLatencyInputSampled();
     inputProbe.reset();
 
     if (m_window.ShouldClose())
@@ -3414,6 +3480,7 @@ void Engine::Frame()
         options.exposureReset = std::exchange(m_exposureResetPending, false);
 
         const auto renderStarted = std::chrono::steady_clock::now();
+        m_renderer.MarkLatencyRenderSubmitStart();
         const auto result = m_renderer.Render(demo.GetScene(), options);
         const double renderMilliseconds = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - renderStarted).count();
@@ -4540,6 +4607,12 @@ void Engine::Frame()
         rendererOptions.selectedObject = (std::numeric_limits<std::size_t>::max)();
         rendererOptions.selectedObjects = *marqueePreview;
     }
+
+    // FG.3: the saved DLSS Frame Generation toggle; Render switches the present path between frames when it changes.
+    m_renderer.SetFrameGenerationRequested(IsFrameGenerationRequested(debugUI.GetEffectiveRenderingSettings()));
+
+    // NVIDIA Reflex: simulation and Editor work end here; Render records and submits the frame next.
+    m_renderer.MarkLatencyRenderSubmitStart();
     const Renderer::FrameRenderResult renderResult = m_renderer.Render(activeScene, rendererOptions);
     renderProbe.reset();
     NoteStartupFrame(renderResult);

@@ -7,8 +7,13 @@
 #include "Renderer/UploadBuffer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <exception>
+#include <iterator>
 #include <random>
+#include <system_error>
+#include <thread>
 
 namespace
 {
@@ -28,6 +33,8 @@ namespace
     // M5.1-4 T-2.1 test only: the self-shift identity check.
     constexpr std::uint32_t FlagSelfShift = 1u << 10;
     constexpr std::uint32_t FlagSelfShiftUnquantized = 1u << 11;
+    // Residual boiling §5d option 2 (experimental): direct-light reservoir, fresh bounce light (extraction frames only).
+    constexpr std::uint32_t FlagDirectReservoir = 1u << 12;
     // T-2.1 round 3 quantization decomposition: one stored field replaced by its in-register value.
     constexpr std::uint32_t FlagShiftExactDirection = 1u << 13;
     constexpr std::uint32_t FlagShiftExactBarycentrics = 1u << 14;
@@ -182,6 +189,245 @@ namespace
         parameter.descriptorCount = 1;
         return parameter;
     }
+
+    // One pipeline of the pass and the shader it is created from.
+    struct PipelineSource
+    {
+        const char* path;
+        const char* entryPoint;
+        // The initial-sampling kernels and the reuse passes share the path tracer's root signature; the light-tile and
+        // ReGIR light-map passes take one constant buffer.
+        bool kernel;
+        ComputePipeline ReSTIRPTPreparedPipelines::* pipeline;
+    };
+
+    // Every pipeline the pass owns. The unified initial sampling is production; the temporal, diagnostics and visibility
+    // bench variants are compiled apart so production never carries their state (M5.2 C0). The spatial passes (M5.3), the
+    // temporal reuse pass (M5.4 C1) and the duplication map (M5.4 C7) are entry points of the same shaders (same bindings).
+    // Ordered by the driver's measured cost after a shader change, largest first, so the parallel creation ends sooner.
+    constexpr PipelineSource PipelineSources[] = {
+        {"ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::diagnostics},
+        {"ReSTIRPT/RestirPtInitialTemporal.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::temporal},
+        // Wall boiling (experimental): the ReGIR kernel with light-traced bounce connections.
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounce.hlsl", "RestirPtInitialCS", true,
+            &ReSTIRPTPreparedPipelines::initialReGIRLightBounce},
+        {"ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "RestirPtSpatialPairsCS", true,
+            &ReSTIRPTPreparedPipelines::spatialPairsDiagnostics},
+        {"ReSTIRPT/RestirPtInitialReGIR.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::initialReGIR},
+        {"ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "RestirPtTemporalCS", true,
+            &ReSTIRPTPreparedPipelines::temporalPassDiagnostics},
+        {"ReSTIRPT/RestirPtInitialVisibilityBench.hlsl", "RestirPtInitialCS", true,
+            &ReSTIRPTPreparedPipelines::visibilityBench},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::initial},
+        {"ReSTIRPT/RestirPtInitialTemporal.hlsl", "RestirPtTemporalCS", true, &ReSTIRPTPreparedPipelines::temporalPass},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtSpatialPairsCS", true, &ReSTIRPTPreparedPipelines::spatialPairs},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtSpatialResampleCS", true, &ReSTIRPTPreparedPipelines::spatialResample},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtDuplicationCS", true, &ReSTIRPTPreparedPipelines::duplication},
+        {"ReSTIRPT/RestirPtLightTiles.hlsl", "main", false, &ReSTIRPTPreparedPipelines::lightTiles},
+        // M5.6 O0: the ReGIR light map.
+        {"ReSTIRPT/RestirPtReGIRLights.hlsl", "main", false, &ReSTIRPTPreparedPipelines::regirLights},
+    };
+
+    // At most this many threads create the pipelines (a quarter of the hardware threads): the driver's cost is a few
+    // large kernels, so more threads would not end sooner, and the Editor keeps the rest of the CPU.
+    constexpr unsigned int MaximumPipelineThreads = 4;
+
+    // Creates one pipeline. A kernel has the path tracer's root signature (t0 TLAS, u0-u2 accumulation, output and
+    // statistics, b0 path tracing constants, b1 scene light constants) plus RestirPtConstants at b2, root parameter 7 (t1,
+    // M5.1-4: the per-instance transforms, a root SRV), and its two static samplers. Returns the failure, empty on success.
+    std::string CreatePipeline(ID3D12Device* device, ShaderLibrary& shaderLibrary, const PipelineSource& source,
+        ComputePipeline& pipeline)
+    {
+        ShaderDescription shaderDescription{};
+        shaderDescription.path = source.path;
+        shaderDescription.entryPoint = source.entryPoint;
+        shaderDescription.stage = ShaderStage::Compute;
+        Shader* shader = shaderLibrary.Load(shaderDescription);
+
+        if(!shader)
+        {
+            return std::string(source.path) + " (" + source.entryPoint + ") did not compile.";
+        }
+
+        ComputePipelineDescription description{};
+        description.computeShader = shader;
+
+        if(source.kernel)
+        {
+            description.rootParameters = {Parameter(RootParameterType::ShaderResource, 0), UnorderedAccessTable(0),
+                UnorderedAccessTable(1), UnorderedAccessTable(2), Parameter(RootParameterType::ConstantBuffer, 0),
+                Parameter(RootParameterType::ConstantBuffer, 1), Parameter(RootParameterType::ConstantBuffer, 2),
+                Parameter(RootParameterType::ShaderResource, 1)};
+            description.staticSamplers = {PathTraceSampler(0, false), PathTraceSampler(1, true)};
+        }
+        else
+        {
+            description.rootParameters = {Parameter(RootParameterType::ConstantBuffer, 0)};
+        }
+
+        if(!pipeline.Initialize(device, description))
+        {
+            return std::string("the pipeline of ") + source.path + " (" + source.entryPoint + ") could not be created.";
+        }
+
+        return {};
+    }
+
+    // M5.3: the pairing textures, one per spatial neighbour, each checked to be an involution with the target standard
+    // deviation. CPU only. Returns the failure, empty on success.
+    std::string BuildPairingTexels(std::vector<std::uint32_t>& texels, std::string& summary)
+    {
+        // sigma = sqrt(8 / (9 pi)) R for the ReSTIR default R = 30 [P 7]: 16.0.
+        const double sigma = std::sqrt(8.0 / (9.0 * 3.14159265358979323846)) * 30.0;
+        texels.clear();
+        summary.clear();
+
+        for(std::uint32_t t = 0; t < ReSTIRPTPass::SpatialNeighbours; ++t)
+        {
+            const std::uint32_t size = ReSTIRPTPass::PairingSizes[t];
+            const std::vector<std::uint32_t> texture = BuildPairingTexture(size, sigma, 0x52535033u + 7919u * t);
+            double squares = 0.0;
+            bool involution = true;
+
+            for(std::uint32_t texel = 0; texel < size * size; ++texel)
+            {
+                const int dx = PairingDelta(texture[texel], 0);
+                const int dy = PairingDelta(texture[texel], 1);
+                squares += static_cast<double>(dx) * dx + static_cast<double>(dy) * dy;
+                const std::uint32_t x = static_cast<std::uint32_t>((static_cast<int>(texel % size) + dx +
+                    static_cast<int>(size)) % static_cast<int>(size));
+                const std::uint32_t y = static_cast<std::uint32_t>((static_cast<int>(texel / size) + dy +
+                    static_cast<int>(size)) % static_cast<int>(size));
+                const std::uint32_t back = texture[y * size + x];
+                involution = involution && (dx != 0 || dy != 0) && PairingDelta(back, 0) == -dx &&
+                    PairingDelta(back, 1) == -dy;
+            }
+
+            // Standard deviation per axis (the deltas' mean is 0 by construction).
+            const double measured = std::sqrt(squares / (2.0 * size * size));
+
+            if(!involution || std::abs(measured - sigma) > 0.02 * sigma)
+            {
+                return "pairing texture " + std::to_string(size) + " failed its check (involution " +
+                    std::to_string(involution) + ", sigma " + std::to_string(measured) + ", target " +
+                    std::to_string(sigma) + " +- 2%).";
+            }
+
+            summary += " " + std::to_string(size) + ": sigma " + std::to_string(measured);
+            texels.insert(texels.end(), texture.begin(), texture.end());
+        }
+
+        return {};
+    }
+}
+
+void ReSTIRPTPreparedPipelines::Shutdown()
+{
+    for(const PipelineSource& source : PipelineSources)
+    {
+        (this->*source.pipeline).Shutdown();
+    }
+
+    pairingTexels.clear();
+    pairingSummary.clear();
+}
+
+bool ReSTIRPTPass::PreparePipelines(ID3D12Device* device, const std::filesystem::path& shaderRoot,
+    ReSTIRPTPreparedPipelines& prepared)
+{
+    if(!device || shaderRoot.empty())
+    {
+        prepared.failure = "no device or no shader sources (ReSTIR PT Enhanced is Editor-only).";
+        return false;
+    }
+
+    // Each thread takes the next pipeline of the table until none is left, with its own ShaderLibrary (a library is used
+    // by one thread at a time), below normal priority so the compiles never take CPU from the render thread. Each slot of
+    // the table is written by exactly one thread.
+    constexpr std::size_t PipelineCount = std::size(PipelineSources);
+    std::vector<std::string> failures(PipelineCount);
+    std::atomic<std::size_t> nextPipeline{0};
+    std::atomic<bool> threadFailed{false};
+    const auto createPipelines = [&]()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        ShaderLibrary shaderLibrary;
+
+        try
+        {
+            const bool libraryReady = shaderLibrary.Initialize(shaderRoot);
+
+            for(std::size_t index = nextPipeline++; index < PipelineCount; index = nextPipeline++)
+            {
+                const PipelineSource& source = PipelineSources[index];
+                failures[index] = libraryReady ? CreatePipeline(device, shaderLibrary, source, prepared.*source.pipeline) :
+                    std::string("the shader compiler could not be initialized for ") + source.path + ".";
+            }
+        }
+        catch(const std::exception&)
+        {
+            threadFailed = true;
+        }
+
+        shaderLibrary.Shutdown();
+    };
+
+    const unsigned int threadCount = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, MaximumPipelineThreads);
+    std::vector<std::thread> threads;
+    threads.reserve(threadCount);
+
+    try
+    {
+        for(unsigned int thread = 0; thread < threadCount; ++thread)
+        {
+            threads.emplace_back(createPipelines);
+        }
+    }
+    catch(const std::system_error&)
+    {
+        // Fewer threads: the started ones take every pipeline.
+    }
+
+    // The pairing texels meanwhile, on this thread (an exception must not leave the joinable threads behind).
+    std::string pairingFailure;
+
+    try
+    {
+        pairingFailure = BuildPairingTexels(prepared.pairingTexels, prepared.pairingSummary);
+    }
+    catch(const std::exception& exception)
+    {
+        pairingFailure = std::string("the pairing textures could not be built: ") + exception.what();
+    }
+
+    for(std::thread& thread : threads)
+    {
+        thread.join();
+    }
+
+    if(threads.empty())
+    {
+        prepared.failure = "no thread could be started to create the pipelines.";
+        return false;
+    }
+
+    if(threadFailed)
+    {
+        prepared.failure = "a pipeline thread failed with an exception.";
+        return false;
+    }
+
+    for(const std::string& failure : failures)
+    {
+        if(!failure.empty())
+        {
+            prepared.failure = failure;
+            return false;
+        }
+    }
+
+    prepared.failure = pairingFailure;
+    return prepared.failure.empty();
 }
 
 bool ReSTIRPTPass::Fail(const std::string& failure)
@@ -195,81 +441,27 @@ bool ReSTIRPTPass::Fail(const std::string& failure)
     return false;
 }
 
-// One variant of the initial-sampling kernel: the path tracer's root signature (t0 TLAS, u0-u2 accumulation, output and
-// statistics, b0 path tracing constants, b1 scene light constants) plus RestirPtConstants at b2, root parameter 7 (t1,
-// M5.1-4: the per-instance transforms, a root SRV), and its two static samplers.
-bool ReSTIRPTPass::CreateInitialPipeline(ID3D12Device* device, ShaderLibrary& shaderLibrary, const char* path,
-    ComputePipeline& pipeline, const char* entryPoint)
+void ReSTIRPTPass::AdoptPipelines(const ReSTIRPTPreparedPipelines& prepared)
 {
-    ShaderDescription shaderDescription{};
-    shaderDescription.path = path;
-    shaderDescription.entryPoint = entryPoint;
-    shaderDescription.stage = ShaderStage::Compute;
-    Shader* shader = shaderLibrary.Load(shaderDescription);
-
-    if(!shader)
-    {
-        return Fail(std::string(path) + " (" + entryPoint + ") did not compile.");
-    }
-
-    ComputePipelineDescription description{};
-    description.computeShader = shader;
-    description.rootParameters = {Parameter(RootParameterType::ShaderResource, 0), UnorderedAccessTable(0),
-        UnorderedAccessTable(1), UnorderedAccessTable(2), Parameter(RootParameterType::ConstantBuffer, 0),
-        Parameter(RootParameterType::ConstantBuffer, 1), Parameter(RootParameterType::ConstantBuffer, 2),
-        Parameter(RootParameterType::ShaderResource, 1)};
-    description.staticSamplers = {PathTraceSampler(0, false), PathTraceSampler(1, true)};
-
-    if(!pipeline.Initialize(device, description))
-    {
-        return Fail(std::string("the pipeline of ") + path + " could not be created.");
-    }
-
-    return true;
+    m_initialPipeline.CopyFrom(prepared.initial);
+    m_temporalPipeline.CopyFrom(prepared.temporal);
+    m_initialReGIRPipeline.CopyFrom(prepared.initialReGIR);
+    m_initialReGIRLightBouncePipeline.CopyFrom(prepared.initialReGIRLightBounce);
+    m_diagnosticsPipeline.CopyFrom(prepared.diagnostics);
+    m_visibilityBenchPipeline.CopyFrom(prepared.visibilityBench);
+    m_spatialPairsPipeline.CopyFrom(prepared.spatialPairs);
+    m_spatialPairsDiagnosticsPipeline.CopyFrom(prepared.spatialPairsDiagnostics);
+    m_spatialResamplePipeline.CopyFrom(prepared.spatialResample);
+    m_temporalPassPipeline.CopyFrom(prepared.temporalPass);
+    m_temporalPassDiagnosticsPipeline.CopyFrom(prepared.temporalPassDiagnostics);
+    m_duplicationPipeline.CopyFrom(prepared.duplication);
+    m_lightTilePipeline.CopyFrom(prepared.lightTiles);
+    m_regirLightsPipeline.CopyFrom(prepared.regirLights);
 }
 
-bool ReSTIRPTPass::CreatePairingTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap,
-    ResourceUploader& uploader)
+bool ReSTIRPTPass::UploadPairingTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap, ResourceUploader& uploader,
+    const std::string& pairingSummary)
 {
-    // sigma = sqrt(8 / (9 pi)) R for the ReSTIR default R = 30 [P 7]: 16.0.
-    const double sigma = std::sqrt(8.0 / (9.0 * 3.14159265358979323846)) * 30.0;
-    m_pairingTexels.clear();
-    std::string summary;
-
-    for(std::uint32_t t = 0; t < SpatialNeighbours; ++t)
-    {
-        const std::uint32_t size = PairingSizes[t];
-        const std::vector<std::uint32_t> texture = BuildPairingTexture(size, sigma, 0x52535033u + 7919u * t);
-        double squares = 0.0;
-        bool involution = true;
-
-        for(std::uint32_t texel = 0; texel < size * size; ++texel)
-        {
-            const int dx = PairingDelta(texture[texel], 0);
-            const int dy = PairingDelta(texture[texel], 1);
-            squares += static_cast<double>(dx) * dx + static_cast<double>(dy) * dy;
-            const std::uint32_t x = static_cast<std::uint32_t>((static_cast<int>(texel % size) + dx + static_cast<int>(size)) %
-                static_cast<int>(size));
-            const std::uint32_t y = static_cast<std::uint32_t>((static_cast<int>(texel / size) + dy + static_cast<int>(size)) %
-                static_cast<int>(size));
-            const std::uint32_t back = texture[y * size + x];
-            involution = involution && (dx != 0 || dy != 0) && PairingDelta(back, 0) == -dx && PairingDelta(back, 1) == -dy;
-        }
-
-        // Standard deviation per axis (the deltas' mean is 0 by construction).
-        const double measured = std::sqrt(squares / (2.0 * size * size));
-
-        if(!involution || std::abs(measured - sigma) > 0.02 * sigma)
-        {
-            return Fail("pairing texture " + std::to_string(size) + " failed its check (involution " +
-                std::to_string(involution) + ", sigma " + std::to_string(measured) + ", target " + std::to_string(sigma) +
-                " +- 2%).");
-        }
-
-        summary += " " + std::to_string(size) + ": sigma " + std::to_string(measured);
-        m_pairingTexels.insert(m_pairingTexels.end(), texture.begin(), texture.end());
-    }
-
     const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     if(!m_pairing.Initialize(device, uploader, m_pairingTexels.data(), m_pairingTexels.size() * sizeof(std::uint32_t),
@@ -278,7 +470,7 @@ bool ReSTIRPTPass::CreatePairingTextures(ID3D12Device* device, DescriptorHeap& d
         return Fail("the pairing textures could not be uploaded.");
     }
 
-    Log::Info("ReSTIR PT (configuration B): pairing textures built (involutions verified);" + summary + ".");
+    Log::Info("ReSTIR PT (configuration B): pairing textures built (involutions verified);" + pairingSummary + ".");
     return true;
 }
 
@@ -472,67 +664,45 @@ bool ReSTIRPTPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary
         return Fail("invalid device or light-tile settings.");
     }
 
-    // The unified initial sampling (production), and its test-only variants (M5.2 C0: compiled apart so production B never
-    // carries their state).
-    if(!CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitial.hlsl", m_initialPipeline) ||
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialTemporal.hlsl", m_temporalPipeline) ||
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialReGIR.hlsl", m_initialReGIRPipeline) ||
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialDiagnostics.hlsl", m_diagnosticsPipeline) ||
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialVisibilityBench.hlsl",
-            m_visibilityBenchPipeline) ||
-        // M5.3: the spatial passes, entry points of the same shader (same bindings).
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitial.hlsl", m_spatialPairsPipeline,
-            "RestirPtSpatialPairsCS") ||
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialDiagnostics.hlsl",
-            m_spatialPairsDiagnosticsPipeline, "RestirPtSpatialPairsCS") ||
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitial.hlsl", m_spatialResamplePipeline,
-            "RestirPtSpatialResampleCS") ||
-        // M5.4 C1: the temporal reuse pass, from the temporal variant (its code is absent from the production tree).
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialTemporal.hlsl", m_temporalPassPipeline,
-            "RestirPtTemporalCS") ||
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialDiagnostics.hlsl",
-            m_temporalPassDiagnosticsPipeline, "RestirPtTemporalCS") ||
-        // M5.4 C7: the duplication map.
-        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitial.hlsl", m_duplicationPipeline,
-            "RestirPtDuplicationCS") ||
-        !CreatePairingTextures(device, descriptorHeap, uploader))
+    // Without pipelines prepared on a worker (direct Render callers, no pipeline worker): the same parallel preparation,
+    // waited for here. A failed set fails the pass below.
+    ReSTIRPTPreparedPipelines prepared;
+    PreparePipelines(device, shaderLibrary.GetShaderRoot(), prepared);
+    const bool initialized = Initialize(device, descriptorHeap, uploader, settings, prepared);
+    prepared.Shutdown();
+    return initialized;
+}
+
+bool ReSTIRPTPass::Initialize(ID3D12Device* device, DescriptorHeap& descriptorHeap, ResourceUploader& uploader,
+    const ReSTIRPTSettings& settings, ReSTIRPTPreparedPipelines& prepared)
+{
+    if(m_initialized)
+    {
+        return true;
+    }
+
+    if(m_failed)
     {
         return false;
     }
 
-    ShaderDescription tileShader{};
-    tileShader.path = "ReSTIRPT/RestirPtLightTiles.hlsl";
-    tileShader.entryPoint = "main";
-    tileShader.stage = ShaderStage::Compute;
-    Shader* tiles = shaderLibrary.Load(tileShader);
-
-    if(!tiles)
+    if(!device || settings.tileCount == 0 || settings.tileSize == 0)
     {
-        return Fail("ReSTIRPT/RestirPtLightTiles.hlsl did not compile.");
+        return Fail("invalid device or light-tile settings.");
     }
 
-    ComputePipelineDescription tileDescription{};
-    tileDescription.computeShader = tiles;
-    tileDescription.rootParameters = {Parameter(RootParameterType::ConstantBuffer, 0)};
-
-    if(!m_lightTilePipeline.Initialize(device, tileDescription))
+    if(!prepared.failure.empty())
     {
-        return Fail("the light-tile pipeline could not be created.");
+        return Fail(prepared.failure);
     }
 
-    // M5.6 O0: the ReGIR light map.
-    ShaderDescription regirLightsShader{};
-    regirLightsShader.path = "ReSTIRPT/RestirPtReGIRLights.hlsl";
-    regirLightsShader.entryPoint = "main";
-    regirLightsShader.stage = ShaderStage::Compute;
-    Shader* regirLights = shaderLibrary.Load(regirLightsShader);
-    ComputePipelineDescription regirLightsDescription{};
-    regirLightsDescription.computeShader = regirLights;
-    regirLightsDescription.rootParameters = {Parameter(RootParameterType::ConstantBuffer, 0)};
+    // The pipelines gain this pass's references; the set keeps its own until its owner releases it.
+    AdoptPipelines(prepared);
+    m_pairingTexels = std::move(prepared.pairingTexels);
 
-    if(!regirLights || !m_regirLightsPipeline.Initialize(device, regirLightsDescription))
+    if(!UploadPairingTextures(device, descriptorHeap, uploader, prepared.pairingSummary))
     {
-        return Fail("ReSTIRPT/RestirPtReGIRLights.hlsl did not compile or its pipeline could not be created.");
+        return false;
     }
 
     const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
@@ -544,8 +714,8 @@ bool ReSTIRPTPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary
         return Fail("the light tiles could not be allocated.");
     }
 
-    // ReGIR architecture investigation (experimental): + 32 bytes per light for the list sampler's proposal records.
-    if(!m_regirLights.InitializeGPUWritable(device, std::size_t{ReGIRLightCapacity} * 44u) ||
+    // 8 bytes per local light (table index, p_1), then 4 bytes per table light (p_1).
+    if(!m_regirLights.InitializeGPUWritable(device, std::size_t{ReGIRLightCapacity} * 12u) ||
         !m_regirLights.CreateRawUAV(device, descriptorHeap) || !m_regirLights.CreateRawSRV(device, descriptorHeap))
     {
         return Fail("the ReGIR light map could not be allocated.");
@@ -855,6 +1025,7 @@ void ReSTIRPTPass::Shutdown()
     m_regirLightsPipeline.Shutdown();
     m_initialPipeline.Shutdown();
     m_initialReGIRPipeline.Shutdown();
+    m_initialReGIRLightBouncePipeline.Shutdown();
     m_temporalPipeline.Shutdown();
     m_diagnosticsPipeline.Shutdown();
     m_visibilityBenchPipeline.Shutdown();
@@ -906,7 +1077,7 @@ bool ReSTIRPTPass::RecordLightTiles(ID3D12GraphicsCommandList* commandList, Uplo
 }
 
 std::uint32_t ReSTIRPTPass::RecordReGIRLights(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer,
-    std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount, std::uint32_t sceneLightBufferIndex)
+    std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount)
 {
     if(!m_initialized || !commandList || !m_regirLights.GetResource() || tableLightCount == 0 ||
         tableLightCount > ReGIRLightCapacity || lightSamplingIndex == 0xFFFFFFFFu)
@@ -926,7 +1097,6 @@ std::uint32_t ReSTIRPTPass::RecordReGIRLights(ID3D12GraphicsCommandList* command
         constants.outputIndex = m_regirLights.GetUAVDescriptorIndex();
         constants.tableLightCount = tableLightCount;
         constants.padding[0] = phase;
-        constants.padding[1] = sceneLightBufferIndex;
         const D3D12_GPU_VIRTUAL_ADDRESS address = uploadBuffer.Allocate(&constants, sizeof(constants),
             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -989,6 +1159,16 @@ ReSTIRPTConstants ReSTIRPTPass::MakeConstants(const ReSTIRPTSettings& settings, 
         (settings.footprintCriteria ? FlagFootprintCriteria : 0u) |
         (settings.footprintCriteria && settings.neeInverseProxy ? FlagNeeInverseProxy : 0u);
 
+    // Residual boiling §5d option 2: the bounce part reaches the final passes through the extraction textures, so the mode
+    // needs extraction (denoiser frames); it also turns the decorrelation swap off (below).
+    const bool directReservoir = settings.directReservoir && settings.reservoir && extract;
+
+    if(directReservoir)
+    {
+        constants.flags |= FlagDirectReservoir;
+        constants.decorrelation = 0.0f;
+    }
+
     // M5.4 C6: dual motion vectors read last frame's instance history only with valid reservoir history (the same
     // commit/abandon lifecycle: the sets' parity); this frame's history is written into the write set's partner.
     if(settings.reservoir && settings.temporal && settings.dualMotion && m_instanceHistory[0].GetResource() &&
@@ -1018,7 +1198,7 @@ ReSTIRPTConstants ReSTIRPTPass::MakeConstants(const ReSTIRPTSettings& settings, 
     // Optimization experiment B1a: stagnancy decorrelation writes this frame's smoothed map in the final (resample) pass
     // and reads last frame's only with valid history; its factor replaces the Uniform probability.
     if(settings.decorrelationMode == ReSTIRPTSettings::DecorrelationMode::Stagnancy && settings.reservoir &&
-        m_stagnancy[0].GetResource() && m_stagnancy[1].GetResource())
+        !directReservoir && m_stagnancy[0].GetResource() && m_stagnancy[1].GetResource())
     {
         constants.flags |= FlagStagnancy;
         constants.decorrelation = settings.stagnancyFactor;
@@ -1031,6 +1211,7 @@ ReSTIRPTConstants ReSTIRPTPass::MakeConstants(const ReSTIRPTSettings& settings, 
     }
 
     // Optimization experiment B1b: firefly replacement in the resample pass (temporal + spatial reuse).
+    // Direct-reservoir mode keeps it: a reused direct firefly is replaced by the fresh direct estimate (the resample pass).
     if(settings.fireflyReplacement && settings.reservoir && settings.temporal && settings.spatial)
     {
         constants.flags |= FlagFirefly;

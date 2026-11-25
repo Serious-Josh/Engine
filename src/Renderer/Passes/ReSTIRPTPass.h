@@ -6,7 +6,9 @@
 
 #include <d3d12.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -126,9 +128,9 @@ struct ReSTIRPTSettings
     // ENGINE_RESTIR_PT_HISTORY_SCENE=0 turns it off for comparisons.
     bool historyScene = true;
     // Optimization A5 (ENGINE_RESTIR_PT_SPATIAL_PAIRS=1..3, or the Editor's "Spatial pairs"): spatial partners per pixel.
-    // Default 1 (user decision 2026-11-23, after the adaptive light sampler; previously 2, user-approved earlier the same
-    // day; 1 showed blockiness on reflections in the M5.5 experiments). 3 is the published, higher-quality option.
-    std::uint32_t spatialPairs = 1;
+    // Default 3, the published option (user decision 2026-11-24, with the direct-light reservoir, whose cheaper reuse
+    // passes pay for it; before: 1 from 2026-11-23, 2 earlier that day).
+    std::uint32_t spatialPairs = 3;
     // Optimization experiment B1a (ENGINE_RESTIR_PT_DECORRELATION_MODE=stagnancy, or the Editor's "Decorrelation"):
     // NVIDIA RTXDI's Stagnancy mode in place of Uniform. p = saturate(4 * stagnancyFactor * sqrt(smoothed age / 40)),
     // with the age carried in the reservoir and smoothed by an EMA over the reprojected map (RTXDI defaults). Biased (the
@@ -190,10 +192,35 @@ struct ReSTIRPTSettings
     // Proposal only. ENGINE_RESTIR_PT_REGIR_SPOT_TARGET=bound or the Editor's "ReGIR representative spot target" restores
     // the bound (with regirCone).
     bool regirSpotTarget = true;
-    // ReGIR architecture investigation (experimental, not a production option): with ENGINE_RESTIR_PT_LIST_PROTOTYPE=1 at
-    // launch (which compiles the prototype), the Editor's "ReGIR list prototype" switches ReSTIR PT's ReGIR candidates to
-    // per-receiver proposals over the light grid's lists at run time. Ignored otherwise.
+    // The adaptive light sampler (on by default, user decision 2026-11-23): ReSTIR PT's ReGIR kernel draws its candidates
+    // from per-receiver proposals over the light grid's lists (the adaptive walk at x1, uniform members deeper) instead of
+    // the ReGIR slots. The Editor's "Adaptive x1 light sampling" or ENGINE_RESTIR_PT_LIST_START=off switches it off at run
+    // time; ENGINE_RESTIR_PT_LIST_PROTOTYPE=0 compiles it out (then this is ignored).
     bool regirListPrototype = true;
+    // Residual boiling P1 (on by default, user decision 2026-11-24; ENGINE_RESTIR_PT_MIRROR_X1=0 or the Editor turns it off):
+    // the first non-delta vertex of a camera mirror chain (x2 behind a delta x1, or x3 behind delta x1 and x2) shades what the
+    // camera sees in the mirror, so its table-light NEE uses x1's light sampler and candidate count instead of the
+    // deep-vertex ones. Proposal only (each candidate keeps its unbiased weight and p_1), so it is not part of the history
+    // signature. Documentation/Rendering/ReSTIR_PT_Residual_Boiling_Investigation.md.
+    bool mirrorChainX1Sampling = true;
+    // Residual boiling, research report §5d option 2 (on by default, user decision 2026-11-24;
+    // ENGINE_RESTIR_PT_DIRECT_RESERVOIR=0 or the Editor turns it off): on denoiser frames (extraction), the reservoir holds
+    // direct-light candidates only (path length k <= 2) and is
+    // reused as usual; the path tree's bounce candidates (k >= 3) are summed fresh each frame and added at final shading.
+    // No decorrelation swap then; firefly replacement stays and shows the fresh direct estimate in place of a reused
+    // direct firefly (biased as before). Each part is an unbiased estimator of its own light. In the history signature
+    // (reservoirs change meaning).
+    bool directReservoir = true;
+    // Wall boiling (experimental, on by default, user decision 2026-11-24; ENGINE_RESTIR_PT_LIGHT_BOUNCE=0 or the Editor's
+    // "Bounce light: light-traced connections" turns it off): with the direct-light reservoir active, each primary surface
+    // also gets one light-traced bounce sample (a light chosen near x1 by power over squared distance, one ray from it, its
+    // hit x2 connected to x1) for the paths x1 -> x2 -> point or spot light, balance-heuristic MIS against the BSDF bounce's
+    // NEE at x2. Unbiased; it removes the single-frame spikes from small bright lit patches that BSDF bounces rarely hit.
+    // Compiled into its own ReGIR kernel variant (RESTIR_PT_LIGHT_BOUNCE), so it needs the ReGIR kernel's adaptive x1
+    // sampler (above 64 lights); elsewhere it is inactive. Bounce light is never reused, so it is not part of the history
+    // signature.
+    // Documentation/Rendering/ReSTIR_PT_Wall_Boiling_Investigation.md.
+    bool lightTracedBounce = true;
 };
 
 // M5.2: what the previous frame's reservoirs were computed against. History is reused only when every field matches
@@ -242,6 +269,9 @@ struct ReSTIRPTFrame
     bool historyValid = false;
     ReSTIRPTHistoryDecision decision = ReSTIRPTHistoryDecision::NoCommittedFrame;
 };
+
+// The local lighting discontinuity regions one frame can carry (RESTIR_PT_MAX_DISCONTINUITY_REGIONS in the shader).
+inline constexpr std::uint32_t ReSTIRPTMaxDiscontinuityRegions = 16;
 
 // GPU layout of RestirPtConstants (register b2, assets/Shaders/ReSTIRPT/RestirPtInitialBody.hlsli).
 struct ReSTIRPTConstants
@@ -332,6 +362,13 @@ struct ReSTIRPTConstants
     // threshold 0). ENGINE_RESTIR_PT_DUPLICATION_RESPONSE="alpha;minCap;threshold". Used only with Duplication::Apply.
     float duplicationResponse[3]{};
 
+    // History through lighting changes: local lighting discontinuities since the committed frame (world-space spheres,
+    // centre xyz and radius w; FrameLighting.h DetectLightingDiscontinuities). Temporal reuse is refused at surfaces inside
+    // them this frame (RestirPtFindTemporalNeighbor); more regions than fit become a global drop.
+    std::uint32_t discontinuityCount = 0;
+    std::uint32_t discontinuityPadding[3]{};
+    float discontinuityRegions[ReSTIRPTMaxDiscontinuityRegions][4]{};
+
     // The SHARC radiance cache at x3 (read only by kernels compiled with RESTIR_PT_SHARC): this frame's NVIDIA SHARC buffers
     // (raw UAV descriptors; sharcCapacity 0: no cache this frame, and paths run as without SHARC), the hash grid's camera
     // and scale.
@@ -360,7 +397,12 @@ struct ReSTIRPTInstanceTransform
     float previousWorldToObject[12]{};
 };
 
-static_assert(sizeof(ReSTIRPTConstants) == 448, "ReSTIRPTConstants must match RestirPtConstants (b2).");
+// 448 bytes before the lighting discontinuity regions (16 + 16 x 16 bytes, ahead of the SHARC fields).
+static_assert(sizeof(ReSTIRPTConstants) == 448 + 16 + ReSTIRPTMaxDiscontinuityRegions * 16,
+    "ReSTIRPTConstants must match RestirPtConstants (b2).");
+static_assert(offsetof(ReSTIRPTConstants, discontinuityRegions) % 16 == 0 &&
+    offsetof(ReSTIRPTConstants, sharcHashEntriesIndex) % 16 == 0,
+    "ReSTIRPTConstants: the discontinuity regions and the SHARC fields start HLSL registers.");
 
 // GPU layout of RestirPtLightTileConstants (register b0, assets/Shaders/ReSTIRPT/RestirPtLightTiles.hlsl).
 struct ReSTIRPTLightTileConstants
@@ -376,6 +418,39 @@ struct ReSTIRPTLightTileConstants
 };
 
 static_assert(sizeof(ReSTIRPTLightTileConstants) == 32, "ReSTIRPTLightTileConstants must match its HLSL layout.");
+
+// ReSTIR PT's compute pipelines and its pairing textures' texels, prepared apart from the pass (ReSTIRPTPass::
+// PreparePipelines), so activating ReSTIR PT creates no pipeline on the render thread: the GPU driver takes 0.1-0.5 s per
+// kernel with a warm shader cache and seconds per kernel after a shader change. Holds only immutable device objects and CPU
+// data that no GPU work has used. ReSTIRPTPass::Initialize adopts the pipelines (adding references); Shutdown releases this
+// set's own references.
+struct ReSTIRPTPreparedPipelines
+{
+    ComputePipeline initial;
+    ComputePipeline temporal;
+    ComputePipeline initialReGIR;
+    ComputePipeline initialReGIRLightBounce;
+    ComputePipeline diagnostics;
+    ComputePipeline visibilityBench;
+    ComputePipeline spatialPairs;
+    ComputePipeline spatialPairsDiagnostics;
+    ComputePipeline spatialResample;
+    ComputePipeline temporalPass;
+    ComputePipeline temporalPassDiagnostics;
+    ComputePipeline duplication;
+    ComputePipeline lightTiles;
+    ComputePipeline regirLights;
+    std::vector<std::uint32_t> pairingTexels;
+    // The measured standard deviation of each pairing texture, for the log.
+    std::string pairingSummary;
+    // Whether the ReSTIRPT/ kernels were compiled with the SHARC radiance cache (ShaderCompiler::SetRestirPtSharc), set by
+    // the caller before preparing; a set prepared for the other choice is not adopted.
+    bool sharc = false;
+    // The first failure (a shader that did not compile, a pipeline that could not be created, a failed pairing check).
+    std::string failure;
+
+    void Shutdown();
+};
 
 // M5.1: configuration B's resources and pipelines. The initial-sampling pipeline has the path tracer's root signature plus
 // RestirPtConstants at b2; PathTraceReferencePass::ExecuteReSTIRPT binds its targets and dispatches it, so the
@@ -411,10 +486,21 @@ class ReSTIRPTPass
     ReSTIRPTPass(const ReSTIRPTPass&) = delete;
     ReSTIRPTPass& operator=(const ReSTIRPTPass&) = delete;
 
-    // Compiles both pipelines and creates the extent-independent buffers (sized for settings' tiles). A failure is sticky
-    // and reported by GetFailure.
+    // Compiles and creates every pipeline into prepared and builds the pairing texels: the pipelines in parallel on a few
+    // threads of their own, each with a private ShaderLibrary rooted at shaderRoot (DXC and the driver compile one shader
+    // per call on the calling thread). Touches no pass state and calls only free-threaded device methods, so it may run on
+    // any thread; it returns when everything is created. False, with prepared.failure, when anything failed.
+    static bool PreparePipelines(ID3D12Device* device, const std::filesystem::path& shaderRoot,
+        ReSTIRPTPreparedPipelines& prepared);
+    // Prepares the pipelines here, blocking (PreparePipelines from shaderLibrary's sources), then initializes from them as
+    // below. For callers without prepared pipelines.
     bool Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary, DescriptorHeap& descriptorHeap,
         ResourceUploader& uploader, const ReSTIRPTSettings& settings);
+    // Adopts the prepared pipelines and pairing texels (a failed set fails the pass with its failure) and creates the
+    // extent-independent buffers (sized for settings' tiles). Render thread. A failure is sticky and reported by
+    // GetFailure. The caller still releases prepared (Shutdown).
+    bool Initialize(ID3D12Device* device, DescriptorHeap& descriptorHeap, ResourceUploader& uploader,
+        const ReSTIRPTSettings& settings, ReSTIRPTPreparedPipelines& prepared);
     // M5.3: the spatial scratch reservoirs and pair records for the current extent (created on first use).
     bool EnsureSpatialResources(ID3D12Device* device, DescriptorHeap& descriptorHeap);
     // M5.4 C5: the temporal pass's replay list (4 B per pixel + the count), created on first use at this resolution.
@@ -491,10 +577,8 @@ class ReSTIRPTPass
     // M5.6 O0: this frame's RTXDI local light -> (table index, global realized probability) map for the ReGIR candidates
     // (RestirPtReGIRLights.hlsl, from the published light sampling's translation and global alias table). Returns its SRV
     // index, or 0xFFFFFFFF (more than ReGIRLightCapacity table lights, or not initialized: the light tiles are used).
-    // sceneLightBufferIndex (ReGIR architecture investigation, experimental): also write the list sampler's 32-byte
-    // proposal records (RestirPtReGIRLights.hlsl) when valid.
     std::uint32_t RecordReGIRLights(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer,
-        std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount, std::uint32_t sceneLightBufferIndex = 0xFFFFFFFFu);
+        std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount);
     static constexpr std::uint32_t ReGIRLightCapacity = 1u << 17;
     // This frame's RestirPtConstants: the settings' flags, the buffers' descriptors and the frame inputs. extract and
     // rawDiffuseHitDistance select the signal outputs (RESTIR_PT_FLAG_EXTRACT / _RAW_DIFFUSE_HIT_DISTANCE).
@@ -527,8 +611,15 @@ class ReSTIRPTPass
             return m_temporalPipeline;
         }
 
-        // M5.6 O0: the ReGIR variant only on frames whose ReGIR light map was recorded (RecordReGIRLights).
-        return m_regirThisFrame ? m_initialReGIRPipeline : m_initialPipeline;
+        // M5.6 O0: the ReGIR variant only on frames whose ReGIR light map was recorded (RecordReGIRLights); its
+        // light-traced bounce variant while that option and the direct-light reservoir are on.
+        if(m_regirThisFrame)
+        {
+            const bool lightBounce = settings.lightTracedBounce && settings.directReservoir;
+            return lightBounce ? m_initialReGIRLightBouncePipeline : m_initialReGIRPipeline;
+        }
+
+        return m_initialPipeline;
     }
 
     // M5.4 C1: the temporal reuse pass (its diagnostics variant with the temporal round trip).
@@ -592,9 +683,9 @@ class ReSTIRPTPass
 
     private:
     bool Fail(const std::string& failure);
-    bool CreateInitialPipeline(ID3D12Device* device, ShaderLibrary& shaderLibrary, const char* path,
-        ComputePipeline& pipeline, const char* entryPoint = "RestirPtInitialCS");
-    bool CreatePairingTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap, ResourceUploader& uploader);
+    void AdoptPipelines(const ReSTIRPTPreparedPipelines& prepared);
+    bool UploadPairingTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap, ResourceUploader& uploader,
+        const std::string& pairingSummary);
 
     ComputePipeline m_initialPipeline;
     ComputePipeline m_temporalPipeline;
@@ -609,6 +700,8 @@ class ReSTIRPTPass
     // M5.6 O0: the production initial kernel with RESTIR_PT_REGIR, and whether this frame recorded the ReGIR light map
     // (reset by RecordLightTiles, which every ReSTIR PT frame records first).
     ComputePipeline m_initialReGIRPipeline;
+    // Wall boiling (experimental): the ReGIR kernel with light-traced bounce connections (RESTIR_PT_LIGHT_BOUNCE).
+    ComputePipeline m_initialReGIRLightBouncePipeline;
     bool m_regirThisFrame = false;
     Buffer m_counters;
     Buffer m_reservoirs[2];
