@@ -15,7 +15,7 @@
 // selected on frames that light replaced pixels. Development only; production frames keep NrdPathTracePrepare.hlsl.
 {"NrdPathTracePreparePsr.hlsl", "NrdPathTracePrepare.hlsl", "NRD_PATH_TRACE_PSR=1", ""},
 // RR.1B: the DLSS Ray Reconstruction input preparation with RR_INPUT_PSR (PsrDenoise.hlsli), on frames that light replaced
-// pixels. Editor diagnostics only (RR is not a rendering mode before RR.1D); not cooked.
+// pixels. Cooked for packaged games since the cooked-game port (PackagedShaderInventory, Feature::RayReconstruction).
 {"RrInputPreparationPsr.hlsl", "RrInputPreparation.hlsl", "RR_INPUT_PSR=1", ""},
 // PSR.1a: Raster Primary primary surface replacement (PATH_TRACE_PSR_LIBRARY, PathTraceReference.hlsl), in a DXR
 // library of its own so every production library compiles exactly as before. Development only: created when the PSR
@@ -629,28 +629,66 @@
 // No production library includes it.
 {"ReSTIRPT/RestirPtInitial.hlsl", "PathTraceReference.hlsl",
     "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
-    "PATH_TRACE_RESTIR_PT_LIBRARY=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 OPENPBR_LAYERED_LOBES=0", "ReSTIRPT/RestirPtInitialBody.hlsli"},
 // M5.2: the same kernel with temporal reuse compiled in (RESTIR_PT_TEMPORAL), selected while temporal reuse is on; the
 // row above carries none of the temporal code.
 {"ReSTIRPT/RestirPtInitialTemporal.hlsl", "PathTraceReference.hlsl",
     "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
-    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_TEMPORAL=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_TEMPORAL=1 OPENPBR_LAYERED_LOBES=0", "ReSTIRPT/RestirPtInitialBody.hlsli"},
 // M5.6 O0: the production kernel with the shared ReGIR candidates compiled in (RESTIR_PT_REGIR), selected only on frames
 // whose ReGIR slots were built (more than 64 local lights, O0 on); the rows above carry none of its code.
 {"ReSTIRPT/RestirPtInitialReGIR.hlsl", "PathTraceReference.hlsl",
     "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
-    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1 OPENPBR_LAYERED_LOBES=0", "ReSTIRPT/RestirPtInitialBody.hlsli"},
 // Wall boiling (experimental, ReSTIRPTSettings::lightTracedBounce): the ReGIR kernel with light-traced bounce connections
 // compiled in (RESTIR_PT_LIGHT_BOUNCE); the rows above carry none of its code.
 {"ReSTIRPT/RestirPtInitialReGIRLightBounce.hlsl", "PathTraceReference.hlsl",
     "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1 RESTIR_PT_LIGHT_BOUNCE=1 OPENPBR_LAYERED_LOBES=0",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
+// OpenPBR (2026-11-25): the four production kernels above are the base tier (OPENPBR_LAYERED_LOBES=0: coat, fuzz, thin
+// film and anisotropy compiled out, MaterialLighting.hlsli). These layered twins compile those lobes in; ReSTIRPTPass
+// prepares them only once a published material uses one (MaterialTablePublication::layeredLobes), as a set of their own.
+{"ReSTIRPT/RestirPtInitialLayered.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialTemporalLayered.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_TEMPORAL=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialReGIRLayered.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialReGIRLightBounceLayered.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
     "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1 RESTIR_PT_LIGHT_BOUNCE=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
 // M5.2 C0: test-only variants of the same kernel, isolated so production B never compiles their state (it lowered
 // occupancy): the T-2.1 self-shift and its diagnostics (RESTIR_PT_DIAGNOSTICS), and the reconnection visibility bench
-// (RESTIR_PT_VISIBILITY_BENCH). ReSTIRPTPass selects one only when its diagnostic setting is on.
+// (RESTIR_PT_VISIBILITY_BENCH). ReSTIRPTPass selects one only when its diagnostic setting is on. Both are base tier
+// (OpenPBR's coat, fuzz, thin film and anisotropy compiled out), which keeps the pass's compile time down.
 {"ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "PathTraceReference.hlsl",
     "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
-    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_DIAGNOSTICS=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_DIAGNOSTICS=1 OPENPBR_LAYERED_LOBES=0",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
 {"ReSTIRPT/RestirPtInitialVisibilityBench.hlsl", "PathTraceReference.hlsl",
     "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
-    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_VISIBILITY_BENCH=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_VISIBILITY_BENCH=1 OPENPBR_LAYERED_LOBES=0",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
+// Cooked-game port (2026-11-26): each kernel above with the SHARC radiance cache at x3 compiled in (RESTIR_PT_SHARC; native
+// 16-bit types, ShaderCompiler::UsesNative16BitTypes). ReSTIRPTPass selects these twins exactly when NVIDIA SHARC is usable
+// on the device. They replace the argument the whole ReSTIRPT/ tree used to get at runtime (ShaderCompiler::SetRestirPtSharc),
+// so a packaged game's bootstrap can hold both choices under their own names.
+{"ReSTIRPT/RestirPtInitialSharc.hlsl", "ReSTIRPT/RestirPtInitial.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialTemporalSharc.hlsl", "ReSTIRPT/RestirPtInitialTemporal.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialReGIRSharc.hlsl", "ReSTIRPT/RestirPtInitialReGIR.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialReGIRLightBounceSharc.hlsl", "ReSTIRPT/RestirPtInitialReGIRLightBounce.hlsl",
+    "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialLayeredSharc.hlsl", "ReSTIRPT/RestirPtInitialLayered.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialTemporalLayeredSharc.hlsl", "ReSTIRPT/RestirPtInitialTemporalLayered.hlsl",
+    "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialReGIRLayeredSharc.hlsl", "ReSTIRPT/RestirPtInitialReGIRLayered.hlsl",
+    "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialReGIRLightBounceLayeredSharc.hlsl", "ReSTIRPT/RestirPtInitialReGIRLightBounceLayered.hlsl",
+    "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialDiagnosticsSharc.hlsl", "ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialVisibilityBenchSharc.hlsl", "ReSTIRPT/RestirPtInitialVisibilityBench.hlsl",
+    "RESTIR_PT_SHARC=1", ""},

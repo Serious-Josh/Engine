@@ -121,11 +121,6 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     float effectiveRoughness = saturate(materialData.a);
     float roughness = effectiveRoughness <= 0.001f ? 0.0f : max(effectiveRoughness, 0.045f);
 
-    if(material.model > 2u)
-    {
-        return;
-    }
-
     Texture2D<float4> motionInput = ResourceDescriptorHeap[constants.motionInputIndex];
     float3 genericMotion = motionInput.Load(int3(gbufferPixel, 0)).xyz;
     if(all(isfinite(genericMotion)))

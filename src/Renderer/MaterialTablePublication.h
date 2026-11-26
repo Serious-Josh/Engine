@@ -21,15 +21,44 @@ struct MaterialTablePublication
 
     std::uint64_t lastSubmitted = 0;
 
+    // OpenPBR tiers: whether a desired material has a coat, fuzz, thin film or anisotropy, so ReSTIR PT must run its
+    // layered kernels (ReSTIRPTPass::SetLayeredMaterials).
+    bool layeredLobes = false;
+
+    static bool UsesLayeredLobes(const std::vector<GPUMaterial>& materials)
+    {
+        constexpr unsigned int layered = GpuMaterialLobeFlags::Coat | GpuMaterialLobeFlags::Fuzz |
+            GpuMaterialLobeFlags::ThinFilm | GpuMaterialLobeFlags::Anisotropy;
+
+        for(const GPUMaterial& material : materials)
+        {
+            if((material.lobeFlags & layered) != 0u)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     static bool Valid(const GPUMaterial& material)
     {
-        if(material.model > 2 || material.preferARM > 1 || material.surfaceDetailMode > 2)
+        constexpr unsigned int knownLobeFlags = GpuMaterialLobeFlags::Coat | GpuMaterialLobeFlags::Fuzz |
+            GpuMaterialLobeFlags::ThinFilm | GpuMaterialLobeFlags::Anisotropy |
+            GpuMaterialLobeFlags::CoatFollowsBaseNormal | GpuMaterialLobeFlags::PathTracedAO;
+
+        if((material.lobeFlags & ~knownLobeFlags) != 0u || material.preferARM > 1 || material.surfaceDetailMode > 2)
         {
             return false;
         }
 
-        const float scalars[] = {material.roughness, material.ior, material.metallic,
-            material.heightScale, material.heightBias};
+        const float scalars[] = {material.roughness, material.ior, material.metallic, material.heightScale,
+            material.heightBias, material.baseWeight, material.diffuseRoughness, material.specularWeight,
+            material.dielectricF0, material.anisotropy, material.anisotropyRotation, material.coatWeight,
+            material.coatRoughness, material.coatIor, material.coatDarkening, material.coatF0,
+            material.coatInternalReflection, material.fuzzWeight, material.fuzzRoughness, material.thinFilmWeight,
+            material.thinFilmThickness, material.thinFilmIor, material.aoDiffuse, material.aoSpecularWeight,
+            material.diffuseOcclusion};
 
         for(float value : scalars)
         {
@@ -41,8 +70,8 @@ struct MaterialTablePublication
 
         for(size_t index = 0; index < 3; ++index)
         {
-            if(!std::isfinite(material.baseColor[index]) || !std::isfinite(material.conductorN[index]) ||
-               !std::isfinite(material.conductorK[index]) || !std::isfinite(material.averageConductorFresnel[index]))
+            if(!std::isfinite(material.baseColor[index]) || !std::isfinite(material.specularColor[index]) ||
+               !std::isfinite(material.coatColor[index]) || !std::isfinite(material.fuzzColor[index]))
             {
                 return false;
             }
@@ -88,6 +117,7 @@ struct MaterialTablePublication
 
         auto copy = records; // Strong guarantee: allocation failure cannot partially replace the desired table.
         desired.swap(copy);
+        layeredLobes = UsesLayeredLobes(desired);
         ++revision;
         return true;
     }
@@ -108,6 +138,7 @@ struct MaterialTablePublication
         auto copy = desired;
         copy.push_back(record);
         desired.swap(copy);
+        layeredLobes = UsesLayeredLobes(desired);
         ++revision;
         return true;
     }

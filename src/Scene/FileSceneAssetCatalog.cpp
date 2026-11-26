@@ -385,19 +385,7 @@ Material* FileSceneAssetCatalog::ResolveMaterialVersion(std::string_view referen
         Material material{};
         material.pipeline = &m_pipeline;
         material.texture = &m_whiteTexture;
-        material.model = data.model;
-        std::copy(data.baseColor.begin(), data.baseColor.end(), material.baseColor);
-        std::copy(data.conductorN.begin(), data.conductorN.end(), material.conductorN);
-        std::copy(data.conductorK.begin(), data.conductorK.end(), material.conductorK);
-
-        material.roughness = data.roughness;
-        material.metallic = data.metallic;
-        material.ior = data.ior;
-
-        material.surfaceDetailMode = data.surfaceDetailMode;
-        material.heightScale = data.heightScale;
-        material.heightBias = data.heightBias;
-        material.preferARM = data.preferARM;
+        MaterialParameterPropagation::Apply(material, data);
 
         const auto attach = [&](
             const std::optional<std::string>& textureReference,
@@ -650,11 +638,12 @@ bool FileSceneAssetCatalog::Initialize(
         D3D12_SHADER_VISIBILITY_ALL
     });
 
+    // ObjectConstants: the pixel shader reads the model matrix too (Triangle.hlsl's primary surface lift scale).
     description.rootParameters.push_back({
         RootParameterType::ConstantBuffer,
         2,
         0,
-        D3D12_SHADER_VISIBILITY_VERTEX
+        D3D12_SHADER_VISIBILITY_ALL
     });
 
     description.depthEnabled = true;
@@ -762,7 +751,6 @@ bool FileSceneAssetCatalog::Initialize(
     m_defaultMaterial = Material{};
     m_defaultMaterial.pipeline = &m_pipeline;
     m_defaultMaterial.texture = &m_whiteTexture;
-    m_defaultMaterial.model = MaterialModel::Dielectric;
 
     m_defaultMaterial.baseColor[0] = 0.8f;
     m_defaultMaterial.baseColor[1] = 0.8f;

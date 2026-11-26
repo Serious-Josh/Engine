@@ -207,9 +207,13 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(
     struct Cleanup { ShaderCompiler& c; ~Cleanup(){c.Shutdown();} } cleanup{compiler};
     std::map<std::string,std::vector<char>> entries;
     ShaderBootstrapStatistics cooked;
+    // Cooked-game port: the production arguments, whatever development switches the cooking process was started with
+    // (the ReSTIRPT/ tree's ENGINE_RESTIR_PT_* compile switches), so a game's DXIL is the same on every machine.
+    const ShaderCompiler::ProductionArgumentsScope productionArguments;
 
     // NVIDIA SHARC compiles only with its headers deployed beside the shaders (ENGINE_SHARC_ROOT). Without them its
-    // entries are left out, and a packaged game reports SHARC unavailable instead of failing to build.
+    // entries are left out (SHARC itself and ReSTIR PT's SHARC twins), and a packaged game reports SHARC unavailable
+    // instead of failing to build.
     const bool sharcHeaders = std::filesystem::is_regular_file(root / "Sharc" / "SharcCommon.h");
 
     if(!sharcHeaders)
@@ -220,7 +224,10 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(
     // The arguments Load uses at runtime: the source under the shader root, its own directory as the include path.
     for(const PackagedShaderEntry& shader : shaders)
     {
-        if(!sharcHeaders && shader.feature == PackagedShaderFeature::Sharc)
+        const bool sharcEntry = shader.feature == PackagedShaderFeature::Sharc ||
+            shader.feature == PackagedShaderFeature::ReSTIRPTSharc;
+
+        if(!sharcHeaders && sharcEntry)
         {
             continue;
         }
@@ -334,7 +341,7 @@ bool ShaderLibrary::InitializePackaged(std::span<const std::byte> payload)
     m_packaged = true; m_shaderRoot.clear(); m_packagedBytecode.clear();
     try
     {
-        if(payload.size()>MaximumBootstrapBytes) throw std::runtime_error("Shader bundle exceeds 64 MiB.");
+        if(payload.size()>MaximumBootstrapBytes) throw std::runtime_error("Shader bundle exceeds " + std::to_string(MaximumBootstrapBytes / (1024 * 1024)) + " MiB.");
         size_t cursor=0;
         const auto get=[&]() { if(payload.size()-cursor<4) throw std::runtime_error("Truncated shader bundle."); std::uint32_t v=0; for(int i=0;i<4;++i) v|=std::uint32_t(payload[cursor++])<<(8*i); return v; };
         if(get()!=0x31424853 || get()!=1) throw std::runtime_error("Unsupported shader bootstrap format.");

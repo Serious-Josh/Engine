@@ -453,6 +453,10 @@ class Engine
     // Builds the game startup scene from its saved file (see ResolveBuildStartupScene). A dirty
     // active startup scene is refused, setting *startupSceneUnsaved, unless saveStartupScene asks
     // to save it first through the File > Save service; unsaved edits are never packaged.
+    // Cooked-game port (audit G9): a Local Level's startup scene copy gets the environment the Editor shows it with
+    // (ResolveSceneEnvironment with its owning World), every group stored and overridden, because a packaged game reads
+    // only the cooked scene's own values and never its World. The saved scene file is not changed.
+    void CookEffectiveEnvironment(SceneDocument& document) const;
     bool StartBuildGame(BuildGame::Settings, std::string&, bool saveStartupScene = false,
         bool* startupSceneUnsaved = nullptr);
 

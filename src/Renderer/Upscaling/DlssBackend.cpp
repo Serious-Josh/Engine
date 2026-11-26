@@ -594,7 +594,7 @@ DlssBackend::InitializationOutcome DlssBackend::RunInitialize(ID3D12Device* devi
     if(!request.rayReconstructionPermitted)
     {
         rayReconstruction.availability = DlssRayReconstructionAvailability::NotPermitted;
-        rayReconstruction.detail = "Ray Reconstruction is Editor-only: its runtime is not redistributed with packaged games.";
+        rayReconstruction.detail = "Ray Reconstruction is turned off in this process.";
     }
     else
     {
@@ -611,7 +611,7 @@ DlssBackend::InitializationOutcome DlssBackend::RunInitialize(ID3D12Device* devi
     if(!request.frameGenerationPermitted)
     {
         frameGeneration.availability = DlssFrameGenerationAvailability::NotPermitted;
-        frameGeneration.detail = "Frame Generation starts in the Editor viewport; packaged games get it in a later stage.";
+        frameGeneration.detail = "Frame Generation is turned off in this process.";
     }
     else
     {

@@ -131,15 +131,49 @@ namespace
         {"NrdPathTracePreparePsr.hlsl", "CSPrepareHybrid", Compute, Feature::PrimarySurfaceReplacement},
         {"NrdPathTracePreparePsr.hlsl", "CSResolveDenoisedHybrid", Compute, Feature::PrimarySurfaceReplacement},
 
-        // SHARC: NVIDIA SHARC's clear, resolve and statistics passes (SharcCache::EnsurePipelines), cooked as DXIL.
+        // SHARC: NVIDIA SHARC's clear, resolve, statistics and region invalidation passes (SharcCache::EnsurePipelines),
+        // cooked as DXIL. SharcCache creates all six or none, so a missing row turns SHARC (and PSR, which renders on the
+        // PSR + SHARC path) off in packaged games: keep this list in step with EnsurePipelines.
         {"SharcNv/SharcNvResolve.hlsl", "CSClear", Compute, Feature::Sharc},
         {"SharcNv/SharcNvResolve.hlsl", "CSClearStatistics", Compute, Feature::Sharc},
         {"SharcNv/SharcNvResolve.hlsl", "CSAccumulationStatistics", Compute, Feature::Sharc},
         {"SharcNv/SharcNvResolve.hlsl", "CSResolve", Compute, Feature::Sharc},
         {"SharcNv/SharcNvResolve.hlsl", "CSResolvedStatistics", Compute, Feature::Sharc},
+        {"SharcNv/SharcNvResolve.hlsl", "CSInvalidateRegions", Compute, Feature::Sharc},
 
         // DLSS: the input preparation every DLSS frame records (Renderer::RecordRenderFrame, DlssInputPreparationPass).
         {"DlssInputPreparation.hlsl", "CSMain", Compute, Feature::Dlss},
+
+        // Cooked-game port: DLSS Ray Reconstruction's input preparation (RrInputPreparationPass) and its PSR variant.
+        {"RrInputPreparation.hlsl", "CSMain", Compute, Feature::RayReconstruction},
+        {"RrInputPreparationPsr.hlsl", "CSMain", Compute, Feature::RayReconstruction},
+
+        // Cooked-game port: ReSTIR PT Enhanced's production pipelines (ReSTIRPTPass's PipelineSources and
+        // LayeredPipelineSources rows marked production), base tier then the OpenPBR layered tier, and the SHARC twins of
+        // its kernels. Keep these in step with those tables: a missing row makes ReSTIR PT unavailable in packaged games.
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounce.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialReGIR.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtSpatialResampleCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtLightTiles.hlsl", "main", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtReGIRLights.hlsl", "main", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounceLayered.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialReGIRLayered.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialLayered.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialLayered.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialLayered.hlsl", "RestirPtSpatialResampleCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounceSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReGIRSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialSharc.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialSharc.hlsl", "RestirPtSpatialResampleCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounceLayeredSharc.hlsl", "RestirPtInitialCS", Compute,
+            Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReGIRLayeredSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialLayeredSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialLayeredSharc.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialLayeredSharc.hlsl", "RestirPtSpatialResampleCS", Compute, Feature::ReSTIRPTSharc},
 
         // R1.2b: EditorMistPass's haze core (Initialize) and its production Gaussian filter (EnsureFilterPipeline). The mist
         // stages (EnsureMistPipelines) are Feature::Air below; the froxel diagnostics stay unpackaged.
@@ -250,6 +284,12 @@ const char* PackagedShaderFeatureName(PackagedShaderFeature feature)
         return "SHARC";
     case Feature::Dlss:
         return "DLSS";
+    case Feature::RayReconstruction:
+        return "DLSS Ray Reconstruction";
+    case Feature::ReSTIRPT:
+        return "ReSTIR PT Enhanced";
+    case Feature::ReSTIRPTSharc:
+        return "ReSTIR PT Enhanced with SHARC";
     case Feature::Volumetrics:
         return "volumetrics";
     case Feature::Air:

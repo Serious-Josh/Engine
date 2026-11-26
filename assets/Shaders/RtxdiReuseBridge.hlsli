@@ -22,7 +22,8 @@
 
 struct RAB_Material
 {
-    uint model;
+    // The material's optional-lobe set (GPUMaterial::lobeFlags): coated, fuzzy or filmed surfaces pair only with alike.
+    uint lobeFlags;
     float roughness;
     float metallic;
 };
@@ -30,17 +31,17 @@ struct RAB_Material
 RAB_Material RAB_GetMaterial(RAB_Surface surface)
 {
     RAB_Material material;
-    material.model = surface.surface.material.model;
+    material.lobeFlags = surface.surface.material.lobeFlags;
     material.roughness = surface.surface.material.roughness;
     material.metallic = surface.surface.material.metallic;
     return material;
 }
 
-// Approved Gate 4 similarity: the same material model, roughness and metallic each within 0.5. Under ray-traced
+// Approved Gate 4 similarity: the same optional lobes, roughness and metallic each within 0.5. Under ray-traced
 // bias correction this only selects neighbors; it never biases the estimate.
 bool RAB_AreMaterialsSimilar(RAB_Material first, RAB_Material second)
 {
-    return first.model == second.model && abs(first.roughness - second.roughness) <= 0.5f &&
+    return first.lobeFlags == second.lobeFlags && abs(first.roughness - second.roughness) <= 0.5f &&
         abs(first.metallic - second.metallic) <= 0.5f;
 }
 

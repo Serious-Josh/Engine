@@ -40,7 +40,7 @@ std::set<std::string> CollectReferencedMaterialIDs(const CookedScene::ArchiveSce
 void ValidateAdmittedMaterial(const Material& material,
                               const ProjectMaterialPreparationService::Candidate& preparedMaterial)
 {
-    RequireArchiveAdmission(material.model == preparedMaterial.parameters.model &&
+    RequireArchiveAdmission(material.metallic == preparedMaterial.parameters.metallic &&
                                 material.roughness == preparedMaterial.parameters.roughness,
                             "Archived material parameters differ from admitted material.");
     const Texture* admittedTextures[] = {

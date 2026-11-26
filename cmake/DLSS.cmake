@@ -224,8 +224,8 @@ function(engine_deploy_dlss target)
     )
 endfunction()
 
-# RR.1A: copies the production DLSS Ray Reconstruction runtime next to the Editor executable. Never called for EngineRuntime,
-# whose directory Build Game deploys games from (RR is Editor-only until its redistribution terms are confirmed).
+# RR.1A: copies the production DLSS Ray Reconstruction runtime next to an executable that initializes DLSS: the Editor and
+# (cooked-game port) EngineRuntime, whose directory Build Game deploys games from.
 function(engine_deploy_dlss_rr target)
     if(NOT ENGINE_DLSS_RR_AVAILABLE)
         return()
@@ -233,13 +233,13 @@ function(engine_deploy_dlss_rr target)
 
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ENGINE_DLSS_RR_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"
-        COMMENT "Deploying NVIDIA DLSS Ray Reconstruction runtime for ${target} (Editor only)"
+        COMMENT "Deploying NVIDIA DLSS Ray Reconstruction runtime for ${target}"
         VERBATIM
     )
 endfunction()
 
-# FG.1: copies the production DLSS Frame Generation runtime next to the Editor executable. Not called for EngineRuntime until
-# packaged games get Frame Generation.
+# FG.1: copies the production DLSS Frame Generation runtime next to an executable that initializes DLSS: the Editor and
+# (cooked-game port) EngineRuntime.
 function(engine_deploy_dlss_fg target)
     if(NOT ENGINE_DLSS_FG_AVAILABLE)
         return()
@@ -247,7 +247,7 @@ function(engine_deploy_dlss_fg target)
 
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ENGINE_DLSS_FG_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"
-        COMMENT "Deploying NVIDIA DLSS Frame Generation runtime for ${target} (Editor only)"
+        COMMENT "Deploying NVIDIA DLSS Frame Generation runtime for ${target}"
         VERBATIM
     )
 endfunction()

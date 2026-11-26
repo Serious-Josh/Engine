@@ -60,8 +60,9 @@ bool CornellBoxScene::Initialize(
     pipelineDescription.rootParameters.push_back(
         {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_ALL});
 
+    // ObjectConstants: the pixel shader reads the model matrix too (Triangle.hlsl's primary surface lift scale).
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
+        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_ALL});
 
     pipelineDescription.depthEnabled = true;
     pipelineDescription.mirroredWindingVariant = true;
@@ -98,7 +99,6 @@ bool CornellBoxScene::Initialize(
 
     m_defaultMaterial.texture = &m_whiteTexture;
 
-    m_defaultMaterial.model = MaterialModel::Dielectric;
 
     m_defaultMaterial.roughness = 0.7f;
     m_defaultMaterial.ior = 1.5f;
@@ -276,7 +276,6 @@ bool CornellBoxScene::Initialize(
     m_brickMaterial.armTexture = &m_brickARMTexture;
 
     m_brickMaterial.preferARM = true;
-    m_brickMaterial.model = MaterialModel::MetallicRoughness;
     m_brickMaterial.roughness = 1.0f;
     m_brickMaterial.metallic = 0.0f;
 

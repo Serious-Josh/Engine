@@ -11,13 +11,37 @@ namespace MaterialParameterPropagation
 {
     inline void Apply(Material& material, const MaterialAssetData& data) noexcept
     {
-        material.model = data.model;
         std::copy(data.baseColor.begin(), data.baseColor.end(), material.baseColor);
-        std::copy(data.conductorN.begin(), data.conductorN.end(), material.conductorN);
-        std::copy(data.conductorK.begin(), data.conductorK.end(), material.conductorK);
-        material.roughness = data.roughness;
+        material.baseWeight = data.baseWeight;
         material.metallic = data.metallic;
+        material.diffuseRoughness = data.diffuseRoughness;
+
+        material.roughness = data.roughness;
         material.ior = data.ior;
+        material.specularWeight = data.specularWeight;
+        std::copy(data.specularColor.begin(), data.specularColor.end(), material.specularColor);
+        material.anisotropy = data.anisotropy;
+        // The asset stores degrees; the shaders rotate the tangent by radians.
+        material.anisotropyRotation = data.anisotropyRotationDegrees * (3.14159265358979323846f / 180.0f);
+
+        material.coatWeight = data.coatWeight;
+        std::copy(data.coatColor.begin(), data.coatColor.end(), material.coatColor);
+        material.coatRoughness = data.coatRoughness;
+        material.coatIor = data.coatIor;
+        material.coatDarkening = data.coatDarkening;
+        material.coatFollowsBaseNormal = data.coatFollowsBaseNormal;
+
+        material.fuzzWeight = data.fuzzWeight;
+        std::copy(data.fuzzColor.begin(), data.fuzzColor.end(), material.fuzzColor);
+        material.fuzzRoughness = data.fuzzRoughness;
+
+        material.thinFilmWeight = data.thinFilmWeight;
+        material.thinFilmThickness = data.thinFilmThickness;
+        material.thinFilmIor = data.thinFilmIor;
+
+        material.aoDiffuse = data.aoDiffuse;
+        material.aoSpecularWeight = data.aoSpecularWeight;
+
         material.surfaceDetailMode = data.surfaceDetailMode;
 
         material.heightScale = data.heightScale;
@@ -58,26 +82,9 @@ namespace MaterialParameterPropagation
             Material candidate = *target;
             Apply(candidate, data);
             replacements.push_back(candidate);
-            auto& gpu = table[target->gpuIndex];
-            // Preserve all descriptor fields and the existing GPU layout.
-            gpu.model = static_cast<unsigned int>(candidate.model);
-            gpu.roughness = candidate.roughness;
-            gpu.metallic = candidate.metallic;
-            gpu.ior = candidate.ior;
-
-            gpu.surfaceDetailMode = static_cast<unsigned int>(candidate.surfaceDetailMode);
-            gpu.heightScale = candidate.heightScale;
-            gpu.heightBias = candidate.heightBias;
-            gpu.preferARM = candidate.preferARM ? 1u : 0u;
-
-            for(size_t component = 0; component < 3; ++component)
-            {
-                gpu.baseColor[component] = candidate.baseColor[component];
-                gpu.conductorN[component] = candidate.conductorN[component];
-                gpu.conductorK[component] = candidate.conductorK[component];
-                gpu.averageConductorFresnel[component] = Material::CalculateAverageConductorFresnel(
-                    candidate.conductorN[component], candidate.conductorK[component]);
-            }
+            // Preserve all descriptor fields and the existing GPU layout: only the parameter fields (and their
+            // derived terms) change.
+            candidate.WriteParameters(table[target->gpuIndex]);
         }
 
         if(targets.empty() || !publisher(table))

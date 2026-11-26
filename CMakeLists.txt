@@ -1073,10 +1073,12 @@ engine_deploy_dxc(Engine)
 # runtime too; Build Game ships it only in games whose saved settings can use DLSS (BuildGame.cpp DeployRuntimeFiles).
 engine_deploy_dlss(Engine)
 engine_deploy_dlss(EngineRuntime)
-# RR.1A: DLSS Ray Reconstruction's runtime beside the Editor only (never EngineRuntime, Build Game's source).
+# RR.1A, cooked-game port: DLSS Ray Reconstruction's and Frame Generation's runtimes beside both executables. Build Game
+# ships each from EngineRuntime's directory only in games whose saved settings use it (BuildGame.cpp DeployRuntimeFiles).
 engine_deploy_dlss_rr(Engine)
-# FG.1: DLSS Frame Generation's runtime beside the Editor only, until packaged games get Frame Generation.
+engine_deploy_dlss_rr(EngineRuntime)
 engine_deploy_dlss_fg(Engine)
+engine_deploy_dlss_fg(EngineRuntime)
 # Both executables start audio. The Editor uses FMOD's logging DLLs in Debug; EngineRuntime, whose directory Build Game
 # deploys games from, always uses the production DLLs (cmake/FMOD.cmake, ENGINE_FMOD_LOGGING).
 set_target_properties(Engine PROPERTIES ENGINE_FMOD_LOGGING ON)

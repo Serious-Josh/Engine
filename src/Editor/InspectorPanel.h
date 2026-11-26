@@ -216,6 +216,7 @@ private:
         const ProjectAssetRegistry& registry,
         bool overwriteConflict);
     void DrawMaterial(const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void DrawMetalPresets(MaterialAssetData& material);
     enum class TextureSlot { BaseColor, Normal, Roughness, Metallic, ARM, AO, Height };
     struct TexturePickerIdentity
     {
@@ -307,6 +308,9 @@ private:
     unsigned int m_texturePickerGeneration = 0;
     unsigned int m_previewTextureRefresh = 0;
     std::array<char, 128> m_textureSearch{};
+    // The Metal preset popup's complex IOR (n, k) input, kept between openings (copper by default).
+    std::array<float, 3> m_metalComplexIorN{0.200f, 0.924f, 1.102f};
+    std::array<float, 3> m_metalComplexIorK{3.912f, 2.452f, 2.142f};
 
     std::vector<AssetRecord> m_texturePickerRegistry;
     std::vector<AssetRecord> m_textureChoices;

@@ -54,7 +54,7 @@ bool PsrRasterEligible(uint2 pixel, float depth, float4 material, float4 surface
         return false;
     }
 
-    return vertex.surface.deltaSpecular && vertex.surface.specularProbability >= 1.0f;
+    return vertex.surface.deltaSpecular && vertex.surface.deltaProbability >= 1.0f;
 }
 
 #endif

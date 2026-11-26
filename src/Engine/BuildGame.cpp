@@ -1056,37 +1056,58 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
     // without one DLSS is never eligible). NGX loads nvngx_dlss.dll from beside the executable. The runtime directory
     // holds the SDK's production lib/Windows_x86_64/rel copy (engine_deploy_dlss(EngineRuntime)); the watermarked
     // development DLL is never deployed there. A game that requests DLSS is never built without its runtime.
+    // Cooked-game port: Ray Reconstruction (nvngx_dlssd.dll) and Frame Generation (nvngx_dlssg.dll) ship the same way,
+    // each only when the saved settings select it (user decision 2026-11-26). NGX initializes only with the Super
+    // Resolution runtime beside the executable, so either one also ships nvngx_dlss.dll.
     const RenderingSettings& rendering = request.projectSettings.rendering;
-
-    // RR.1D: Ray Reconstruction is Editor-only (its runtime is never deployed); the packaged game renders NRD Hybrid.
-    if(rendering.pathTracing.denoiser == ProjectPathTraceDenoiser::DlssRayReconstruction)
-    {
-        Log::Info("Build Game: the project selects DLSS Ray Reconstruction (experimental, Editor only); the packaged game "
-            "renders NRD Hybrid and nvngx_dlssd.dll is not deployed.");
-    }
-
-    if(rendering.pathTracing.estimator == ProjectPathTraceEstimator::ReSTIRPTEnhanced)
-    {
-        Log::Info("Build Game: the project selects ReSTIR PT Enhanced (M5, experimental, Editor only); the packaged game "
-            "renders ReSTIR DI.");
-    }
-
-    const bool dlssUsable = rendering.lightingMode == ProjectLightingMode::PathTracing && rendering.pathTracing.dlss &&
+    const bool pathTracing = rendering.lightingMode == ProjectLightingMode::PathTracing;
+    const bool rayReconstructionSelected = pathTracing &&
+        rendering.pathTracing.denoiser == ProjectPathTraceDenoiser::DlssRayReconstruction;
+    const bool frameGenerationSelected = rendering.frameGeneration.enabled;
+    const bool superResolutionSelected = pathTracing && rendering.pathTracing.dlss &&
         rendering.pathTracing.denoiser != ProjectPathTraceDenoiser::Off;
+    const bool dlssUsable = superResolutionSelected || rayReconstructionSelected || frameGenerationSelected;
+
+    if(pathTracing && rendering.pathTracing.estimator == ProjectPathTraceEstimator::ReSTIRPTEnhanced)
+    {
+        Log::Info("Build Game: the project selects ReSTIR PT Enhanced (experimental); the packaged game renders it from "
+            "its cooked production kernels.");
+    }
+
+    // One NGX runtime: required when a selected feature needs it, named in the failure, and deployed beside the game.
+    const auto deployDlssRuntime = [&](const char* fileName, const std::string& feature)
+    {
+        const fs::path runtime = request.runtimeDirectory / fileName;
+        Require(fs::is_regular_file(runtime) && !IsReparsePoint(runtime),
+            "Project Settings enable " + feature + ", but the runtime directory has no " + fileName + " (EngineRuntime "
+            "was built without it from the NVIDIA DLSS SDK). Turn " + feature + " off in Project Settings, or build "
+            "EngineRuntime with the SDK.");
+
+        copyRuntimeFile(runtime, fileName);
+        deploymentFiles.emplace_back(fileName);
+    };
 
     if(dlssUsable)
     {
-        const fs::path dlssRuntime = request.runtimeDirectory / "nvngx_dlss.dll";
-        Require(fs::is_regular_file(dlssRuntime) && !IsReparsePoint(dlssRuntime),
-            "Project Settings enable DLSS, but the runtime directory has no nvngx_dlss.dll (EngineRuntime was built "
-            "without the NVIDIA DLSS SDK). Turn DLSS off in Project Settings, or build EngineRuntime with the SDK.");
+        deployDlssRuntime("nvngx_dlss.dll", superResolutionSelected ? "DLSS" :
+            rayReconstructionSelected ? "DLSS Ray Reconstruction" : "DLSS Frame Generation");
+        std::string deployed = "NVIDIA DLSS Super Resolution (nvngx_dlss.dll)";
 
-        copyRuntimeFile(dlssRuntime, "nvngx_dlss.dll");
-        deploymentFiles.emplace_back("nvngx_dlss.dll");
+        if(rayReconstructionSelected)
+        {
+            deployDlssRuntime("nvngx_dlssd.dll", "DLSS Ray Reconstruction");
+            deployed += ", Ray Reconstruction (nvngx_dlssd.dll)";
+        }
+
+        if(frameGenerationSelected)
+        {
+            deployDlssRuntime("nvngx_dlssg.dll", "DLSS Frame Generation");
+            deployed += ", Frame Generation (nvngx_dlssg.dll)";
+        }
+
         // NVIDIA RTX supplement 7.1(b) and 4 (../DLSS/LICENSE.txt) bind the game's author, not the build.
-        Log::Info("Build Game: deployed NVIDIA DLSS Super Resolution (nvngx_dlss.dll). Its license requires the game "
-            "to attribute the DLSS SDK with the NVIDIA Marks (splash screen, about box, credits) and NVIDIA to be "
-            "notified before commercial release.");
+        Log::Info("Build Game: deployed " + deployed + ". Its license requires the game to attribute the DLSS SDK with "
+            "the NVIDIA Marks (splash screen, about box, credits) and NVIDIA to be notified before commercial release.");
     }
 
     // Audio.1D: FMOD's production runtime (EngineRuntime delay-loads fmod.dll and fmodstudio.dll in every

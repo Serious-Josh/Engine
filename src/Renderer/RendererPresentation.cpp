@@ -93,8 +93,14 @@ namespace
 
 void Renderer::SetFrameGenerationRequested(bool requested)
 {
-    const bool effective = m_frameGenerationRequestForTesting.value_or(requested || IsFrameGenerationForcedForTesting());
-    m_frameGenerationRequested = effective && !m_packagedRuntime;
+    // Cooked-game port: a packaged game follows its saved settings only (no diagnostics override).
+    if(m_packagedRuntime)
+    {
+        m_frameGenerationRequested = requested;
+        return;
+    }
+
+    m_frameGenerationRequested = m_frameGenerationRequestForTesting.value_or(requested || IsFrameGenerationForcedForTesting());
 }
 
 bool Renderer::SetFrameGenerationPresentation(bool enabled)
@@ -102,12 +108,6 @@ bool Renderer::SetFrameGenerationPresentation(bool enabled)
     if(enabled == m_frameGenerationPresentation)
     {
         return true;
-    }
-
-    if(enabled && m_packagedRuntime)
-    {
-        Log::Warning("Frame Generation present path: not available in packaged games yet.");
-        return false;
     }
 
     // Stage 1: nothing in flight on either queue while the swap chain moves between them. Stop presents what was submitted.
@@ -266,7 +266,7 @@ bool Renderer::AcquirePresentationTarget(PresentationTarget& target, bool withGe
 
 bool Renderer::IsFrameGenerationRunning() const
 {
-    return m_frameGenerationRequested && m_frameGenerationPresentation && !m_packagedRuntime &&
+    return m_frameGenerationRequested && m_frameGenerationPresentation &&
         m_dlssBackend.GetStatus().frameGeneration.availability == DlssFrameGenerationAvailability::Available;
 }
 
@@ -287,7 +287,7 @@ bool Renderer::PresentTarget(const PresentationTarget& target)
     {
         generated = target.generatedComposite;
     }
-    else if(!m_frameGenerationRequested && GetFramePresentationTest() != FramePresentationTest::Off)
+    else if(!m_frameGenerationRequested && !m_packagedRuntime && GetFramePresentationTest() != FramePresentationTest::Off)
     {
         generated = m_framePresenter.GetLastSubmittedComposite();
     }
@@ -322,13 +322,9 @@ bool Renderer::CompletePresentation(const PresentationTarget& target)
 
 void Renderer::ApplyFramePresentationRequest()
 {
-    if(m_packagedRuntime)
-    {
-        return;
-    }
-
-    // Stage 1: FG.3, the saved toggle. NGX initializes for it as for a DLSS request (on its own thread, adopted here once
-    // done); the path follows the toggle while Frame Generation is available.
+    // Stage 1: FG.3, the saved toggle (since the cooked-game port, a packaged game's too). NGX initializes for it as for a
+    // DLSS request (on its own thread, adopted here once done); the path follows the toggle while Frame Generation is
+    // available.
     bool wanted = false;
 
     if(m_frameGenerationRequested)
@@ -338,8 +334,9 @@ void Renderer::ApplyFramePresentationRequest()
         wanted = m_dlssBackend.GetStatus().frameGeneration.availability == DlssFrameGenerationAvailability::Available;
     }
 
-    // Stage 2: the FG.2 diagnostics, which also run the path without Frame Generation (stand-in generated frames).
-    const FramePresentationTest test = GetFramePresentationTest();
+    // Stage 2: the FG.2 diagnostics, which also run the path without Frame Generation (stand-in generated frames). Never in
+    // a packaged game.
+    const FramePresentationTest test = m_packagedRuntime ? FramePresentationTest::Off : GetFramePresentationTest();
 
     if(test != FramePresentationTest::Off)
     {
@@ -368,7 +365,7 @@ void Renderer::ApplyFramePresentationRequest()
     {
         // Stage 3: the generated viewport image and the HUD-less copy at the output extent, (re)created between frames once
         // nothing in flight uses the old ones (a viewport resize, or the first Frame Generation frame). A failure is not
-        // retried for the same extent.
+        // retried for the same extent. A packaged game draws no UI over its scene image, so it has no HUD-less copy.
         m_frameGenerationImageAttemptWidth = m_outputWidth;
         m_frameGenerationImageAttemptHeight = m_outputHeight;
         ID3D12Device* const device = m_graphicsDevice.GetDevice();
@@ -379,8 +376,8 @@ void Renderer::ApplyFramePresentationRequest()
             m_frameGenerationOutput.Initialize(device, m_outputWidth, m_outputHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
                 m_rtvDescriptorHeap, m_resourceDescriptorHeap, {0.0f, 0.0f, 0.0f, 1.0f},
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
-            m_frameGenerationHudless.Initialize(device, m_outputWidth, m_outputHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
-                m_rtvDescriptorHeap, m_resourceDescriptorHeap);
+            (m_packagedRuntime || m_frameGenerationHudless.Initialize(device, m_outputWidth, m_outputHeight,
+                DXGI_FORMAT_R8G8B8A8_UNORM, m_rtvDescriptorHeap, m_resourceDescriptorHeap));
 
         m_frameGenerationImagesFailed = !created;
 
@@ -568,6 +565,45 @@ bool Renderer::RecordFrameGeneration(ID3D12GraphicsCommandList* commandList, uns
 
     m_frameGenerationResetPending = false;
     return true;
+}
+
+void Renderer::RecordPackagedPresentationCopy(ID3D12GraphicsCommandList* commandList, const PresentationTarget& target)
+{
+    // The real frame: the finished scene image into the target, back in RENDER_TARGET for the rest of the frame.
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = target.resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    commandList->ResourceBarrier(1, &barrier);
+    m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commandList->CopyResource(target.resource, m_finalSceneColor.GetResource());
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    commandList->ResourceBarrier(1, &barrier);
+    m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // The generated frame, when this recording rendered one: its image into its composite, which idles in COPY_SOURCE for
+    // the present thread. The Editor draws its UI over the generated image instead (RecordGeneratedFrameUi); a packaged
+    // game has no UI to draw.
+    if(!target.generatedRecorded || !target.generatedResource)
+    {
+        return;
+    }
+
+    barrier.Transition.pResource = target.generatedResource;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    commandList->ResourceBarrier(1, &barrier);
+    m_frameGenerationOutput.Transition(commandList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commandList->CopyResource(target.generatedResource, m_frameGenerationOutput.GetResource());
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    commandList->ResourceBarrier(1, &barrier);
+    m_frameGenerationOutput.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 void Renderer::RecordGeneratedFrameUi(ID3D12GraphicsCommandList* commandList, const PresentationTarget& target,

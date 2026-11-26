@@ -17,12 +17,28 @@
 
 namespace
 {
+    // Cooked-game port (2026-11-26): while an offline cook compiles on this thread (ShaderCompiler::ProductionArgumentsScope),
+    // the ReSTIRPT/ tree's development switches read no environment variable, so a packaged game's DXIL never depends on the
+    // environment the Editor ran Build Game in.
+    thread_local bool t_productionArguments = false;
+
+    // A development switch's environment value, or null while a production scope is active on this thread.
+    const char* DevelopmentSwitch(const char* name)
+    {
+        if(t_productionArguments)
+        {
+            return nullptr;
+        }
+
+        return std::getenv(name);
+    }
+
     // The adaptive light sampler (default since the user decision of 2026-11-23): the ReSTIRPT/ tree compiles with
     // RESTIR_PT_LIST_PROTOTYPE (per-receiver light-grid list proposals in the ReGIR kernel) unless
     // ENGINE_RESTIR_PT_LIST_PROTOTYPE=0.
     bool UsesListPrototype(const std::filesystem::path& shaderPath)
     {
-        const char* value = std::getenv("ENGINE_RESTIR_PT_LIST_PROTOTYPE");
+        const char* value = DevelopmentSwitch("ENGINE_RESTIR_PT_LIST_PROTOTYPE");
 
         if(value != nullptr && std::string(value) == "0")
         {
@@ -38,30 +54,6 @@ namespace
         }
 
         return false;
-    }
-
-    // The SHARC radiance cache at x3 in ReSTIR PT: compiled into the ReSTIRPT/ tree (RESTIR_PT_SHARC, with native 16-bit
-    // types for NVIDIA SHARC's packed fp16 data) once the Renderer has found NVIDIA SHARC usable on this device and build
-    // (ShaderCompiler::SetRestirPtSharc, before ReSTIR PT's pipelines are created).
-    std::atomic<bool> g_restirPtSharc{false};
-
-    void AddRestirPtSharcArguments(const std::filesystem::path& shaderPath, std::vector<const wchar_t*>& arguments)
-    {
-        if(!g_restirPtSharc.load(std::memory_order_relaxed))
-        {
-            return;
-        }
-
-        for(const std::filesystem::path& component : shaderPath)
-        {
-            if(component == "ReSTIRPT")
-            {
-                arguments.push_back(L"-enable-16bit-types");
-                arguments.push_back(L"-D");
-                arguments.push_back(L"RESTIR_PT_SHARC=1");
-                return;
-            }
-        }
     }
 
     std::filesystem::path DependencyPath(const wchar_t* path)
@@ -434,8 +426,6 @@ bool ShaderCompiler::Compile(
         arguments.push_back(L"RESTIR_PT_LIST_PROTOTYPE=1");
     }
 
-    AddRestirPtSharcArguments(description.path, arguments);
-
     // Shader variants (ShaderVariants) compile from their generated text instead of a file.
     const std::optional<VariantSource> variant = FindVariantSource(description.path, description.shaderRoot);
 
@@ -689,8 +679,6 @@ bool ShaderCompiler::CompileLibrary(
         arguments.push_back(L"RESTIR_PT_LIST_PROTOTYPE=1");
     }
 
-    AddRestirPtSharcArguments(description.path, arguments);
-
     std::error_code sameDirectoryError;
 
     // Root-level libraries keep exactly their original arguments.
@@ -888,22 +876,37 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
     return ShaderLibraryProfile::Library66;
 }
 
-void ShaderCompiler::SetRestirPtSharc(bool available)
+ShaderCompiler::ProductionArgumentsScope::ProductionArgumentsScope() :
+    m_previous(t_productionArguments)
 {
-    g_restirPtSharc.store(available, std::memory_order_relaxed);
+    t_productionArguments = true;
+}
+
+ShaderCompiler::ProductionArgumentsScope::~ProductionArgumentsScope()
+{
+    t_productionArguments = m_previous;
 }
 
 bool ShaderCompiler::UsesNative16BitTypes(const std::filesystem::path& shaderPath)
 {
+    bool restirPtTree = false;
+
     for(const std::filesystem::path& component : shaderPath)
     {
         if(component == "SharcNv")
         {
             return true;
         }
+
+        if(component == "ReSTIRPT")
+        {
+            restirPtTree = true;
+        }
     }
 
-    return false;
+    // Cooked-game port: ReSTIR PT's SHARC twins (ShaderVariantTable.inl, "ReSTIRPT/...Sharc.hlsl") read and write NVIDIA
+    // SHARC's packed fp16 data like its own shaders.
+    return restirPtTree && shaderPath.stem().wstring().ends_with(L"Sharc");
 }
 
 bool ShaderCompiler::UsesStrictFloatingPoint(const std::filesystem::path& shaderPath)
@@ -912,7 +915,7 @@ bool ShaderCompiler::UsesStrictFloatingPoint(const std::filesystem::path& shader
     // Tri-Test -7.9 ms; gates pass, no visible difference). ENGINE_RESTIR_PT_STRICT_FP=1 restores strict IEEE for
     // diagnostics and comparisons (the M5.1 exact-identity tests need it). The persistent cache keys on the arguments, so
     // the two variants never mix.
-    const char* const strict = std::getenv("ENGINE_RESTIR_PT_STRICT_FP");
+    const char* const strict = DevelopmentSwitch("ENGINE_RESTIR_PT_STRICT_FP");
 
     if(strict == nullptr || std::string(strict) != "1")
     {
@@ -937,7 +940,7 @@ bool ShaderCompiler::UsesDiagnosticCounters(const std::filesystem::path& shaderP
     // The persistent cache keys on the arguments.
     const auto requested = [](const char* name)
     {
-        const char* value = std::getenv(name);
+        const char* value = DevelopmentSwitch(name);
         return value != nullptr && std::string(value) == "1";
     };
 
@@ -960,7 +963,7 @@ bool ShaderCompiler::UsesDiagnosticCounters(const std::filesystem::path& shaderP
 bool ShaderCompiler::DisablesSmallLightPath(const std::filesystem::path& shaderPath)
 {
     // Audit T1-b: the small-light NEE path (RestirPtInitialBody.hlsli) is on unless ENGINE_RESTIR_PT_SMALL_LIGHTS=0.
-    const char* value = std::getenv("ENGINE_RESTIR_PT_SMALL_LIGHTS");
+    const char* value = DevelopmentSwitch("ENGINE_RESTIR_PT_SMALL_LIGHTS");
 
     if(value == nullptr || std::string(value) != "0")
     {
@@ -983,7 +986,7 @@ bool ShaderCompiler::UsesUnfusedBsdf(const std::filesystem::path& shaderPath)
     // M5.6 B3a: the ReSTIRPT/ tree compiles with RESTIR_PT_UNFUSED_BSDF (the pre-B3a evaluation: production unchanged)
     // unless ENGINE_RESTIR_PT_FUSED_BSDF=1 selects the fused evaluation (B3a measured no gain beyond process variance;
     // awaiting review). The persistent cache keys on the arguments.
-    const char* const fused = std::getenv("ENGINE_RESTIR_PT_FUSED_BSDF");
+    const char* const fused = DevelopmentSwitch("ENGINE_RESTIR_PT_FUSED_BSDF");
 
     if(fused != nullptr && std::string(fused) == "1")
     {

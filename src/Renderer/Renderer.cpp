@@ -2941,11 +2941,12 @@ bool Renderer::Initialize(
     m_dlssPublishedState.clear();
     m_dlssPublishedDetail.clear();
     m_packagedRuntime = !packagedShaders.empty();
-    // RR.1A: Ray Reconstruction is Editor-only (its runtime is never deployed with packaged games); a packaged run reports
-    // it NotPermitted without querying NGX for it.
-    m_dlssBackend.SetRayReconstructionPermitted(!m_packagedRuntime);
-    // FG.1: Frame Generation starts in the Editor viewport; packaged games get it in a later stage.
-    m_dlssBackend.SetFrameGenerationPermitted(!m_packagedRuntime);
+    // Cooked-game port: Ray Reconstruction runs in packaged games too (Build Game deploys nvngx_dlssd.dll beside the
+    // game when the project selects it, user decision 2026-11-26), so NGX is queried for it there as in the Editor.
+    m_dlssBackend.SetRayReconstructionPermitted(true);
+    // FG.1, cooked-game port: Frame Generation too (nvngx_dlssg.dll ships when the saved settings enable it; a packaged
+    // frame generates from its offscreen final image, RecordPackagedPresentationCopy).
+    m_dlssBackend.SetFrameGenerationPermitted(true);
     m_projectWorkflowStart = projectWorkflowStart && !m_packagedRuntime;
     // PS.5C: the worker's private shader library for the PSR auxiliary pipelines reads the same cooked bootstrap.
     m_packagedShaderPayload = m_packagedRuntime ?
@@ -3327,11 +3328,14 @@ bool Renderer::Initialize(
     // estimator variants. ENGINE_RESTIR_PT_RIS=0 (one light-tile candidate), _RESERVOIR=0 (every candidate accumulated),
     // _NORMALIZATION=onem (the Q-2 counter-hypothesis), _ISOLATE=direct|indirect, _CANDIDATES=<primary RIS candidates>,
     // _ROULETTE=production|never|<paper vertex>, _DEBUG_VIEW=<n>, _COUNTERS=1.
-    if(!m_packagedRuntime)
+    // Cooked-game port: many production defaults are set here rather than in ReSTIRPTSettings (spatial reuse, for one), so
+    // a packaged game runs the same block with every switch read as unset. It then renders the Editor's defaults and only
+    // the production kernels Build Game cooks (ReSTIRPTPass's PipelineSource::production).
     {
-        const auto environment = [](const char* name)
+        const bool developmentSwitches = !m_packagedRuntime;
+        const auto environment = [developmentSwitches](const char* name)
         {
-            const char* value = std::getenv(name);
+            const char* value = developmentSwitches ? std::getenv(name) : nullptr;
             return std::string(value ? value : "");
         };
         const std::string ris = environment("ENGINE_RESTIR_PT_RIS");
@@ -3482,10 +3486,9 @@ bool Renderer::Initialize(
         m_restirPtUiRegirSpotTarget = m_restirPtSettings.regirSpotTarget;
         m_debugUI.SetRestirPtRegirSpotTarget(m_restirPtUiRegirSpotTarget);
         // ReGIR architecture investigation (experimental): the list prototype's switch (on when compiled in).
-        const char* listPrototype = std::getenv("ENGINE_RESTIR_PT_LIST_PROTOTYPE");
-        const bool listAvailable = !(listPrototype && std::string(listPrototype) == "0");
+        const bool listAvailable = environment("ENGINE_RESTIR_PT_LIST_PROTOTYPE") != "0";
 
-        if(const char* start = std::getenv("ENGINE_RESTIR_PT_LIST_START"); start && std::string(start) == "off")
+        if(environment("ENGINE_RESTIR_PT_LIST_START") == "off")
         {
             m_restirPtSettings.regirListPrototype = false;
         }
@@ -7357,8 +7360,8 @@ void Renderer::EvaluatePathTraceReSTIRDI()
 }
 
 // M5.1 ReSTIR PT Enhanced (configuration B): the raster-primary prerequisites and the ReSTIR DI mode's primary pipeline
-// (configuration B records its G-buffer path, targets and denoisers), then its own pass. Editor-only: a packaged runtime
-// never makes it available (its shaders are not cooked).
+// (configuration B records its G-buffer path, targets and denoisers), then its own pass. Packaged games run it from the
+// cooked production kernels (PackagedShaderInventory's ReSTIR PT rows).
 void Renderer::EvaluatePathTraceReSTIRPT()
 {
     EvaluatePathTraceRasterPrimary();
@@ -7366,12 +7369,7 @@ void Renderer::EvaluatePathTraceReSTIRPT()
     const PathTraceModeAvailability previous = status;
     std::string pipelineFailure;
 
-    if(m_packagedRuntime)
-    {
-        status = {PathTraceRasterPrimaryAvailability::Unavailable,
-            "ReSTIR PT Enhanced is Editor-only (experimental); packaged games render ReSTIR DI."};
-    }
-    else if(m_rasterPrimaryStatus.rasterPrimary.availability != PathTraceRasterPrimaryAvailability::Available)
+    if(m_rasterPrimaryStatus.rasterPrimary.availability != PathTraceRasterPrimaryAvailability::Available)
     {
         status = {PathTraceRasterPrimaryAvailability::Unavailable, m_rasterPrimaryStatus.rasterPrimary.reason};
     }
@@ -7461,12 +7459,14 @@ static const ReGIRListMode& ReGIRListModeFromEnvironment()
     return mode;
 }
 
-static bool ReGIRListPrototype()
+// packaged: a packaged game's cooked kernels always have the adaptive sampler compiled in (ShaderCompiler's
+// ProductionArgumentsScope), so the switch is not read there.
+static bool ReGIRListPrototype(bool packaged)
 {
-    static const bool enabled = []
+    static const bool enabled = [packaged]
     {
         // Default on (user decision 2026-11-23); ENGINE_RESTIR_PT_LIST_PROTOTYPE=0 compiles the adaptive sampler out.
-        const char* value = std::getenv("ENGINE_RESTIR_PT_LIST_PROTOTYPE");
+        const char* value = packaged ? nullptr : std::getenv("ENGINE_RESTIR_PT_LIST_PROTOTYPE");
         return !(value && std::string(value) == "0");
     }();
     return enabled;
@@ -7657,7 +7657,7 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
             m_restirPtSettings.regirWindow, (m_restirPtSettings.regirCone ? 1u : 0u) |
             (m_restirPtSettings.regirDirectFetch ? 2u : 0u) | (m_restirPtSettings.regirExactProposal ? 4u : 0u) |
             (m_restirPtSettings.regirSpotTarget ? 8u : 0u) |
-            (ReGIRListPrototype() && m_restirPtSettings.regirListPrototype ? 16u : 0u) |
+            (ReGIRListPrototype(m_packagedRuntime) && m_restirPtSettings.regirListPrototype ? 16u : 0u) |
             (ReGIRStratifiedExperiment() ? 32u : 0u),
             m_restirPtSettings.regirSlots);
 
@@ -7765,7 +7765,7 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         return value && std::string(value) == "bonly" ? 2048u : 0u;
     }();
     constants.regirPadding[0] = (regirExact ? 1u : 0u) | (pncLog ? 2u : 0u) |
-        (ReGIRListPrototype() && m_restirPtSettings.regirListPrototype ? listModeBits : 0u) |
+        (ReGIRListPrototype(m_packagedRuntime) && m_restirPtSettings.regirListPrototype ? listModeBits : 0u) |
         (m_restirPtSettings.mirrorChainX1Sampling ? mirrorChainX1Bit : 0u) | lightBounceTestBits;
 
     // The SHARC radiance cache: this frame's, resolved before configuration B's kernels (sharcCapacity 0: none).
@@ -7909,6 +7909,10 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     }
 
     m_restirPtPass.PrepareInitialPass(commandList);
+    // OpenPBR tiers: the layered kernels only while this frame's material table has a coat, fuzz, thin film or
+    // anisotropic material (prepared on first need).
+    UpdateReSTIRPTLayeredPipelines();
+    m_restirPtPass.SetLayeredMaterials(m_materialPublication.layeredLobes);
     m_pathTraceReferencePass.ExecuteReSTIRPT(commandList, m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap,
         m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight,
         m_restirPtPass.GetInitialPipeline(m_restirPtSettings, temporalPass), address, transformsAddress, extract,
@@ -8132,9 +8136,8 @@ bool Renderer::EnsureReSTIRPT()
 
     // Creation only: no GPU work is recorded, so creating during recording is safe.
     TransitionTiming::Scope er1Scope("EnsureReSTIRPT");
-    // The SHARC radiance cache at x3 is compiled into the kernels exactly when NVIDIA SHARC is usable here.
-    const bool sharcAvailable = NvidiaSharcCapabilityFailure().empty();
-    ShaderCompiler::SetRestirPtSharc(sharcAvailable);
+    // The SHARC radiance cache at x3 is in the kernels (their SHARC twins) exactly when NVIDIA SHARC is usable here.
+    const bool sharcAvailable = ReSTIRPTSharcAvailable();
     m_debugUI.SetRestirPtSharc(m_restirPtSettings.sharc, sharcAvailable);
 
     // Pipelines prepared on the worker for the same SHARC choice are adopted (or their failure is the pass's). Otherwise
@@ -8159,8 +8162,8 @@ bool Renderer::EnsureReSTIRPT()
         }
     }
 
-    return m_restirPtPass.Initialize(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
-        m_resourceUploader, m_restirPtSettings);
+    return m_restirPtPass.Initialize(m_graphicsDevice.GetDevice(), GetReSTIRPTShaderSource(), sharcAvailable,
+        m_resourceDescriptorHeap, m_resourceUploader, m_restirPtSettings);
 }
 
 ShaderLibraryPreparation Renderer::PrepareReSTIRPTPipelines()
@@ -8209,7 +8212,7 @@ ShaderLibraryPreparation Renderer::PrepareReSTIRPTPipelines()
 
 bool Renderer::SubmitReSTIRPTPipelines()
 {
-    if(!m_graphicsDevice.GetDevice() || !m_graphicsDevice.GetRayTracingDevice() || m_shaderLibrary.IsPackaged())
+    if(!m_graphicsDevice.GetDevice() || !m_graphicsDevice.GetRayTracingDevice())
     {
         return false;
     }
@@ -8228,20 +8231,19 @@ bool Renderer::SubmitReSTIRPTPipelines()
         m_restirPtPipelineWorker = std::move(worker);
     }
 
-    // As EnsureReSTIRPT compiles them: with the SHARC radiance cache exactly when NVIDIA SHARC is usable here.
-    const bool sharcAvailable = NvidiaSharcCapabilityFailure().empty();
-    ShaderCompiler::SetRestirPtSharc(sharcAvailable);
+    // As EnsureReSTIRPT creates them: the SHARC twins exactly when the SHARC radiance cache can run here.
+    const bool sharcAvailable = ReSTIRPTSharcAvailable();
     auto prepared = std::make_shared<ReSTIRPTPreparedPipelines>();
     prepared->sharc = sharcAvailable;
-    const std::filesystem::path shaderRoot = m_shaderLibrary.GetShaderRoot();
+    const ReSTIRPTShaderSource shaderSource = GetReSTIRPTShaderSource();
     // Read only by the job (free-threaded device methods); Shutdown joins the worker before the device is released.
     ID3D12Device* device = m_graphicsDevice.GetDevice();
     RayTracingPipelineRequest request{};
     request.key = ReSTIRPTPipelineJobKey;
     request.device = m_graphicsDevice.GetRayTracingDevice();
-    request.prepareAuxiliary = [prepared, shaderRoot, device]()
+    request.prepareAuxiliary = [prepared, shaderSource, device]()
     {
-        return ReSTIRPTPass::PreparePipelines(device, shaderRoot, *prepared);
+        return ReSTIRPTPass::PreparePipelines(device, shaderSource, *prepared);
     };
 
     if(!m_restirPtPipelineWorker->Submit(std::move(request)))
@@ -8300,6 +8302,123 @@ void Renderer::ReleasePreparedReSTIRPTPipelines()
     {
         m_restirPtPreparedPipelines->Shutdown();
         m_restirPtPreparedPipelines.reset();
+    }
+}
+
+bool Renderer::SubmitReSTIRPTLayeredPipelines()
+{
+    if(!m_graphicsDevice.GetDevice() || !m_graphicsDevice.GetRayTracingDevice())
+    {
+        return false;
+    }
+
+    if(!m_restirPtPipelineWorker)
+    {
+        auto worker = std::make_unique<RayTracingPipelineWorker>();
+
+        if(!worker->Start())
+        {
+            return false;
+        }
+
+        m_restirPtPipelineWorker = std::move(worker);
+    }
+
+    // The same SHARC choice as the base set (EnsureReSTIRPT).
+    const bool sharcAvailable = ReSTIRPTSharcAvailable();
+    auto prepared = std::make_shared<ReSTIRPTPreparedPipelines>();
+    prepared->sharc = sharcAvailable;
+    prepared->layered = true;
+    const ReSTIRPTShaderSource shaderSource = GetReSTIRPTShaderSource();
+    ID3D12Device* device = m_graphicsDevice.GetDevice();
+    RayTracingPipelineRequest request{};
+    request.key = ReSTIRPTLayeredPipelineJobKey;
+    request.device = m_graphicsDevice.GetRayTracingDevice();
+    request.prepareAuxiliary = [prepared, shaderSource, device]()
+    {
+        return ReSTIRPTPass::PreparePipelines(device, shaderSource, *prepared);
+    };
+
+    if(!m_restirPtPipelineWorker->Submit(std::move(request)))
+    {
+        return false;
+    }
+
+    m_restirPtPreparedLayeredPipelines = std::move(prepared);
+    m_restirPtLayeredPreparing = true;
+    m_restirPtLayeredRequested = std::chrono::steady_clock::now();
+    Log::Info("ReSTIR PT layered pipelines (OpenPBR coat, fuzz, thin film, anisotropy): preparing on the ReSTIR PT "
+        "worker; until they are ready those lobes are not rendered.");
+    return true;
+}
+
+void Renderer::UpdateReSTIRPTLayeredPipelines()
+{
+    if(!m_materialPublication.layeredLobes || !m_restirPtPass.IsInitialized() || m_restirPtPass.HasLayeredPipelines() ||
+        m_restirPtLayeredFailed)
+    {
+        return;
+    }
+
+    if(!m_restirPtLayeredPreparing)
+    {
+        if(!SubmitReSTIRPTLayeredPipelines())
+        {
+            m_restirPtLayeredFailed = true;
+            Log::Warning("ReSTIR PT layered pipelines: no worker could take them; coat, fuzz, thin film and anisotropy "
+                "are not rendered in ReSTIR PT.");
+        }
+
+        return;
+    }
+
+    if(!m_restirPtPipelineWorker ||
+        m_restirPtPipelineWorker->GetState(ReSTIRPTLayeredPipelineJobKey) != RayTracingPipelineJobState::Completed)
+    {
+        return;
+    }
+
+    const std::optional<RayTracingPipelineOutcome> outcome =
+        m_restirPtPipelineWorker->TakeCompleted(ReSTIRPTLayeredPipelineJobKey);
+    m_restirPtLayeredPreparing = false;
+
+    // Created on another device: released, and prepared again on the next frame that needs them.
+    if(!outcome || outcome->device != m_graphicsDevice.GetRayTracingDevice())
+    {
+        ReleasePreparedReSTIRPTLayeredPipelines();
+        return;
+    }
+
+    if(!outcome->succeeded && m_restirPtPreparedLayeredPipelines->failure.empty())
+    {
+        m_restirPtPreparedLayeredPipelines->failure = "the pipeline preparation job failed.";
+    }
+
+    const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+        m_restirPtLayeredRequested).count();
+    const bool sameSharc = m_restirPtPreparedLayeredPipelines->sharc == NvidiaSharcCapabilityFailure().empty();
+
+    if(sameSharc && m_restirPtPass.AdoptLayeredPipelines(*m_restirPtPreparedLayeredPipelines))
+    {
+        Log::Info("ReSTIR PT layered pipelines: prepared and adopted " + std::to_string(milliseconds) +
+            " ms after the request.");
+    }
+    else
+    {
+        m_restirPtLayeredFailed = true;
+        Log::Error("ReSTIR PT layered pipelines: preparation failed after " + std::to_string(milliseconds) + " ms: " +
+            (sameSharc ? m_restirPtPreparedLayeredPipelines->failure : std::string("the SHARC choice changed.")));
+    }
+
+    ReleasePreparedReSTIRPTLayeredPipelines();
+}
+
+void Renderer::ReleasePreparedReSTIRPTLayeredPipelines()
+{
+    if(m_restirPtPreparedLayeredPipelines)
+    {
+        m_restirPtPreparedLayeredPipelines->Shutdown();
+        m_restirPtPreparedLayeredPipelines.reset();
     }
 }
 
@@ -8642,6 +8761,31 @@ void Renderer::InvalidateSceneLighting(SceneLightingInvalidation reason) noexcep
 const SceneLightingEpoch::Status& Renderer::GetSceneLightingEpoch() const noexcept
 {
     return m_sceneLightingEpoch.GetStatus();
+}
+
+bool Renderer::ReSTIRPTSharcAvailable()
+{
+    if(!NvidiaSharcCapabilityFailure().empty())
+    {
+        return false;
+    }
+
+    // SharcCache::CapabilityFailure does not look at a packaged game's shaders; the twins' presence is the cook's choice.
+    if(m_shaderLibrary.IsPackaged())
+    {
+        return m_shaderLibrary.HasPackagedShader("ReSTIRPT/RestirPtInitialSharc.hlsl", "RestirPtInitialCS",
+            ShaderStage::Compute);
+    }
+
+    return true;
+}
+
+ReSTIRPTShaderSource Renderer::GetReSTIRPTShaderSource() const
+{
+    ReSTIRPTShaderSource source{};
+    source.shaderRoot = m_shaderLibrary.GetShaderRoot();
+    source.packagedShaders = m_shaderLibrary.IsPackaged() ? m_packagedShaderPayload : nullptr;
+    return source;
 }
 
 const std::string& Renderer::NvidiaSharcCapabilityFailure()
@@ -9553,7 +9697,7 @@ void Renderer::SetRayReconstructionRequested(bool requested)
 
 bool Renderer::RayReconstructionApplicable(RenderScale scale) const
 {
-    return m_rayReconstructionRequested && !m_packagedRuntime && m_rrFailure.empty() &&
+    return m_rayReconstructionRequested && m_rrFailure.empty() &&
         m_dlssBackend.GetStatus().rayReconstruction.availability == DlssRayReconstructionAvailability::Available &&
         (scale == RenderScale::Native || GetDlssPreset(scale).has_value());
 }
@@ -9948,6 +10092,11 @@ bool Renderer::RecordPathTraceReference(
         constants.samplesPerFrame = frameSamples;
         constants.maxPathDepth = settings.maxPathDepth;
         constants.russianRouletteDepth = settings.russianRouletteDepth;
+        // The reference mode is unclamped ground truth; every other primary keeps the real-time indirect clamp (the default).
+        if(primary == PathTracePrimary::Camera && !settings.referenceIndirectLuminanceClamp)
+        {
+            constants.indirectLuminanceClamp = 0.0f;
+        }
         if(primary == PathTracePrimary::Camera && m_debugUI.ReferenceRayCountsEnabled())
         {
             ReferenceRayCountResult metadata{};
@@ -10010,13 +10159,16 @@ bool Renderer::RecordPathTraceReference(
         constants.gBufferGeometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
 
         // EndGeometryPass already left the G-buffer readable; restating it keeps the raster primary's
-        // reads independent of that ordering.
+        // reads independent of that ordering. The motion target's alpha is the material AO the opt-in
+        // path-traced AO controls read (OpenPBR report §9.2).
         if(primary == PathTracePrimary::Raster || primary == PathTracePrimary::RasterReSTIRDI)
         {
             m_gBuffer.GetDepth().Transition(commandList, shaderReadState);
             m_gBuffer.GetMaterial().Transition(commandList, shaderReadState);
             m_gBuffer.GetSurface().Transition(commandList, shaderReadState);
             m_gBuffer.GetGeometricNormal().Transition(commandList, shaderReadState);
+            m_gBuffer.GetMotion().Transition(commandList, shaderReadState);
+            constants.gBufferMotionIndex = m_gBuffer.GetMotion().GetSRVIndex();
         }
 
         // RTXPT.3: the per-sample direct radiance the ReSTIR DI passes exchange, sized for the configured samples
@@ -14486,10 +14638,16 @@ bool Renderer::RecordRenderFrame(
         (m_psrLightingThisFrame || (!m_sharcSettings.enabled &&
             options.psrDebugView != ToneMapDebugView::None));
 
+    // Every raster-primary frame gives the geometry pass the path tracer's camera: the pass measures how far each pixel's
+    // decoded point will lie under its surface and stores the lift scale that clears it (PathTracePrimaryRasterLiftScale).
+    const bool rasterPrimaryFrame = runPathTrace &&
+        (pathTracePrimary == PathTracePrimary::Raster || pathTracePrimary == PathTracePrimary::RasterReSTIRDI);
+
     // M5.5: guide-only PSR marks eligibility too (the identity flag; B's shaders strip it), replacing after lighting.
-    if(psrInPlace || m_psrGuideOnlyThisFrame)
+    if(psrInPlace || m_psrGuideOnlyThisFrame || rasterPrimaryFrame)
     {
-        cameraConstants.psrEligibility = 1u;
+        cameraConstants.psrEligibility = psrInPlace || m_psrGuideOnlyThisFrame ? 1u : 0u;
+        cameraConstants.primarySurfaceLiftScale = rasterPrimaryFrame ? 1u : 0u;
         cameraConstants.psrResolution[0] = m_sceneWidth;
         cameraConstants.psrResolution[1] = m_sceneHeight;
         cameraConstants.psrInverseCameraRelativeViewProjection =
@@ -15920,6 +16078,16 @@ bool Renderer::RecordRenderFrame(
                               psrDebugView != ToneMapDebugView::None ? &m_gBuffer : nullptr, m_psrInPlaceReplacedLastFrame);
     };
 
+    // Cooked-game port: a packaged frame tone maps into the final scene image too, then copies it to the presentation
+    // target, when something reads or draws on the finished image: the unlit mist (drawn after tone mapping) or DLSS Frame
+    // Generation. Otherwise it tone maps straight into the target, as before, with no copy. The copy needs the output
+    // extent to be the window's, which a packaged game's is (ResizeScene follows the window).
+    const bool packagedExtentMatches = m_finalSceneColor.GetWidth() == m_applicationWidth &&
+        m_finalSceneColor.GetHeight() == m_applicationHeight;
+    const bool packagedDrawsAfterToneMapping = (options.airMist && !litMist) || presentationTarget.generatedComposite;
+    const bool packagedOffscreen = m_packagedRuntime && !lightingSuppressed && packagedExtentMatches &&
+        packagedDrawsAfterToneMapping;
+
     if (!m_packagedRuntime)
     {
         m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -15932,6 +16100,11 @@ bool Renderer::RecordRenderFrame(
         {
             toneMap(m_finalSceneColor.GetRTV());
         }
+    }
+    else if(packagedOffscreen)
+    {
+        m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        toneMap(m_finalSceneColor.GetRTV());
     }
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
@@ -16035,8 +16208,9 @@ bool Renderer::RecordRenderFrame(
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     // FG.3: DLSS Frame Generation's generated frame, between the previous real frame and this finished one (overlays
-    // included; the HUD-less copy tells it which pixels are overlays).
-    if(presentationTarget.generatedComposite)
+    // included; the HUD-less copy tells it which pixels are overlays). A packaged frame has a finished image to generate
+    // from only on the offscreen path.
+    if(presentationTarget.generatedComposite && (!m_packagedRuntime || packagedOffscreen))
     {
         presentationTarget.generatedRecorded = RecordFrameGeneration(commandList, frameIndex, frameView,
             cameraConstants.previousViewProjection, presentationTarget);
@@ -16054,6 +16228,10 @@ bool Renderer::RecordRenderFrame(
         if(lightingSuppressed)
         {
             RecordPreparationScreen(commandList, rtvHandle, m_applicationWidth, m_applicationHeight, true);
+        }
+        else if(packagedOffscreen)
+        {
+            RecordPackagedPresentationCopy(commandList, presentationTarget);
         }
         else
         {
@@ -16599,6 +16777,9 @@ void Renderer::Shutdown()
 
     ReleasePreparedReSTIRPTPipelines();
     m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::NotSubmitted;
+    ReleasePreparedReSTIRPTLayeredPipelines();
+    m_restirPtLayeredPreparing = false;
+    m_restirPtLayeredFailed = false;
 
     m_volumetricState = VolumetricState::NotRequested;
     m_volumetricHoldThisFrame = false;
@@ -16700,6 +16881,13 @@ void Renderer::Shutdown()
     m_skyAtmosphere.Shutdown();
     m_sceneColor.Shutdown();
     m_finalSceneColor.Shutdown();
+    // Frame Generation's generated image and HUD-less copy, which outlived the renderer before (26,607,616 bytes in the
+    // memory-soak runs, Documentation/Rendering/GPU_Memory_Notes.md §5). After the final drain, as the other targets here.
+    m_frameGenerationOutput.Shutdown();
+    m_frameGenerationHudless.Shutdown();
+    m_frameGenerationImageAttemptWidth = 0;
+    m_frameGenerationImageAttemptHeight = 0;
+    m_frameGenerationImagesFailed = false;
     m_selectionMask.Shutdown();
     m_presentationColor.Shutdown();
     m_presentationSelectionMask.Shutdown();

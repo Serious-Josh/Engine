@@ -23,7 +23,8 @@ enum class RendererLightingMode
     // M5.1 ReSTIR PT Enhanced (configuration B; Editor-only, experimental): the raster-primary mode whose direct and
     // indirect light come from one unified path-space reservoir (ReSTIRPTPass) instead of ReSTIR DI and the indirect path
     // tracer. It shares the ReSTIR DI mode's primary (RasterReSTIRDI: raster G-buffer, path-tracing targets, denoisers,
-    // DLSS) but uses neither RTXDI, SHARC nor PSR. Renders Legacy when unavailable.
+    // DLSS) but uses neither RTXDI nor PSR. Its paths end at the third vertex in NVIDIA SHARC's cache by default
+    // (ReSTIRPTSettings::sharc, depth 3 or more). Renders Legacy when unavailable.
     PathTracedRasterPrimaryReSTIRPT
 };
 
@@ -85,6 +86,11 @@ struct PathTraceReferenceSettings
     // Longest supported delta chain; depth below three automatically uses K=1.
     std::uint32_t primarySurfaceReplacementChain = 2;
 
+    // The reference mode (camera primary) is unclamped ground truth. True applies the real-time modes' indirect
+    // luminance clamp to it as well (the behaviour before 2026-11-26), for comparisons against those clamped modes.
+    // Part of the accumulation key.
+    bool referenceIndirectLuminanceClamp = false;
+
     bool operator==(const PathTraceReferenceSettings&) const = default;
 };
 
@@ -107,8 +113,9 @@ inline bool IsNrdPathTraceDenoiserMode(PathTraceDenoiserMode mode)
         mode == PathTraceDenoiserMode::NrdHybrid;
 }
 
-// SHARC is NVIDIA SHARC v1.8.3 (Documentation/Rendering/NVIDIA_SHARC_Integration_A.md). Its headers are Editor-only;
-// packaged games report SHARC unavailable. Engine's own D6 cache was retired on 2026-11-24.
+// SHARC is NVIDIA SHARC v1.8.3 (Documentation/Rendering/NVIDIA_SHARC_Integration_A.md). Build Game cooks its shaders
+// (PS.5D) when the SHARC headers are present; a build without them reports SHARC unavailable in packaged games. Engine's
+// own D6 cache was retired on 2026-11-24.
 //
 // SHARC.4E experimental cached-radiance rendering (Path Traced Raster Primary, and with ReSTIR DI since SHARC.5B;
 // off by default, not saved).

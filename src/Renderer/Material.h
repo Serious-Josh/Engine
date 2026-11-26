@@ -3,6 +3,7 @@
 #include "Renderer/ShaderData.h"
 #include "Renderer/Texture.h"
 #include "Renderer/MaterialTypes.h"
+#include "Renderer/OpenPBRMaterialParameters.h"
 
 #include <climits>
 #include <algorithm>
@@ -10,6 +11,8 @@
 
 class Pipeline;
 
+// A runtime material: OpenPBR Surface parameters (OpenPBR 1.1.2 names in comments) plus its texture bindings. The
+// asset form is MaterialAssetData; MaterialParameterPropagation copies one into the other.
 struct Material
 {
     Pipeline* pipeline = nullptr;
@@ -30,80 +33,139 @@ struct Material
 
     bool preferARM = true;
 
-    MaterialModel model = MaterialModel::Dielectric;
-
+    // Base: base_color, base_weight, base_metalness, base_diffuse_roughness.
     float baseColor[3] = {1.0f, 1.0f, 1.0f};
-
-    float roughness = 0.5f;
-    float ior = 1.536f;
-
+    float baseWeight = 1.0f;
     float metallic = 0.0f;
+    float diffuseRoughness = 0.0f;
 
-    float conductorN[3] = {1.0f, 1.0f, 1.0f};
-    float conductorK[3] = {0.0f, 0.0f, 0.0f};
+    // Specular: specular_roughness, specular_ior, specular_weight, specular_color, specular_roughness_anisotropy and
+    // its rotation (radians about the shading normal, from the surface tangent).
+    float roughness = 0.5f;
+    float ior = 1.5f;
+    float specularWeight = 1.0f;
+    float specularColor[3] = {1.0f, 1.0f, 1.0f};
+    float anisotropy = 0.0f;
+    float anisotropyRotation = 0.0f;
+
+    // Coat: coat_weight, coat_color, coat_roughness, coat_ior, coat_darkening; the coat normal follows the base's
+    // normal map, or the smooth interpolated normal.
+    float coatWeight = 0.0f;
+    float coatColor[3] = {1.0f, 1.0f, 1.0f};
+    float coatRoughness = 0.0f;
+    float coatIor = OpenPBRMaterialParameters::DefaultCoatIor;
+    float coatDarkening = 1.0f;
+    bool coatFollowsBaseNormal = false;
+
+    // Fuzz: fuzz_weight, fuzz_color, fuzz_roughness.
+    float fuzzWeight = 0.0f;
+    float fuzzColor[3] = {1.0f, 1.0f, 1.0f};
+    float fuzzRoughness = OpenPBRMaterialParameters::DefaultFuzzRoughness;
+
+    // Thin film: thin_film_weight, thin_film_thickness (micrometres), thin_film_ior.
+    float thinFilmWeight = 0.0f;
+    float thinFilmThickness = OpenPBRMaterialParameters::DefaultThinFilmThickness;
+    float thinFilmIor = OpenPBRMaterialParameters::DefaultThinFilmIor;
+
+    // Engine extension (not OpenPBR): how much the material AO map affects path tracing, as a darkening of the
+    // diffuse albedo and of specular_weight. Legacy shading always applies the AO map to indirect lighting.
+    float aoDiffuse = 0.0f;
+    float aoSpecularWeight = 0.0f;
 
     unsigned int gpuIndex = 0;
 
-    static float EvaluateConductorFresnel(
-        float cosTheta,
-        float n,
-        float k)
+    // Writes every parameter field of data (everything but the texture descriptor indices), including the derived
+    // terms, so a material table update and a full rebuild produce the same record.
+    void WriteParameters(GPUMaterial& data) const
     {
-        cosTheta = std::clamp(cosTheta, 0.0f, 1.0f);
+        data.roughness = roughness;
+        data.ior = ior;
+        data.metallic = metallic;
 
-        float cosThetaSquared = cosTheta * cosTheta;
-        float sinThetaSquared = 1.0f - cosThetaSquared;
-        float nSquared = n * n;
-        float kSquared = k * k;
-
-        float t0 = nSquared - kSquared - sinThetaSquared;
-        float a2PlusB2 = std::sqrt(t0 * t0 + 4.0f * nSquared * kSquared);
-        float t1 = a2PlusB2 + cosThetaSquared;
-        float a = std::sqrt(0.5f * (a2PlusB2 + t0));
-
-        float t2 = 2.0f * cosTheta * a;
-        float Rs = (t1 - t2) / (t1 + t2);
-        float t3 = cosThetaSquared * a2PlusB2 + sinThetaSquared * sinThetaSquared;
-        float t4 = t2 * sinThetaSquared;
-
-        float Rp = Rs * (t3 - t4) / (t3 + t4);
-
-        return 0.5f * (Rp + Rs);
-    }
-
-    static float CalculateAverageConductorFresnel(
-        float n,
-        float k)
-    {
-        constexpr unsigned int sampleCount = 256;
-
-        float integral = 0.0f;
-
-        for (unsigned int sample = 0; sample < sampleCount; ++sample)
+        for(size_t component = 0; component < 3; ++component)
         {
-            // Midpoint integration over mu = cos(theta).
-            float mu = (static_cast<float>(sample) + 0.5f) / static_cast<float>(sampleCount);
-
-            float fresnel = EvaluateConductorFresnel(mu, n, k);
-
-            integral += fresnel * mu;
+            data.baseColor[component] = baseColor[component];
+            data.specularColor[component] = specularColor[component];
+            data.coatColor[component] = coatColor[component];
+            data.fuzzColor[component] = fuzzColor[component];
         }
 
-        return 2.0f * integral / static_cast<float>(sampleCount);
+        data.preferARM = preferARM ? 1u : 0u;
+        data.surfaceDetailMode = static_cast<uint32_t>(surfaceDetailMode);
+        data.heightScale = heightScale;
+        data.heightBias = heightBias;
+
+        data.baseWeight = baseWeight;
+        data.diffuseRoughness = diffuseRoughness;
+        data.specularWeight = specularWeight;
+        data.anisotropy = anisotropy;
+        data.anisotropyRotation = anisotropyRotation;
+
+        data.coatWeight = coatWeight;
+        data.coatRoughness = coatRoughness;
+        data.coatIor = coatIor;
+        data.coatDarkening = coatDarkening;
+
+        data.fuzzWeight = fuzzWeight;
+        data.fuzzRoughness = fuzzRoughness;
+
+        data.thinFilmWeight = thinFilmWeight;
+        data.thinFilmThickness = thinFilmThickness;
+        data.thinFilmIor = thinFilmIor;
+
+        data.aoDiffuse = aoDiffuse;
+        data.aoSpecularWeight = aoSpecularWeight;
+        data.diffuseOcclusion = 1.0f;
+        data.reserved1 = 0u;
+
+        // Derived terms.
+        data.dielectricF0 = OpenPBRMaterialParameters::DielectricF0(ior, specularWeight, coatWeight, coatIor);
+        data.coatF0 = OpenPBRMaterialParameters::CoatF0(coatIor);
+        data.coatInternalReflection = OpenPBRMaterialParameters::CoatInternalReflection(coatIor);
+        data.lobeFlags = LobeFlags();
+    }
+
+    unsigned int LobeFlags() const
+    {
+        unsigned int flags = 0u;
+
+        if(coatWeight > 0.0f)
+        {
+            flags |= GpuMaterialLobeFlags::Coat;
+        }
+
+        if(fuzzWeight > 0.0f)
+        {
+            flags |= GpuMaterialLobeFlags::Fuzz;
+        }
+
+        if(thinFilmWeight > 0.0f && thinFilmThickness > 0.0f)
+        {
+            flags |= GpuMaterialLobeFlags::ThinFilm;
+        }
+
+        if(anisotropy > 0.0f)
+        {
+            flags |= GpuMaterialLobeFlags::Anisotropy;
+        }
+
+        if(coatFollowsBaseNormal)
+        {
+            flags |= GpuMaterialLobeFlags::CoatFollowsBaseNormal;
+        }
+
+        if(aoDiffuse > 0.0f || aoSpecularWeight > 0.0f)
+        {
+            flags |= GpuMaterialLobeFlags::PathTracedAO;
+        }
+
+        return flags;
     }
 
     GPUMaterial GetGPUData() const
     {
         GPUMaterial data{};
-
-        data.model = static_cast<unsigned int>(model);
-        data.roughness = roughness;
-        data.ior = ior;
-        data.metallic = metallic;
-
-        data.baseColor[0] = baseColor[0];
-        data.baseColor[1] = baseColor[1];
-        data.baseColor[2] = baseColor[2];
+        WriteParameters(data);
 
         data.textureIndex = texture ? texture->GetDescriptorIndex() : UINT_MAX;
         data.normalTextureIndex = normalTexture ? normalTexture->GetDescriptorIndex() : UINT_MAX;
@@ -111,27 +173,8 @@ struct Material
         data.metallicTextureIndex = metallicTexture ? metallicTexture->GetDescriptorIndex() : UINT_MAX;
 
         data.armTextureIndex = armTexture ? armTexture->GetDescriptorIndex() : UINT_MAX;
-        data.preferARM = preferARM ? 1u : 0u;
         data.aoTextureIndex = aoTexture ? aoTexture->GetDescriptorIndex() : UINT_MAX;
-        data.surfaceDetailMode = static_cast<uint32_t>(surfaceDetailMode);
-
         data.heightTextureIndex = heightTexture ? heightTexture->GetDescriptorIndex() : UINT_MAX;
-        data.heightScale = heightScale;
-        data.heightBias = heightBias;
-
-        data.conductorN[0] = conductorN[0];
-        data.conductorN[1] = conductorN[1];
-        data.conductorN[2] = conductorN[2];
-
-        data.conductorK[0] = conductorK[0];
-        data.conductorK[1] = conductorK[1];
-        data.conductorK[2] = conductorK[2];
-
-        data.averageConductorFresnel[0] = CalculateAverageConductorFresnel(conductorN[0], conductorK[0]);
-
-        data.averageConductorFresnel[1] = CalculateAverageConductorFresnel(conductorN[1], conductorK[1]);
-
-        data.averageConductorFresnel[2] = CalculateAverageConductorFresnel(conductorN[2], conductorK[2]);
 
         return data;
     }

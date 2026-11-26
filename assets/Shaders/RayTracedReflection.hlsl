@@ -834,9 +834,6 @@ float SecondarySurfaceRoughness(GPUMaterial material, ReflectionPayload surface)
 
 float SecondarySurfaceMetallic(GPUMaterial material, ReflectionPayload surface)
 {
-    if(material.model != 0u)
-        return material.metallic;
-
     float metallic = saturate(material.metallic);
     if(material.armTextureIndex != 0xFFFFFFFFu && material.preferARM != 0u)
     {
@@ -863,8 +860,7 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
     StructuredBuffer<GPUMaterial> materialBuffer =
         ResourceDescriptorHeap[reflectionConstants.materialBufferIndex];
     GPUMaterial material = materialBuffer[surface.materialIndex];
-    if(material.model == 0u)
-        material.metallic = SecondarySurfaceMetallic(material, surface);
+    material.metallic = SecondarySurfaceMetallic(material, surface);
     material.roughness = SecondarySurfaceRoughness(material, surface);
     float3 worldNormal = surface.shadingNormal;
     float2 hitUV = surface.uv;
@@ -996,47 +992,17 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
             0.0f
         );
 
-    if(material.model == 0)
-    {
-        directBRDF =
-            EvaluateMetallicRoughnessDirectBRDF(
-                material,
-                baseColor,
-                worldNormal,
-                directionToLight,
-                viewDirection,
-                directionalAlbedoLight,
-                directionalAlbedoView,
-                averageAlbedo
-            );
-    }
-    else if(material.model == 1)
-    {
-        directBRDF =
-            EvaluateDielectricDirectBRDF(
-                material,
-                baseColor,
-                worldNormal,
-                directionToLight,
-                viewDirection,
-                directionalAlbedoLight,
-                directionalAlbedoView,
-                averageAlbedo
-            );
-    }
-    else if(material.model == 2)
-    {
-        directBRDF =
-            EvaluateConductorDirectBRDF(
-                material,
-                worldNormal,
-                directionToLight,
-                viewDirection,
-                directionalAlbedoLight,
-                directionalAlbedoView,
-                averageAlbedo
-            );
-    }
+    directBRDF =
+        EvaluateMetallicRoughnessDirectBRDF(
+            material,
+            baseColor,
+            worldNormal,
+            directionToLight,
+            viewDirection,
+            directionalAlbedoLight,
+            directionalAlbedoView,
+            averageAlbedo
+        );
 
     float3 directional =
         directBRDF *
@@ -1113,30 +1079,14 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
             multiscatterMip
         ).rgb;
 
-    if(material.model == 0)
     {
         float metallic =
             saturate(
                 material.metallic
             );
 
-        float3 dielectricF0 =
-            float3(
-                0.04f,
-                0.04f,
-                0.04f
-            );
-
-        float3 F0 =
-            lerp(
-                dielectricF0,
-                baseColor,
-                metallic
-            );
-
-        float3 diffuseColor =
-            baseColor *
-            (1.0f - metallic);
+        float3 F0 = LegacyMaterialF0(material, baseColor, metallic);
+        float3 diffuseColor = LegacyMaterialDiffuseColor(material, baseColor, metallic);
 
         environmentSpecular =
             prefilteredEnvironment *
@@ -1198,128 +1148,6 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
             (diffuseColor / PI) *
             irradiance;
     }
-    else if(material.model == 1)
-    {
-        float iorDifference =
-            material.ior - 1.0f;
-
-        float iorSum =
-            material.ior + 1.0f;
-
-        float dielectricF0 =
-            (iorDifference * iorDifference) /
-            max(
-                iorSum * iorSum,
-                1.0e-6f
-            );
-
-        float3 F0 =
-            float3(
-                dielectricF0,
-                dielectricF0,
-                dielectricF0
-            );
-
-        environmentSpecular =
-            prefilteredEnvironment *
-            (
-                F0 *
-                integratedBRDF.x +
-                integratedBRDF.y
-            );
-
-        float3 averageFresnel =
-            AverageSchlickFresnel(
-                F0
-            );
-
-        float3 multipleScatterFresnel =
-            EvaluateGGXMultipleScatterFresnel(
-                environmentAverageAlbedo,
-                averageFresnel
-            );
-
-        float multiscatterNormalization =
-            max(
-                1.0f -
-                environmentAverageAlbedo,
-                1.0e-6f
-            );
-
-        lighting.singleScatterEnvironmentSpecular = environmentSpecular;
-        lighting.multipleScatterEnvironmentSpecular =
-            multiscatterIrradiance *
-            multipleScatterFresnel *
-            (1.0f - directionalEnvironmentAlbedo) *
-            INV_PI /
-            multiscatterNormalization;
-
-        environmentSpecular += lighting.multipleScatterEnvironmentSpecular;
-
-        float3 irradiance =
-            diffuseIrradiance.SampleLevel(
-                materialSampler,
-                worldNormal,
-                0.0f
-            ).rgb;
-
-        float3 environmentFresnel =
-            F0 +
-            (1.0f - F0) *
-            pow(
-                1.0f - NdotV,
-                5.0f
-            );
-
-        float3 environmentDiffuseWeight =
-            1.0f -
-            environmentFresnel;
-
-        environmentDiffuse =
-            environmentDiffuseWeight *
-            (baseColor / PI) *
-            irradiance;
-    }
-    else if(material.model == 2)
-    {
-        float3 conductorF0 =
-            FresnelConductor(
-                1.0f,
-                material.conductorN,
-                material.conductorK
-            );
-
-        environmentSpecular =
-            prefilteredEnvironment *
-            (
-                conductorF0 *
-                integratedBRDF.x +
-                integratedBRDF.y
-            );
-
-        float3 multipleScatterFresnel =
-            EvaluateGGXMultipleScatterFresnel(
-                environmentAverageAlbedo,
-                material.averageConductorFresnel
-            );
-
-        float multiscatterNormalization =
-            max(
-                1.0f -
-                environmentAverageAlbedo,
-                1.0e-6f
-            );
-
-        lighting.singleScatterEnvironmentSpecular = environmentSpecular;
-        lighting.multipleScatterEnvironmentSpecular =
-            multiscatterIrradiance *
-            multipleScatterFresnel *
-            (1.0f - directionalEnvironmentAlbedo) *
-            INV_PI /
-            multiscatterNormalization;
-
-        environmentSpecular += lighting.multipleScatterEnvironmentSpecular;
-    }
 
     lighting.directional = directional;
     lighting.environmentDiffuse = environmentDiffuse;
@@ -1329,27 +1157,11 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
 // Deterministic delta-mirror weight, matching the existing primary mirror model handling.
 float3 EvaluateSecondaryMirrorFresnel(GPUMaterial material, ReflectionPayload surface, float cosine)
 {
-    if(material.model == 0)
-    {
-        Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(material.textureIndex)];
-        float3 baseColor = material.baseColor * texture.SampleLevel(materialSampler, surface.uv,
-            ReflectionTextureLOD(texture, surface.coneWidth, surface.textureDensity)).rgb;
-        float3 F0 = lerp(float3(0.04f, 0.04f, 0.04f), baseColor, saturate(material.metallic));
-        return FresnelSchlick(cosine, F0);
-    }
-    if(material.model == 1)
-    {
-        float difference = material.ior - 1.0f;
-        float sum = material.ior + 1.0f;
-        float F0 = (difference * difference) / max(sum * sum, 1.0e-6f);
-        return FresnelSchlick(cosine, float3(F0, F0, F0));
-    }
-    if(material.model == 2)
-    {
-        return FresnelConductor(cosine, material.conductorN, material.conductorK);
-    }
-
-    return float3(0.0f, 0.0f, 0.0f);
+    Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(material.textureIndex)];
+    float3 baseColor = material.baseColor * texture.SampleLevel(materialSampler, surface.uv,
+        ReflectionTextureLOD(texture, surface.coneWidth, surface.textureDensity)).rgb;
+    float3 F0 = LegacyMaterialF0(material, baseColor, saturate(material.metallic));
+    return FresnelSchlick(cosine, F0);
 }
 
 [shader("raygeneration")]
@@ -1651,8 +1463,7 @@ void RayGeneration()
         ResourceDescriptorHeap[reflectionConstants.geometricNormalIndex];
     float4 geometricNormalData = geometricNormalTexture.Load(int3(pixelIndex, 0));
     float3 geometricNormal = normalize(geometricNormalData.rgb);
-    if(primaryMaterial.model == 0u)
-        primaryMaterial.metallic = saturate(geometricNormalData.a);
+    primaryMaterial.metallic = saturate(geometricNormalData.a);
 
     ray.Origin =
         worldPosition.xyz +
@@ -1760,11 +1571,10 @@ void RayGeneration()
         secondaryRadiance = ShadeSecondarySurface(payload, ray.Direction, secondaryVisibility, secondaryLighting);
 
         GPUMaterial secondaryMaterial = materialBuffer[payload.materialIndex];
-        if(secondaryMaterial.model == 0u)
-            secondaryMaterial.metallic = SecondarySurfaceMetallic(secondaryMaterial, payload);
+        secondaryMaterial.metallic = SecondarySurfaceMetallic(secondaryMaterial, payload);
         secondaryMaterial.roughness = SecondarySurfaceRoughness(secondaryMaterial, payload);
         // Preserve the validated deterministic mirror continuation.
-        if(secondaryMaterial.roughness <= 0.001f && secondaryMaterial.model <= 2u)
+        if(secondaryMaterial.roughness <= 0.001f)
         {
             float3 secondaryView = normalize(-ray.Direction);
             float secondaryNdotV = dot(payload.shadingNormal, secondaryView);
@@ -1804,7 +1614,7 @@ void RayGeneration()
                     (secondaryFresnel * tertiaryRadiance + secondaryLighting.multipleScatterEnvironmentSpecular);
             }
         }
-        else if(secondaryMaterial.roughness > 0.001f && secondaryMaterial.roughness < 0.30f && secondaryMaterial.model <= 2u)
+        else if(secondaryMaterial.roughness > 0.001f && secondaryMaterial.roughness < 0.30f)
         {
             float3 sampledSecondarySpecular = float3(0.0f, 0.0f, 0.0f);
             float3 secondaryView = normalize(-ray.Direction);
@@ -1913,64 +1723,11 @@ void RayGeneration()
                 0.0f
             );
 
-        if(primaryMaterial.model == 0)
-        {
-            float3 dielectricF0 =
-                float3(
-                    0.04f,
-                    0.04f,
-                    0.04f
-                );
-
-            float3 F0 =
-                lerp(
-                    dielectricF0,
-                    primaryBaseColor,
-                    saturate(
-                        primaryMaterial.metallic
-                    )
-                );
-
-            F =
-                FresnelSchlick(
-                    VdotH,
-                    F0
-                );
-        }
-        else if(primaryMaterial.model == 1)
-        {
-            float iorDifference =
-                primaryMaterial.ior - 1.0f;
-
-            float iorSum =
-                primaryMaterial.ior + 1.0f;
-
-            float dielectricF0 =
-                (iorDifference * iorDifference) /
-                max(
-                    iorSum * iorSum,
-                    1.0e-6f
-                );
-
-            F =
-                FresnelSchlick(
-                    VdotH,
-                    float3(
-                        dielectricF0,
-                        dielectricF0,
-                        dielectricF0
-                    )
-                );
-        }
-        else if(primaryMaterial.model == 2)
-        {
-            F =
-                FresnelConductor(
-                    VdotH,
-                    primaryMaterial.conductorN,
-                    primaryMaterial.conductorK
-                );
-        }
+        F =
+            FresnelSchlick(
+                VdotH,
+                LegacyMaterialF0(primaryMaterial, primaryBaseColor, saturate(primaryMaterial.metallic))
+            );
 
         float3 sampleWeight =
             float3(

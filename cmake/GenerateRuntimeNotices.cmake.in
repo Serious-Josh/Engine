@@ -39,6 +39,11 @@ endif()
 file(READ "${source}/cmake/ImGuiLicense.txt" text)
 string(APPEND notices "===== Dear ImGui =====\n${text}\n\n")
 
+# OpenPBR's fuzz lobe uses MaterialX's ltc-sheen fits (Apache-2.0) and is in every game's cooked shaders; Engine keeps the
+# attribution and license text beside these scripts.
+file(READ "${source}/cmake/MaterialXLicense.txt" text)
+string(APPEND notices "===== MaterialX (OpenPBR fuzz lobe) =====\n${text}\n\n")
+
 file(READ "${agility_license}" text)
 string(APPEND notices "===== DirectX 12 Agility SDK @ENGINE_AGILITY_SDK_PACKAGE_VERSION@ =====\n${text}\n\n")
 

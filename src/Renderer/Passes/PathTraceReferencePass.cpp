@@ -318,8 +318,9 @@ namespace
                                               {RootParameterType::ConstantBuffer, 0},
                                               {RootParameterType::ConstantBuffer, 1}};
 
-        // Hit distance, geometric normal, shading normal, UV, material index.
-        pipelineDescription.maxPayloadSize = 40;
+        // Hit distance, geometric normal, shading normal, UV, material index, and OpenPBR's packed coat smooth normal and
+        // anisotropy tangent (PathTraceReference.hlsl PathTracePayload).
+        pipelineDescription.maxPayloadSize = 48;
         pipelineDescription.maxAttributeSize = 8;
         // Raygen traces every segment iteratively; closest hit and miss never trace.
         pipelineDescription.maxRecursionDepth = 1;
@@ -429,7 +430,8 @@ namespace
         description.hitGroups = {{L"PathTracePsrGuideHitGroup", L"PathTracePsrGuideClosestHit", L""}};
         description.rootParameters.push_back({RootParameterType::ConstantBuffer, 3});
         description.rootParameters.push_back({RootParameterType::ShaderResource, 1});
-        description.maxPayloadSize = 48;
+        // PathTracePsrGuidePayload: the radiance payload (48 bytes) plus the hit's instance and primitive.
+        description.maxPayloadSize = 56;
         return description;
     }
 

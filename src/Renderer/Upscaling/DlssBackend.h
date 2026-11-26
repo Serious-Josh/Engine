@@ -38,7 +38,8 @@ enum class DlssRayReconstructionAvailability
 {
     // Built without ENGINE_ENABLE_DLSS_RR (or without the Super Resolution backend it needs).
     NotCompiled,
-    // The packaged runtime: RR is Editor-only until NVIDIA's redistribution terms are confirmed.
+    // The process turned Ray Reconstruction off before Initialize (SetRayReconstructionPermitted). Both the Editor and
+    // packaged games permit it since the cooked-game port.
     NotPermitted,
     // Initialize has not run (or Shutdown ran).
     NotInitialized,
@@ -65,7 +66,8 @@ enum class DlssFrameGenerationAvailability
 {
     // Built without ENGINE_ENABLE_DLSS_FG (or without the Super Resolution backend it needs).
     NotCompiled,
-    // The packaged runtime: Frame Generation starts in the Editor viewport; packaged games get it in a later stage.
+    // The process turned Frame Generation off before Initialize (SetFrameGenerationPermitted). Both the Editor and
+    // packaged games permit it since the cooked-game port.
     NotPermitted,
     // Initialize has not run (or Shutdown ran).
     NotInitialized,
@@ -305,9 +307,9 @@ public:
     DlssBackend& operator=(const DlssBackend&) = delete;
     ~DlssBackend();
 
-    // RR.1A: before Initialize. False (the packaged runtime) reports Ray Reconstruction NotPermitted without querying it.
+    // RR.1A: before Initialize. False reports Ray Reconstruction NotPermitted without querying it.
     void SetRayReconstructionPermitted(bool permitted) noexcept { m_rayReconstructionPermitted = permitted; }
-    // FG.1: likewise for Frame Generation (Editor viewport first; packaged games in a later stage).
+    // FG.1: likewise for Frame Generation.
     void SetFrameGenerationPermitted(bool permitted) noexcept { m_frameGenerationPermitted = permitted; }
 
     // Once per device, after it is created. Never fails the caller: every outcome is reported through GetStatus. A

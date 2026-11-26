@@ -256,30 +256,12 @@ float4 NrdPathTracePsrMotion(uint2 pixel, float4 motion)
 #define NRD_PATH_TRACE_MOTION(pixel, motion) NrdPathTracePsrMotion(pixel, motion)
 #endif
 
-// The diffuse albedo and Schlick F0 of the path tracer's material models (PathTraceDiffuseAlbedo, PathTraceSchlickF0;
-// conductors use their average Fresnel), from the G-buffer's resolved base colour and metallic.
+// The diffuse albedo and specular F0 of the path tracer's OpenPBR material (OpenPBRMaterialReflectanceGuide), from the
+// G-buffer's resolved base colour and metalness.
 void NrdPathTraceMaterialAlbedo(GPUMaterial material, float3 baseColor, float metallic, out float3 diffuseAlbedo,
     out float3 specularF0)
 {
-    if(material.model == 0u)
-    {
-        diffuseAlbedo = baseColor * (1.0f - metallic);
-        specularF0 = lerp(float3(0.04f, 0.04f, 0.04f), baseColor, metallic);
-        return;
-    }
-
-    if(material.model == 1u)
-    {
-        float iorDifference = material.ior - 1.0f;
-        float iorSum = material.ior + 1.0f;
-        float dielectricF0 = (iorDifference * iorDifference) / max(iorSum * iorSum, 1.0e-6f);
-        diffuseAlbedo = baseColor;
-        specularF0 = float3(dielectricF0, dielectricF0, dielectricF0);
-        return;
-    }
-
-    diffuseAlbedo = float3(0.0f, 0.0f, 0.0f);
-    specularF0 = saturate(material.averageConductorFresnel);
+    OpenPBRMaterialReflectanceGuide(material, baseColor, metallic, diffuseAlbedo, specularF0);
 }
 
 // Shared by CSPrepare and CSResolve, so demodulation and remodulation use the same factors.
@@ -345,11 +327,6 @@ NrdPathTraceSurface NrdPathTraceLoadSurface(uint2 pixel)
 
     GPUMaterial material = materials[uint(materialIndex)];
 
-    if(material.model > 2u)
-    {
-        return result;
-    }
-
     float3 normal = normalize(surface.xyz);
     float roughness = saturate(materialData.a);
     float3 diffuseAlbedo;
@@ -382,7 +359,7 @@ NrdPathTraceSurface NrdPathTraceLoadSurface(uint2 pixel)
     result.normal = normal;
     // A delta mirror is roughness 0 for NRD, as for the path tracer.
     result.roughness = roughness <= NRD_PATH_TRACE_DELTA_ROUGHNESS ? 0.0f : roughness;
-    result.materialID = material.model == 2u || metallic >= 0.5f ? 1.0f : 0.0f;
+    result.materialID = metallic >= 0.5f ? 1.0f : 0.0f;
     NRD_MaterialFactors(normal, view, diffuseAlbedo, specularF0, result.roughness, result.diffuseFactor,
         result.specularFactor);
 #ifdef NRD_PATH_TRACE_PSR

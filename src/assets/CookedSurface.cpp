@@ -142,10 +142,35 @@ std::vector<Asset> CookDependencies(const CookedScene::Metadata& scene,const Pro
         std::ifstream stream(resolved.resolvedPath,std::ios::binary);
         const auto json=nlohmann::json::parse(stream);
         MaterialAssetData m; Check(MaterialAssetSerializer::Deserialize(json,m,&error),"Invalid source material.");
+
+        // A source field the cooker would silently drop fails the cook. A schema 2 source must match its re-serialization.
+        // OpenPBR's writer emits schema 2 only while schema 1 files still load (migrated), so a schema 1 source is held to
+        // the keys the schema 1 reader consumes instead; its re-serialization has none of them.
         const auto schema=MaterialAssetSerializer::Serialize(m);
-        for(auto field=json.begin();field!=json.end();++field) Check(schema.contains(field.key()),"Unsupported source material field.");
+        const bool schemaOne=json.at("schemaVersion").get<int>()==1;
+        const auto accepted=[&](const nlohmann::json& serialized,std::span<const std::string_view> schemaOneKeys,const std::string& key)
+        {
+            return schemaOne ? std::find(schemaOneKeys.begin(),schemaOneKeys.end(),key)!=schemaOneKeys.end() : serialized.contains(key);
+        };
+        const auto source=record->relativePath.generic_u8string();
+        const std::string sourceText(source.begin(),source.end());
+
+        for(auto field=json.begin();field!=json.end();++field)
+        {
+            if(!accepted(schema,MaterialAssetSerializer::SchemaOneDocumentKeys(),field.key()))
+            {
+                throw std::runtime_error("Unsupported source material field '"+field.key()+"' in "+sourceText+".");
+            }
+        }
+
         for(auto field=json.at("textures").begin();field!=json.at("textures").end();++field)
-            Check(schema.at("textures").contains(field.key()),"Unsupported source texture dependency.");
+        {
+            if(!accepted(schema.at("textures"),MaterialAssetSerializer::SchemaOneTextureKeys(),field.key()))
+            {
+                throw std::runtime_error("Unsupported source texture dependency '"+field.key()+"' in "+sourceText+".");
+            }
+        }
+
         auto refs=References(m);
         for(size_t i=0;i<7;++i) if(refs[i]) { auto texture=AssetID::ParseReference(*refs[i]); Check(bool(texture),"Unsupported texture source reference."); textures[texture->ToString()].insert(Interpretation(i)); }
         materials.emplace(text,std::move(m));

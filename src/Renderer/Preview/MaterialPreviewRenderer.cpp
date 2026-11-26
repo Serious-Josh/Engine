@@ -14,6 +14,7 @@
 #include "assets/ProjectAssetResolver.h"
 #include "assets/MaterialAssetSerializer.h"
 #include "Renderer/Material.h"
+#include "Scene/MaterialParameterPropagation.h"
 
 #include <exception>
 #include <algorithm>
@@ -27,6 +28,66 @@
 
 namespace
 {
+    // The previewed material's fields the Legacy preview shading reads (MaterialPreview.hlsl
+    // PreviewMaterialConstants): the full OpenPBR GPUMaterial does not fit the 64-DWORD root signature beside the 36
+    // geometry DWORDs.
+    struct PreviewMaterialConstants
+    {
+        float baseColor[3];
+        unsigned int textureIndex;
+
+        float roughness;
+        float metallic;
+        float baseWeight;
+        float diffuseRoughness;
+
+        float dielectricF0;
+        unsigned int roughnessTextureIndex;
+        unsigned int metallicTextureIndex;
+        unsigned int normalTextureIndex;
+
+        unsigned int armTextureIndex;
+        unsigned int preferARM;
+        unsigned int aoTextureIndex;
+        unsigned int surfaceDetailMode;
+
+        unsigned int heightTextureIndex;
+        float heightScale;
+        float heightBias;
+        unsigned int reserved;
+    };
+
+    constexpr unsigned int PreviewMaterialConstantCount = sizeof(PreviewMaterialConstants) / sizeof(unsigned int);
+    static_assert(sizeof(PreviewMaterialConstants) == 20 * sizeof(unsigned int));
+
+    PreviewMaterialConstants MakePreviewMaterialConstants(const GPUMaterial& material)
+    {
+        PreviewMaterialConstants constants{};
+
+        for(size_t component = 0; component < 3; ++component)
+        {
+            constants.baseColor[component] = material.baseColor[component];
+        }
+
+        constants.textureIndex = material.textureIndex;
+        constants.roughness = material.roughness;
+        constants.metallic = material.metallic;
+        constants.baseWeight = material.baseWeight;
+        constants.diffuseRoughness = material.diffuseRoughness;
+        constants.dielectricF0 = material.dielectricF0;
+        constants.roughnessTextureIndex = material.roughnessTextureIndex;
+        constants.metallicTextureIndex = material.metallicTextureIndex;
+        constants.normalTextureIndex = material.normalTextureIndex;
+        constants.armTextureIndex = material.armTextureIndex;
+        constants.preferARM = material.preferARM;
+        constants.aoTextureIndex = material.aoTextureIndex;
+        constants.surfaceDetailMode = material.surfaceDetailMode;
+        constants.heightTextureIndex = material.heightTextureIndex;
+        constants.heightScale = material.heightScale;
+        constants.heightBias = material.heightBias;
+        return constants;
+    }
+
     std::string ThumbnailFingerprint(
         const ProjectPaths& paths,
         const ProjectAssetRegistry& registry,
@@ -360,9 +421,10 @@ bool MaterialPreviewRenderer::InitializePipelines(
     geometry.renderTargets.formats[3] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     geometry.depthEnabled = true;
     geometry.depthFormat = DXGI_FORMAT_D32_FLOAT;
-    // 36 geometry DWORDs + 27 material DWORDs = 63, within the 64-DWORD root budget.
+    // 36 geometry DWORDs + 20 preview material DWORDs = 56, within the 64-DWORD root budget.
     geometry.rootParameters.push_back({RootParameterType::Constants, 0, 36, D3D12_SHADER_VISIBILITY_ALL});
-    geometry.rootParameters.push_back({RootParameterType::Constants, 2, 27, D3D12_SHADER_VISIBILITY_PIXEL});
+    geometry.rootParameters.push_back({RootParameterType::Constants, 2, PreviewMaterialConstantCount,
+        D3D12_SHADER_VISIBILITY_PIXEL});
 
     if(!m_geometryPipeline.Initialize(device, geometry))
     {
@@ -375,7 +437,8 @@ bool MaterialPreviewRenderer::InitializePipelines(
     lighting.renderTargets.count = 1;
     lighting.renderTargets.formats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     lighting.rootParameters.push_back({RootParameterType::Constants, 1, 9, D3D12_SHADER_VISIBILITY_PIXEL});
-    lighting.rootParameters.push_back({RootParameterType::Constants, 2, 27, D3D12_SHADER_VISIBILITY_PIXEL});
+    lighting.rootParameters.push_back({RootParameterType::Constants, 2, PreviewMaterialConstantCount,
+        D3D12_SHADER_VISIBILITY_PIXEL});
 
     return m_lightingPipeline.Initialize(device, lighting) && m_toneMap.Initialize(device, shaders);
 }
@@ -551,8 +614,8 @@ bool MaterialPreviewRenderer::RecordGeometryJob(const RecordingContext& context,
     commandList->SetGraphicsRoot32BitConstants(0, 16, &geometry.model, 16);
     const float cameraPosition[4] = {eye.x, eye.y, eye.z, 1.0f};
     commandList->SetGraphicsRoot32BitConstants(0, 4, cameraPosition, 32);
-    static_assert(sizeof(GPUMaterial) == 27 * sizeof(unsigned int));
-    commandList->SetGraphicsRoot32BitConstants(1, 27, &material, 0);
+    const PreviewMaterialConstants previewMaterial = MakePreviewMaterialConstants(material);
+    commandList->SetGraphicsRoot32BitConstants(1, PreviewMaterialConstantCount, &previewMaterial, 0);
     commandList->IASetVertexBuffers(0, 1, &geometry.vertices);
     commandList->IASetIndexBuffer(&geometry.indices);
 
@@ -588,7 +651,7 @@ bool MaterialPreviewRenderer::RecordGeometryJob(const RecordingContext& context,
         m_gBuffer.GetMotion().GetSRVIndex(), context.brdfLUTIndex, context.averageAlbedoLUTIndex,
         {eye.x, eye.y, eye.z}, m_gBuffer.GetGeometricNormal().GetSRVIndex()};
     commandList->SetGraphicsRoot32BitConstants(0, 9, &lighting, 0);
-    commandList->SetGraphicsRoot32BitConstants(1, 27, &material, 0);
+    commandList->SetGraphicsRoot32BitConstants(1, PreviewMaterialConstantCount, &previewMaterial, 0);
     commandList->DrawInstanced(3, 1, 0, 0);
 
     displayColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -735,21 +798,7 @@ bool MaterialPreviewRenderer::PrepareSavedThumbnail(
         const auto& saved = snapshot.material;
 
         Material material;
-        material.model = saved.model;
-        material.roughness = saved.roughness;
-        material.metallic = saved.metallic;
-        material.ior = saved.ior;
-        material.surfaceDetailMode = saved.surfaceDetailMode;
-        material.heightScale = saved.heightScale;
-        material.heightBias = saved.heightBias;
-        material.preferARM = saved.preferARM;
-
-        for(size_t index = 0; index < 3; ++index)
-        {
-            material.baseColor[index] = saved.baseColor[index];
-            material.conductorN[index] = saved.conductorN[index];
-            material.conductorK[index] = saved.conductorK[index];
-        }
+        MaterialParameterPropagation::Apply(material, saved);
 
         MaterialPreviewRequest request{root, id.ToReference(), m_thumbnail.revision + 1, material.GetGPUData(), 0.0f, 0.0f};
         request.textures = {saved.baseColorTexture, saved.normalTexture, saved.roughnessTexture,

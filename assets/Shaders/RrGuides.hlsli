@@ -33,34 +33,13 @@ float3 RrEnvBRDFApprox2(float3 specularColor, float alpha, float NoV)
     return mad(specularColor, max(0.0f, scale), max(0.0f, bias));
 }
 
-// The diffuse reflectance and specular F0 of Engine's three material models, from the G-buffer's linear base colour and
-// model-0 metallic (the same conventions as the path tracer's PathTraceDiffuseAlbedo / PathTraceSchlickF0 and NRD's
-// NrdPathTraceMaterialAlbedo, without any of NRD's demodulation floors):
-//   0 metallic-roughness: diffuse base * (1 - metallic), F0 lerp(0.04, base, metallic)
-//   1 dielectric:         diffuse base,                 F0 ((ior - 1) / (ior + 1))^2
-//   2 conductor:          diffuse 0,                    F0 the average conductor Fresnel
+// The diffuse reflectance and specular F0 from the G-buffer's linear base colour and metalness: the OpenPBR material's
+// guide reflectances (OpenPBRMaterialReflectanceGuide, the same ones NRD's NrdPathTraceMaterialAlbedo uses), without
+// any of NRD's demodulation floors.
 void RrMaterialReflectance(GPUMaterial material, float3 baseColor, float metallic, out float3 diffuseAlbedo,
     out float3 specularF0)
 {
-    if(material.model == 0u)
-    {
-        diffuseAlbedo = baseColor * (1.0f - metallic);
-        specularF0 = lerp(float3(0.04f, 0.04f, 0.04f), baseColor, metallic);
-        return;
-    }
-
-    if(material.model == 1u)
-    {
-        float iorDifference = material.ior - 1.0f;
-        float iorSum = material.ior + 1.0f;
-        float dielectricF0 = (iorDifference * iorDifference) / max(iorSum * iorSum, 1.0e-6f);
-        diffuseAlbedo = baseColor;
-        specularF0 = float3(dielectricF0, dielectricF0, dielectricF0);
-        return;
-    }
-
-    diffuseAlbedo = float3(0.0f, 0.0f, 0.0f);
-    specularF0 = saturate(material.averageConductorFresnel);
+    OpenPBRMaterialReflectanceGuide(material, baseColor, metallic, diffuseAlbedo, specularF0);
 }
 
 #endif

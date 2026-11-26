@@ -1145,9 +1145,20 @@ class Renderer
         return m_frameGenerationPresentation;
     }
 
-    // FG.3: the saved DLSS Frame Generation toggle, from Engine before each Editor frame. Render applies it between frames
-    // (the present path follows it while Frame Generation is available); packaged games never request it.
-    // ENGINE_FRAME_GENERATION=1 (diagnostics) requests it whatever is saved.
+    // Cooked-game port (the packaged status line): whether the last frame presented a generated frame, and why not.
+    bool IsFrameGenerationActiveLastFrame() const noexcept
+    {
+        return m_frameGenerationEvaluatedLastFrame;
+    }
+
+    const std::string& GetFrameGenerationInactiveReason() const noexcept
+    {
+        return m_frameGenerationInactiveReason;
+    }
+
+    // FG.3: the saved DLSS Frame Generation toggle, from Engine before each Editor or packaged frame. Render applies it
+    // between frames (the present path follows it while Frame Generation is available). ENGINE_FRAME_GENERATION=1
+    // (diagnostics, Editor only) requests it whatever is saved.
     void SetFrameGenerationRequested(bool requested);
 
     FramePresenter::Statistics GetFramePresentationStatistics() const
@@ -2261,6 +2272,10 @@ private:
     // After the real frame's UI: the same UI over the generated image, into the generated composite.
     void RecordGeneratedFrameUi(ID3D12GraphicsCommandList* commandList, const PresentationTarget& target,
         const D3D12_VIEWPORT& viewport, const D3D12_RECT& scissor, const float clearColor[4]);
+    // Cooked-game port: a packaged frame's offscreen path (unlit mist or Frame Generation). Copies the finished scene image
+    // into the target (left in RENDER_TARGET), and the generated image into its composite when this recording rendered
+    // one. Both extents are the window's.
+    void RecordPackagedPresentationCopy(ID3D12GraphicsCommandList* commandList, const PresentationTarget& target);
     // After the frame's recording was submitted: the swap chain presents it, or the present thread receives it.
     bool PresentTarget(const PresentationTarget& target);
     // PresentTarget for a scene frame, inside the CPU timing and NVIDIA Reflex present markers.
@@ -2579,6 +2594,18 @@ private:
     void ReleasePreparedReSTIRPTPipelines();
     ReSTIRPTPipelinePreparation m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::NotSubmitted;
     std::shared_ptr<ReSTIRPTPreparedPipelines> m_restirPtPreparedPipelines;
+    // OpenPBR tiers: the layered kernels (coat, fuzz, thin film, anisotropy) are prepared on the same worker only once a
+    // published material needs them, and adopted when ready (UpdateReSTIRPTLayeredPipelines, every ReSTIR PT frame).
+    // Until then such materials render through the base tier without those lobes. A failed set is not retried.
+    static constexpr const char* ReSTIRPTLayeredPipelineJobKey = "ReSTIR PT layered pipelines";
+    void UpdateReSTIRPTLayeredPipelines();
+    bool SubmitReSTIRPTLayeredPipelines();
+    // Only while no job uses the set (it was taken, or the worker was joined).
+    void ReleasePreparedReSTIRPTLayeredPipelines();
+    std::shared_ptr<ReSTIRPTPreparedPipelines> m_restirPtPreparedLayeredPipelines;
+    bool m_restirPtLayeredPreparing = false;
+    bool m_restirPtLayeredFailed = false;
+    std::chrono::steady_clock::time_point m_restirPtLayeredRequested{};
     std::unique_ptr<RayTracingPipelineWorker> m_restirPtPipelineWorker;
     std::chrono::steady_clock::time_point m_restirPtPipelinesRequested{};
     bool m_restirPtSamplingFailureLogged = false;
@@ -2714,6 +2741,12 @@ private:
 
     // Why NVIDIA SHARC cannot run here (capabilities, deployed headers), checked once; empty when it can.
     const std::string& NvidiaSharcCapabilityFailure();
+    // Whether the ReSTIR PT kernels are the SHARC twins (the SHARC radiance cache at x3): NVIDIA SHARC is usable here and,
+    // in a packaged game, Build Game cooked the twins (it skips them when SHARC's headers are not deployed).
+    bool ReSTIRPTSharcAvailable();
+    // Where the ReSTIR PT pipelines' shaders come from: the loose shader directory, or the cooked bootstrap in a packaged
+    // game (shared with the worker, as for the PSR auxiliary pipelines).
+    ReSTIRPTShaderSource GetReSTIRPTShaderSource() const;
     void UpdateNvidiaSharc(bool enabled);
     // After the scene-lighting latch: clears the cache when what its radiance means changed (scene lifetime, environment
     // replacement, path estimator). Moving objects and lights, light and material edits and residency changes do not clear

@@ -16,6 +16,14 @@
 // Physical sky S5: RtxdiLights.hlsli shades the sun through the cloud shadow (SkyFrameInfoIndexForLights, defined below).
 #define SKY_FRAME_HAS_INFO_FUNCTION 1
 uint SkyFrameInfoIndexForLights();
+// OpenPBR path-traced AO: the raster primary reads the G-buffer's material AO (PathTracePrimaryOcclusion, defined below).
+#define PATH_TRACE_PRIMARY_HAS_OCCLUSION 1
+float PathTracePrimaryOcclusion(uint2 pixel);
+// OpenPBR anisotropy: the raster primary's tangent (PathTracePrimaryTangent, defined below). Set while a previous frame's
+// G-buffer is decoded, whose pixels the current identity target does not describe.
+#define PATH_TRACE_PRIMARY_HAS_TANGENT 1
+uint PathTracePrimaryTangent(uint2 pixel, float3 origin, float3 position, uint materialIndex);
+static bool g_pathTracePrimaryPreviousFrame = false;
 #include "PathTracePrimarySurface.hlsli"
 #include "RayTracingInstanceData.hlsli"
 // PT.2B: who estimates the HDRI at the ReSTIR DI vertex; read by the ReSTIR DI direct pass and by every split indirect pass.
@@ -52,6 +60,10 @@ struct PATH_TRACE_RAY_PAYLOAD PathTracePayload
     float3 shadingNormal PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
     float2 uv PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
     uint materialIndex PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    // OpenPBR: the smooth interpolated normal of a coated material and the tangent of an anisotropic one
+    // (OpenPBRPackUnitVector; OPENPBR_PACKED_VECTOR_NONE otherwise).
+    uint packedSmoothNormal PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    uint packedTangent PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
 };
 
 struct PATH_TRACE_RAY_PAYLOAD PathTraceVisibilityPayload
@@ -70,6 +82,8 @@ struct PATH_TRACE_RAY_PAYLOAD PathTracePsrGuidePayload
     float3 shadingNormal PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
     float2 uv PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
     uint materialIndex PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    uint packedSmoothNormal PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    uint packedTangent PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
     uint instanceID PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
     uint primitiveIndex PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
 };
@@ -158,8 +172,27 @@ cbuffer PathTraceConstants : register(b0)
     uint skyBackgroundEquirect;
     // S5: the physical sky's frame information (SkyFrame.hlsli), or 0xFFFFFFFF.
     uint skyFrameInfoIndex;
-    uint skyBackgroundPadding;
+    // OpenPBR path-traced AO (former padding): the G-buffer motion target, whose alpha holds the material AO, for the
+    // raster primary (PathTracePrimaryOcclusion), or 0xFFFFFFFF.
+    uint gBufferMotionIndex;
+
+    // ReSTIR PT brightness (2026-11-26), appended: the indirect luminance clamp's threshold (PathTraceIndirectClampScale),
+    // PATH_TRACE_INDIRECT_LUMINANCE_CLAMP in the real-time modes and 0 (no clamp) in the reference mode.
+    float indirectLuminanceClamp;
+    uint3 indirectLuminanceClampPadding;
 };
+
+// The raster primary's material AO from the G-buffer (PathTracePrimarySurface.hlsli); 1 without a motion target.
+float PathTracePrimaryOcclusion(uint2 pixel)
+{
+    if(gBufferMotionIndex == 0xFFFFFFFFu)
+    {
+        return 1.0f;
+    }
+
+    Texture2D<float4> motionTexture = ResourceDescriptorHeap[gBufferMotionIndex];
+    return saturate(motionTexture.Load(int3(pixel, 0)).a);
+}
 
 cbuffer SceneLightConstants : register(b1)
 {
@@ -518,11 +551,6 @@ bool PathTraceVisible(float3 position, float3 geometricNormal, float3 direction,
 
 float PathTraceResolveMetallic(GPUMaterial material, float2 uv, bool useARM, float sampledARMMetallic)
 {
-    if(material.model != 0u)
-    {
-        return material.metallic;
-    }
-
     float metallic = saturate(material.metallic);
 
     if(useARM)
@@ -540,7 +568,8 @@ float PathTraceResolveMetallic(GPUMaterial material, float2 uv, bool useARM, flo
 }
 
 // Resolves the material exactly as the G-buffer pixel shader does (base color, ARM/roughness/metallic
-// textures), at texture LOD 0. Parallax UV offsets and material AO are not applied (see the report).
+// textures), at texture LOD 0. Parallax UV offsets are not applied (see the report); material AO only through the
+// opt-in path-traced AO controls (OpenPBRApplyOcclusion).
 bool PathTraceBuildSurface(PathTracePayload payload, float3 rayDirection, out PathTraceSurface surface)
 {
     surface = (PathTraceSurface)0;
@@ -569,22 +598,22 @@ bool PathTraceBuildSurface(PathTracePayload payload, float3 rayDirection, out Pa
     }
 
     GPUMaterial material = materials[payload.materialIndex];
-
-    if(material.model > 2u)
-    {
-        return false;
-    }
+    surface.packedSmoothNormal = payload.packedSmoothNormal;
+    surface.packedTangent = payload.packedTangent;
 
     Texture2D<float4> baseColorTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.textureIndex)];
     surface.baseColor = max(material.baseColor * baseColorTexture.SampleLevel(materialSampler, payload.uv, 0.0f).rgb, 0.0f);
 
     bool useARM = material.armTextureIndex != 0xFFFFFFFFu && material.preferARM != 0u;
     float2 armRoughnessMetallic = float2(1.0f, 1.0f);
+    float armOcclusion = 1.0f;
 
     if(useARM)
     {
         Texture2D<float4> armTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.armTextureIndex)];
-        armRoughnessMetallic = armTexture.SampleLevel(materialSampler, payload.uv, 0.0f).gb;
+        float3 arm = armTexture.SampleLevel(materialSampler, payload.uv, 0.0f).rgb;
+        armOcclusion = arm.r;
+        armRoughnessMetallic = arm.gb;
     }
 
     float roughness = material.roughness;
@@ -601,6 +630,13 @@ bool PathTraceBuildSurface(PathTracePayload payload, float3 rayDirection, out Pa
 
     material.roughness = roughness;
     material.metallic = PathTraceResolveMetallic(material, payload.uv, useARM, armRoughnessMetallic.y);
+
+    if((material.lobeFlags & GPU_MATERIAL_PATH_TRACED_AO) != 0u)
+    {
+        OpenPBRApplyOcclusion(material, OpenPBRMaterialOcclusion(material, materialSampler, payload.uv, useARM,
+            armOcclusion));
+    }
+
     surface.material = material;
 
     if(!all(isfinite(surface.baseColor)) || !isfinite(material.roughness) || !isfinite(material.metallic))
@@ -617,6 +653,9 @@ bool PathTraceBuildSurface(PathTracePayload payload, float3 rayDirection, out Pa
 
 // Indirect luminance clamp: the scene-linear luminance above which one indirect contribution (last scattering vertex
 // >= 1) is scaled down to it, preserving RGB ratios. Primary direct lighting, ReSTIR DI and camera-ray misses are exempt.
+// The threshold the loop uses is indirectLuminanceClamp (b0): this value in the real-time modes (and ReSTIR PT's
+// would-clamp counter), 0 in the reference mode, whose progressive mean is unclamped ground truth
+// (PathTraceReferenceSettings::referenceIndirectLuminanceClamp restores the clamp there).
 static const float PATH_TRACE_INDIRECT_LUMINANCE_CLAMP = 10.0f;
 
 // True when a contribution whose last scattering vertex is `vertex` is subject to the clamp.
@@ -636,8 +675,13 @@ float PathTraceIndirectClampScale(float3 contribution)
     }
 #endif
 
+    if(!(indirectLuminanceClamp > 0.0f))
+    {
+        return 1.0f;
+    }
+
     float luminance = PathTraceLuminance(contribution);
-    return luminance > PATH_TRACE_INDIRECT_LUMINANCE_CLAMP ? PATH_TRACE_INDIRECT_LUMINANCE_CLAMP / luminance : 1.0f;
+    return luminance > indirectLuminanceClamp ? indirectLuminanceClamp / luminance : 1.0f;
 }
 
 // PT.2B Approach B (RTXDI_ENVIRONMENT_STRATEGY_SEPARATE_MIS): only the HDRI term of PathTraceMissRadiance for a non-delta
@@ -1104,6 +1148,60 @@ void PathTraceTraceRadianceReordered(RayDesc ray, uint instanceMask, bool reorde
 // after the closest-hit helpers it shares with PathTraceClosestHit.
 void PathTraceTraceRadianceInline(RayDesc ray, uint instanceMask, inout PathTracePayload payload);
 #endif
+
+#ifdef PATH_TRACE_RESTIR_PT_LIBRARY
+// ReSTIR PT reads the tangent from the triangle the G-buffer identity names (RestirPtInitialBody.hlsli); false when this
+// frame's identity target is unavailable.
+bool RestirPtPrimaryTangentFromIdentity(uint2 pixel, float3 position, uint materialIndex, out uint packedTangent);
+#endif
+
+// OpenPBR anisotropy at the raster primary (PathTracePrimarySurface.hlsli; layered tier only, since the base tier compiles
+// the anisotropy flag out). The G-buffer has no tangent. ReSTIR PT interpolates it on the triangle the identity target
+// names, with no ray; otherwise an anisotropic pixel traces its camera ray once and takes the hit's tangent
+// (PathTraceClosestHitBody.hlsli) when the hit has the decoded material. A miss, another material (such as a PSR-replaced
+// pixel) or a mesh without tangents leaves the base isotropic.
+uint PathTracePrimaryTangent(uint2 pixel, float3 origin, float3 position, uint materialIndex)
+{
+#ifdef PATH_TRACE_RESTIR_PT_LIBRARY
+    uint identityTangent;
+
+    if(!g_pathTracePrimaryPreviousFrame &&
+        RestirPtPrimaryTangentFromIdentity(pixel, position, materialIndex, identityTangent))
+    {
+        return identityTangent;
+    }
+#endif
+
+    float3 offset = position - origin;
+    float distance = length(offset);
+
+    if(!(distance > 0.0f) || !isfinite(distance))
+    {
+        return OPENPBR_PACKED_VECTOR_NONE;
+    }
+
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = offset / distance;
+    ray.TMin = 0.0f;
+    ray.TMax = distance * 1.01f + 1.0e-3f;
+
+    PathTracePayload payload = (PathTracePayload)0;
+    payload.hitDistance = -1.0f;
+    payload.packedTangent = OPENPBR_PACKED_VECTOR_NONE;
+#if defined(PATH_TRACE_DIRECT_COMPUTE)
+    PathTraceTraceRadianceInline(ray, 0xFF, payload);
+#else
+    TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
+#endif
+
+    if(payload.hitDistance < 0.0f || payload.materialIndex != materialIndex)
+    {
+        return OPENPBR_PACKED_VECTOR_NONE;
+    }
+
+    return payload.packedTangent;
+}
 
 // How the path loop forms its first vertex. Every ray-generation entry passes one of these as a literal,
 // so the compiler specialises the loop per entry and folds the other cases away: the reference entry's loop
@@ -1608,7 +1706,7 @@ bool PathTracePsrReplaced(uint state)
 bool PathTracePsrEligible(PathTraceRasterFirstVertex firstVertex)
 {
     return firstVertex.state > 0 && maxPathDepth > 0u && firstVertex.surface.deltaSpecular &&
-        firstVertex.surface.specularProbability >= 1.0f;
+        firstVertex.surface.deltaProbability >= 1.0f;
 }
 
 uint PathTracePsrRecordAddress(uint2 pixel)
@@ -1810,7 +1908,10 @@ bool PathTracePsrReplacementSurface(uint2 pixel, PathTraceRasterFirstVertex firs
     surface.view = PsrReflectDirection(surface.view, planeNormal);
     surface.normal = PsrReflectDirection(surface.normal, planeNormal);
     surface.geometricNormal = PsrReflectDirection(surface.geometricNormal, planeNormal);
-    const float lift = PATH_TRACE_PRIMARY_SURFACE_LIFT * length(virtualVertex.cameraRelativePosition);
+    // The virtual image is decoded from the depth target too, so it takes the decode's lift (reflection keeps the angle
+    // between the normal and the view ray).
+    const float lift = PathTracePrimarySurfaceLift(pixel, gBuffer.depth, virtualVertex.cameraRelativePosition,
+        virtualVertex.surface.geometricNormal, PathTracePsrMirrorCamera().camera);
     const float3 relative = PsrReflectPoint(virtualVertex.cameraRelativePosition, firstVertex.psrPlanePoint, planeNormal) +
         surface.geometricNormal * lift;
     position = psrGBufferCameraPosition + relative;
@@ -1876,7 +1977,8 @@ bool PathTracePsrChainSurface(uint2 pixel, PathTraceRasterFirstVertex firstVerte
     const float3 relative = PsrReflectPoint(PsrReflectPoint(virtualVertex.cameraRelativePosition,
         firstVertex.psrPlanePoint, planeNormal), chainPoint, chainNormal);
     exactPoint = psrGBufferCameraPosition + relative;
-    position = exactPoint + surface.geometricNormal * (PATH_TRACE_PRIMARY_SURFACE_LIFT * pathLength);
+    position = exactPoint + surface.geometricNormal * PathTracePrimarySurfaceLift(pixel, gBuffer.depth,
+        virtualVertex.cameraRelativePosition, virtualVertex.surface.geometricNormal, PathTracePsrMirrorCamera().camera);
     return all(isfinite(position)) && pathLength > 0.0f && PathTraceFinalizeSurface(surface);
 }
 
@@ -1916,7 +2018,7 @@ bool PathTracePsrChainOnRay(float3 chainHit, PathTraceSurface chainSurface, floa
 
 bool PathTracePsrPureMirror(PathTraceSurface surface)
 {
-    return surface.deltaSpecular && surface.specularProbability >= 1.0f;
+    return surface.deltaSpecular && surface.deltaProbability >= 1.0f;
 }
 
 // The direct pass's K = 2 shading vertex: retraces A -> B (one ray) and accepts D if it lies on B's delta ray.
@@ -1993,6 +2095,8 @@ PathTracePayload PathTraceEffectivePrimaryReplacementPayload(uint2 pixel)
     payload.shadingNormal = hit.shadingNormal;
     payload.uv = hit.uv;
     payload.materialIndex = hit.materialIndex;
+    payload.packedSmoothNormal = OPENPBR_PACKED_VECTOR_NONE;
+    payload.packedTangent = OPENPBR_PACKED_VECTOR_NONE;
     return payload;
 }
 
@@ -2489,7 +2593,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             break;
         }
 #endif
-        bool hasNonDeltaLobe = !surface.deltaSpecular || surface.specularProbability < 1.0f;
+        bool hasNonDeltaLobe = !surface.deltaSpecular || surface.deltaProbability < 1.0f;
 
         if(hasNonDeltaLobe && PATH_TRACE_SHARC_NV_SHADES(vertex))
         {
@@ -3259,6 +3363,8 @@ void PathTracePsrGuideRayGeneration()
             payload.shadingNormal = guidePayload.shadingNormal;
             payload.uv = guidePayload.uv;
             payload.materialIndex = guidePayload.materialIndex;
+            payload.packedSmoothNormal = guidePayload.packedSmoothNormal;
+            payload.packedTangent = guidePayload.packedTangent;
 
             PathTraceSurface replacement;
 
@@ -3290,10 +3396,16 @@ void PathTracePsrGuideRayGeneration()
 
     PathTracePsrStoreRecord(pixel, state, payload);
 
-    // The mirror plane: the raster point before PATH_TRACE_PRIMARY_SURFACE_LIFT, and its viewer-facing geometric normal.
+    // The mirror plane: the raster point before the decode's lift, and its viewer-facing geometric normal.
     float3 planeNormal = firstVertex.surface.geometricNormal;
     // The lift is along n, so the lifted point's camera distance differs from the raster point's only to second order.
-    float lift = PATH_TRACE_PRIMARY_SURFACE_LIFT * length(firstVertex.position - cameraPosition);
+    PathTracePrimaryCamera liftCamera;
+    liftCamera.inverseCameraRelativeViewProjection = inverseCameraRelativeViewProjection;
+    liftCamera.cameraPosition = cameraPosition;
+    liftCamera.resolution = resolution;
+    Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[gBufferGeometricNormalIndex];
+    float lift = PathTracePrimarySurfaceLift(pixel, depthTexture.Load(int3(pixel, 0)), firstVertex.position - cameraPosition,
+        planeNormal, liftCamera) * PathTracePrimaryLiftScale(geometricNormalTexture.Load(int3(pixel, 0)).xyz);
     float3 planePoint = firstVertex.position - planeNormal * lift;
     Texture2D<uint2> identityTexture = ResourceDescriptorHeap[psrIdentityIndex];
     uint mirrorIdentity = PsrIdentityInstance(identityTexture.Load(int3(pixel, 0)).x);
@@ -3469,7 +3581,7 @@ void PathTraceRunReSTIRDISplitDirect(bool extract)
         // The conditions under which PathTraceTracePath calls PathTraceRtxdiDirectLighting at vertex 0: a G-buffer
         // surface, a path that continues past vertex 0, and a non-delta lobe.
         bool hasNonDeltaLobe = !rasterFirstVertex.surface.deltaSpecular ||
-            rasterFirstVertex.surface.specularProbability < 1.0f;
+            rasterFirstVertex.surface.deltaProbability < 1.0f;
         bool directLighting = rasterFirstVertex.state > 0 && maxPathDepth > 0u && hasNonDeltaLobe;
 #ifdef PATH_TRACE_PSR_LIBRARY
         // PSR.1c-A: a SURFACE pixel (a pure-delta mirror; the production pass computes nothing for it) is lit at its
@@ -3827,6 +3939,8 @@ void PathTracePsrGuideClosestHit(inout PathTracePsrGuidePayload payload, BuiltIn
     payload.shadingNormal = shadingNormal;
     payload.uv = uv;
     payload.materialIndex = instance.materialIndex;
+    payload.packedSmoothNormal = OPENPBR_PACKED_VECTOR_NONE;
+    payload.packedTangent = OPENPBR_PACKED_VECTOR_NONE;
     payload.instanceID = InstanceID();
     payload.primitiveIndex = PrimitiveIndex();
 }

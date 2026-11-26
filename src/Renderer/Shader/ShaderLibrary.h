@@ -66,10 +66,12 @@ class ShaderLibrary
     }
     bool InitializePackaged(std::span<const std::byte> payload);
 
-    // The shader bootstrap limits InitializePackaged admits.
-    static constexpr std::size_t MaximumBootstrapRecords = 256;
+    // The shader bootstrap limits InitializePackaged admits. Cooked-game port: raised from 256 records and 64 MiB for
+    // ReSTIR PT Enhanced's kernels, their SHARC twins and OpenPBR's larger DXR libraries. 256 MiB is the archive's
+    // largest entry (EngineAssetPak::Limits::payloadBytes).
+    static constexpr std::size_t MaximumBootstrapRecords = 512;
     static constexpr std::size_t MaximumBootstrapRecordBytes = 16 * 1024 * 1024;
-    static constexpr std::size_t MaximumBootstrapBytes = 64 * 1024 * 1024;
+    static constexpr std::size_t MaximumBootstrapBytes = 256 * 1024 * 1024;
 
     // Offline authoring only. Compiles the renderer's packaged inventory (PackagedShaderInventory) with the arguments
     // the runtime uses, libraries through the persistent DXIL cache. Throws when any entry fails or a limit is exceeded.
@@ -88,6 +90,14 @@ class ShaderLibrary
     bool HasPackagedLibrary(const std::filesystem::path& path) const
     {
         return m_packaged && m_packagedBytecode.contains(path.generic_string() + ":library");
+    }
+
+    // Whether the packaged bootstrap holds the shader (its runtime key, as Load looks it up). Always false outside packaged
+    // games. Lets a pass pick a variant Build Game may have left out (SHARC's twins without SHARC's headers).
+    bool HasPackagedShader(const std::string& path, const std::string& entryPoint, ShaderStage stage) const
+    {
+        return m_packaged &&
+            m_packagedBytecode.contains(path + ":" + entryPoint + ":" + std::to_string(static_cast<int>(stage)));
     }
 
     // PS.5B.1: the cooked library at path, the packaged counterpart of compiling it. On failure problem says whether it

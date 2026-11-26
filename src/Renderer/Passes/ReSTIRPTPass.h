@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -419,6 +420,15 @@ struct ReSTIRPTLightTileConstants
 
 static_assert(sizeof(ReSTIRPTLightTileConstants) == 32, "ReSTIRPTLightTileConstants must match its HLSL layout.");
 
+// Cooked-game port (2026-11-26): where ReSTIR PT's pipeline preparation reads its shaders. The Editor compiles from the loose
+// shader root; a packaged game loads the cooked bootstrap (the renderer's shared copy, as the PSR auxiliary worker reads it).
+// Exactly one is set.
+struct ReSTIRPTShaderSource
+{
+    std::filesystem::path shaderRoot;
+    std::shared_ptr<const std::vector<std::byte>> packagedShaders;
+};
+
 // ReSTIR PT's compute pipelines and its pairing textures' texels, prepared apart from the pass (ReSTIRPTPass::
 // PreparePipelines), so activating ReSTIR PT creates no pipeline on the render thread: the GPU driver takes 0.1-0.5 s per
 // kernel with a warm shader cache and seconds per kernel after a shader change. Holds only immutable device objects and CPU
@@ -430,6 +440,15 @@ struct ReSTIRPTPreparedPipelines
     ComputePipeline temporal;
     ComputePipeline initialReGIR;
     ComputePipeline initialReGIRLightBounce;
+    // OpenPBR: the layered tier of the production kernels (coat, fuzz, thin film and anisotropy compiled in), filled only
+    // in a layered set (below); the members above are the base tier.
+    ComputePipeline initialLayered;
+    ComputePipeline temporalLayered;
+    ComputePipeline initialReGIRLayered;
+    ComputePipeline initialReGIRLightBounceLayered;
+    ComputePipeline spatialPairsLayered;
+    ComputePipeline spatialResampleLayered;
+    ComputePipeline temporalPassLayered;
     ComputePipeline diagnostics;
     ComputePipeline visibilityBench;
     ComputePipeline spatialPairs;
@@ -443,9 +462,12 @@ struct ReSTIRPTPreparedPipelines
     std::vector<std::uint32_t> pairingTexels;
     // The measured standard deviation of each pairing texture, for the log.
     std::string pairingSummary;
-    // Whether the ReSTIRPT/ kernels were compiled with the SHARC radiance cache (ShaderCompiler::SetRestirPtSharc), set by
-    // the caller before preparing; a set prepared for the other choice is not adopted.
+    // Whether the kernels are the SHARC twins (ShaderVariantTable.inl, the SHARC radiance cache at x3 compiled in), set by
+    // the caller before preparing from NVIDIA SHARC's capability; a set prepared for the other choice is not adopted.
     bool sharc = false;
+    // OpenPBR: set by the caller for the layered tier's own set (only its *Layered members, no pairing textures), prepared
+    // once a published material needs it and adopted by ReSTIRPTPass::AdoptLayeredPipelines.
+    bool layered = false;
     // The first failure (a shader that did not compile, a pipeline that could not be created, a failed pairing check).
     std::string failure;
 
@@ -487,14 +509,17 @@ class ReSTIRPTPass
     ReSTIRPTPass& operator=(const ReSTIRPTPass&) = delete;
 
     // Compiles and creates every pipeline into prepared and builds the pairing texels: the pipelines in parallel on a few
-    // threads of their own, each with a private ShaderLibrary rooted at shaderRoot (DXC and the driver compile one shader
-    // per call on the calling thread). Touches no pass state and calls only free-threaded device methods, so it may run on
-    // any thread; it returns when everything is created. False, with prepared.failure, when anything failed.
-    static bool PreparePipelines(ID3D12Device* device, const std::filesystem::path& shaderRoot,
+    // threads of their own, each with a private ShaderLibrary rooted at the source's shader root (DXC and the driver compile
+    // one shader per call on the calling thread), or, packaged, sharing one library over the cooked bootstrap (loading is a
+    // lookup there; only the driver's compile runs in parallel). A packaged set holds the production pipelines only: the
+    // test-only and off-by-default kernels are never cooked, and nothing selects them without their development switches.
+    // Touches no pass state and calls only free-threaded device methods, so it may run on any thread; it returns when
+    // everything is created. False, with prepared.failure, when anything failed.
+    static bool PreparePipelines(ID3D12Device* device, const ReSTIRPTShaderSource& source,
         ReSTIRPTPreparedPipelines& prepared);
-    // Prepares the pipelines here, blocking (PreparePipelines from shaderLibrary's sources), then initializes from them as
-    // below. For callers without prepared pipelines.
-    bool Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary, DescriptorHeap& descriptorHeap,
+    // Prepares the pipelines here, blocking (PreparePipelines with this SHARC choice), then initializes from them as below.
+    // For callers without prepared pipelines.
+    bool Initialize(ID3D12Device* device, const ReSTIRPTShaderSource& source, bool sharc, DescriptorHeap& descriptorHeap,
         ResourceUploader& uploader, const ReSTIRPTSettings& settings);
     // Adopts the prepared pipelines and pairing texels (a failed set fails the pass with its failure) and creates the
     // extent-independent buffers (sized for settings' tiles). Render thread. A failure is sticky and reported by
@@ -606,9 +631,11 @@ class ReSTIRPTPass
 
         // M5.2: the fused temporal kernel only while temporal reuse is on without its own pass (the production kernel
         // carries none of its code).
+        const bool layered = UsesLayeredPipelines();
+
         if(settings.reservoir && settings.temporal && !temporalPass)
         {
-            return m_temporalPipeline;
+            return layered ? m_temporalLayeredPipeline : m_temporalPipeline;
         }
 
         // M5.6 O0: the ReGIR variant only on frames whose ReGIR light map was recorded (RecordReGIRLights); its
@@ -616,27 +643,64 @@ class ReSTIRPTPass
         if(m_regirThisFrame)
         {
             const bool lightBounce = settings.lightTracedBounce && settings.directReservoir;
-            return lightBounce ? m_initialReGIRLightBouncePipeline : m_initialReGIRPipeline;
+
+            if(lightBounce)
+            {
+                return layered ? m_initialReGIRLightBounceLayeredPipeline : m_initialReGIRLightBouncePipeline;
+            }
+
+            return layered ? m_initialReGIRLayeredPipeline : m_initialReGIRPipeline;
         }
 
-        return m_initialPipeline;
+        return layered ? m_initialLayeredPipeline : m_initialPipeline;
     }
 
     // M5.4 C1: the temporal reuse pass (its diagnostics variant with the temporal round trip).
     const ComputePipeline& GetTemporalPassPipeline(const ReSTIRPTSettings& settings) const
     {
-        return settings.temporalRoundTrip ? m_temporalPassDiagnosticsPipeline : m_temporalPassPipeline;
+        if(settings.temporalRoundTrip)
+        {
+            return m_temporalPassDiagnosticsPipeline;
+        }
+
+        return UsesLayeredPipelines() ? m_temporalPassLayeredPipeline : m_temporalPassPipeline;
     }
 
     // M5.3 spatial reuse's pre-pass (the diagnostics variant for the round trip) and resampling pass.
     const ComputePipeline& GetSpatialPairsPipeline(const ReSTIRPTSettings& settings) const
     {
-        return settings.spatialRoundTrip ? m_spatialPairsDiagnosticsPipeline : m_spatialPairsPipeline;
+        if(settings.spatialRoundTrip)
+        {
+            return m_spatialPairsDiagnosticsPipeline;
+        }
+
+        return UsesLayeredPipelines() ? m_spatialPairsLayeredPipeline : m_spatialPairsPipeline;
     }
 
     const ComputePipeline& GetSpatialResamplePipeline() const
     {
-        return m_spatialResamplePipeline;
+        return UsesLayeredPipelines() ? m_spatialResampleLayeredPipeline : m_spatialResamplePipeline;
+    }
+
+    // OpenPBR tiers: whether this frame's material table has a coat, fuzz, thin film or anisotropic material, so the
+    // getters above return the layered kernels once their set was adopted (the base tier compiles those lobes out; until
+    // then such materials render without them). Set before each dispatch.
+    void SetLayeredMaterials(bool layeredMaterials)
+    {
+        m_layeredMaterials = layeredMaterials;
+    }
+
+    // Adopts a layered set (ReSTIRPTPreparedPipelines::layered) into the initialized pass; false when the set failed.
+    bool AdoptLayeredPipelines(const ReSTIRPTPreparedPipelines& prepared);
+
+    bool HasLayeredPipelines() const
+    {
+        return m_layeredReady;
+    }
+
+    bool UsesLayeredPipelines() const
+    {
+        return m_layeredMaterials && m_layeredReady;
     }
 
     // M5.3 test only: the pairing textures (packed int8 deltas, 254^2 + 230^2 + 210^2 texels) and their measured
@@ -703,6 +767,16 @@ class ReSTIRPTPass
     // Wall boiling (experimental): the ReGIR kernel with light-traced bounce connections (RESTIR_PT_LIGHT_BOUNCE).
     ComputePipeline m_initialReGIRLightBouncePipeline;
     bool m_regirThisFrame = false;
+    // OpenPBR: the layered tier of the production kernels (SetLayeredMaterials selects it).
+    ComputePipeline m_initialLayeredPipeline;
+    ComputePipeline m_temporalLayeredPipeline;
+    ComputePipeline m_initialReGIRLayeredPipeline;
+    ComputePipeline m_initialReGIRLightBounceLayeredPipeline;
+    ComputePipeline m_spatialPairsLayeredPipeline;
+    ComputePipeline m_spatialResampleLayeredPipeline;
+    ComputePipeline m_temporalPassLayeredPipeline;
+    bool m_layeredMaterials = false;
+    bool m_layeredReady = false;
     Buffer m_counters;
     Buffer m_reservoirs[2];
     // M5.3: spatial pipelines, the scratch reservoirs (the initial/temporal kernel's output while spatial reuse runs), the

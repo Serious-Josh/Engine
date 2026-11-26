@@ -49,8 +49,9 @@ bool SphereGridScene::Initialize(
 
     pipelineDescription.rootParameters.push_back(
         {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_ALL});
+    // ObjectConstants: the pixel shader reads the model matrix too (Triangle.hlsl's primary surface lift scale).
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
+        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_ALL});
 
     pipelineDescription.depthEnabled = true;
     pipelineDescription.mirroredWindingVariant = true;
@@ -125,7 +126,6 @@ bool SphereGridScene::Initialize(
         material.pipeline = &m_pipeline;
         material.texture = &m_texture;
         material.normalTexture = &m_normalTexture;
-        material.model = MaterialModel::Dielectric;
 
         material.roughnessTexture = &m_roughnessTexture;
         material.roughness = 1.0f;
@@ -153,7 +153,9 @@ bool SphereGridScene::Initialize(
 
         material.texture = &m_texture;
         material.normalTexture = &m_normalTexture;
-        material.model = MaterialModel::Conductor;
+        // A fully metallic OpenPBR base whose F82-tint colours reproduce the copper-like complex IOR these spheres
+        // used as conductors.
+        material.metallic = 1.0f;
         material.roughnessTexture = &m_roughnessTexture;
 
         material.roughness = 1.0f;
@@ -178,19 +180,14 @@ bool SphereGridScene::Initialize(
             material.roughness = 0.65f;
         }
 
-        material.conductorN[0] = 0.2f;
-        material.conductorN[1] = 0.9f;
+        const OpenPBRMaterialParameters::MetalColors metalColors =
+            OpenPBRMaterialParameters::MetalColorsFromComplexIor({0.2f, 0.9f, 1.1f}, {3.9f, 2.5f, 2.1f});
 
-        material.conductorN[2] = 1.1f;
-
-        material.conductorK[0] = 3.9f;
-
-        material.conductorK[1] = 2.5f;
-        material.conductorK[2] = 2.1f;
-
-        material.baseColor[0] = 0.5f;
-        material.baseColor[1] = 0.5f;
-        material.baseColor[2] = 0.5f;
+        for(size_t component = 0; component < 3; ++component)
+        {
+            material.baseColor[component] = metalColors.baseColor[component];
+            material.specularColor[component] = metalColors.edgeTint[component];
+        }
 
         RenderObject object{};
 
@@ -212,7 +209,6 @@ bool SphereGridScene::Initialize(
 
         material.texture = &m_texture;
         material.normalTexture = &m_normalTexture;
-        material.model = MaterialModel::MetallicRoughness;
 
         material.roughnessTexture = &m_roughnessTexture;
         material.roughness = 1.0f;
@@ -235,7 +231,6 @@ bool SphereGridScene::Initialize(
     m_floorMaterial.pipeline = &m_pipeline;
     m_floorMaterial.texture = &m_texture;
     m_floorMaterial.normalTexture = &m_normalTexture;
-    m_floorMaterial.model = MaterialModel::Dielectric;
 
     m_floorMaterial.roughness = 0.7f;
 

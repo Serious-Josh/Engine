@@ -8,7 +8,9 @@
 #include "assets/ProjectAssetResolver.h"
 #include "assets/MaterialAssetSerializer.h"
 #include "Renderer/Material.h"
+#include "Renderer/OpenPBRMaterialParameters.h"
 #include "Renderer/Renderer.h"
+#include "Scene/MaterialParameterPropagation.h"
 
 #include <utility>
 #include <fstream>
@@ -69,10 +71,18 @@ namespace
             return std::equal(left.begin(), left.end(), right.begin(), sameFloat);
         };
 
-        const bool surface = a.model == b.model && sameVector(a.baseColor, b.baseColor) &&
-            sameFloat(a.roughness, b.roughness) && sameFloat(a.metallic, b.metallic);
-        const bool optical = sameFloat(a.ior, b.ior) && sameVector(a.conductorN, b.conductorN) &&
-            sameVector(a.conductorK, b.conductorK);
+        const bool base = sameVector(a.baseColor, b.baseColor) && sameFloat(a.baseWeight, b.baseWeight) &&
+            sameFloat(a.metallic, b.metallic) && sameFloat(a.diffuseRoughness, b.diffuseRoughness);
+        const bool specular = sameFloat(a.roughness, b.roughness) && sameFloat(a.ior, b.ior) &&
+            sameFloat(a.specularWeight, b.specularWeight) && sameVector(a.specularColor, b.specularColor) &&
+            sameFloat(a.anisotropy, b.anisotropy) && sameFloat(a.anisotropyRotationDegrees, b.anisotropyRotationDegrees);
+        const bool coat = sameFloat(a.coatWeight, b.coatWeight) && sameVector(a.coatColor, b.coatColor) &&
+            sameFloat(a.coatRoughness, b.coatRoughness) && sameFloat(a.coatIor, b.coatIor) &&
+            sameFloat(a.coatDarkening, b.coatDarkening) && a.coatFollowsBaseNormal == b.coatFollowsBaseNormal;
+        const bool fuzzAndFilm = sameFloat(a.fuzzWeight, b.fuzzWeight) && sameVector(a.fuzzColor, b.fuzzColor) &&
+            sameFloat(a.fuzzRoughness, b.fuzzRoughness) && sameFloat(a.thinFilmWeight, b.thinFilmWeight) &&
+            sameFloat(a.thinFilmThickness, b.thinFilmThickness) && sameFloat(a.thinFilmIor, b.thinFilmIor);
+        const bool occlusion = sameFloat(a.aoDiffuse, b.aoDiffuse) && sameFloat(a.aoSpecularWeight, b.aoSpecularWeight);
         const bool detail = a.surfaceDetailMode == b.surfaceDetailMode && sameFloat(a.heightScale, b.heightScale) &&
             sameFloat(a.heightBias, b.heightBias) && a.preferARM == b.preferARM;
 
@@ -81,7 +91,7 @@ namespace
         const bool packedTextures = a.armTexture == b.armTexture && a.aoTexture == b.aoTexture &&
             a.heightTexture == b.heightTexture;
 
-        return surface && optical && detail && textures && packedTextures;
+        return base && specular && coat && fuzzAndFilm && occlusion && detail && textures && packedTextures;
     }
 }
 
@@ -136,22 +146,7 @@ const std::optional<MaterialPreviewRequest>& InspectorPanel::GetPreviewRequest()
     {
         MaterialAssetSerializer::Serialize(*m_material);
         Material material;
-        material.model = m_material->model;
-        material.roughness = m_material->roughness;
-        material.metallic = m_material->metallic;
-        material.ior = m_material->ior;
-
-        material.surfaceDetailMode = m_material->surfaceDetailMode;
-        material.heightScale = m_material->heightScale;
-        material.heightBias = m_material->heightBias;
-        material.preferARM = m_material->preferARM;
-
-        for(size_t index = 0; index < 3; ++index)
-        {
-            material.baseColor[index] = m_material->baseColor[index];
-            material.conductorN[index] = m_material->conductorN[index];
-            material.conductorK[index] = m_material->conductorK[index];
-        }
+        MaterialParameterPropagation::Apply(material, *m_material);
 
         m_previewRequest = MaterialPreviewRequest{
             m_projectRoot, identity, ++m_previewRevision, material.GetGPUData(), m_previewYaw, m_previewPitch};
@@ -1287,65 +1282,128 @@ void InspectorPanel::DrawMaterial(
     const ProjectAssetRegistry& registry)
 {
     auto& material = *m_material;
-    int model = static_cast<int>(material.model);
     int detail = static_cast<int>(material.surfaceDetailMode);
 
-    ImGui::SeparatorText("Surface");
-
-    if(ImGui::Combo("Model", &model, "MetallicRoughness\0Dielectric\0Conductor\0"))
-    {
-        material.model = static_cast<MaterialModel>(model);
-    }
-
-    ImGui::ColorEdit3("Base color", material.baseColor.data());
-
-    // Transform-style drag controls edit the unsaved material draft directly; Save and
-    // Revert keep their existing meaning. Ranges and clamps match the previous controls:
-    // roughness and metallic were always clamped to [0, 1], including typed values.
+    // OpenPBR Surface parameters (OpenPBR 1.1.2), grouped as the specification groups them. Weights, colours and
+    // roughnesses are clamped to [0, 1] (typed values too); IORs only stay positive. The optional layers (coat, fuzz,
+    // thin film) start collapsed while their weight is 0.
     constexpr InspectorDragSpec unitIntervalDrag{0.005f, 0.0f, 1.0f, true, "%.4f"};
+    constexpr InspectorDragSpec iorDrag{0.005f, 1.0f, 3.0f, false, "%.4f"};
+
+    ImGui::SeparatorText("Base");
+    ImGui::ColorEdit3("Base color", material.baseColor.data());
+    InspectorDragFloats("Base weight", &material.baseWeight, 1, unitIntervalDrag);
+    InspectorDragFloats("Metalness", &material.metallic, 1, unitIntervalDrag);
+    InspectorDragFloats("Diffuse roughness", &material.diffuseRoughness, 1, unitIntervalDrag);
+
+    ImGui::SeparatorText("Specular");
     InspectorDragFloats("Roughness", &material.roughness, 1, unitIntervalDrag);
-    InspectorDragFloats("Metallic", &material.metallic, 1, unitIntervalDrag);
 
-    if(material.model == MaterialModel::Dielectric || material.model == MaterialModel::Conductor)
+    if(InspectorDragFloats("IOR", &material.ior, 1, iorDrag) != InspectorDragResult::Idle)
     {
-        ImGui::SeparatorText("Optical properties");
+        material.ior = (std::max)(material.ior, (std::numeric_limits<float>::min)());
     }
 
-    if(material.model == MaterialModel::Dielectric)
-    {
-        constexpr InspectorDragSpec iorDrag{0.005f};
+    // specular_weight may exceed 1: it scales the normal-incidence reflectivity, which the shaders clamp to 1.
+    constexpr InspectorDragSpec specularWeightDrag{0.005f, 0.0f, 2.0f, false, "%.4f"};
 
-        if(InspectorDragFloats("IOR (> 0)", &material.ior, 1, iorDrag) != InspectorDragResult::Idle)
-        {
-            material.ior = (std::max)(material.ior, (std::numeric_limits<float>::min)());
-        }
+    if(InspectorDragFloats("Specular weight", &material.specularWeight, 1, specularWeightDrag) !=
+       InspectorDragResult::Idle)
+    {
+        material.specularWeight = (std::max)(material.specularWeight, 0.0f);
     }
-    else if(material.model == MaterialModel::Conductor)
+
+    ImGui::ColorEdit3("Specular color", material.specularColor.data());
+
+    if(ImGui::IsItemHovered())
     {
-        constexpr InspectorDragSpec conductorDrag{0.01f};
+        ImGui::SetTooltip("Tints the dielectric highlight. On metals it is the edge colour near grazing angles.");
+    }
 
-        if(InspectorDragFloats("Conductor N (>= 0)", material.conductorN.data(), 3, conductorDrag) != InspectorDragResult::Idle)
+    InspectorDragFloats("Anisotropy", &material.anisotropy, 1, unitIntervalDrag);
+    constexpr InspectorDragSpec rotationDrag{0.5f, -180.0f, 180.0f, false, "%.1f deg"};
+    InspectorDragFloats("Anisotropy rotation", &material.anisotropyRotationDegrees, 1, rotationDrag);
+
+    DrawMetalPresets(material);
+
+    ImGui::SeparatorText("Layers");
+
+    if(ImGui::CollapsingHeader("Coat", material.coatWeight > 0.0f ? ImGuiTreeNodeFlags_DefaultOpen : 0))
+    {
+        ImGui::PushID("Coat");
+        InspectorDragFloats("Weight", &material.coatWeight, 1, unitIntervalDrag);
+        ImGui::ColorEdit3("Color", material.coatColor.data());
+        InspectorDragFloats("Roughness", &material.coatRoughness, 1, unitIntervalDrag);
+
+        if(InspectorDragFloats("IOR", &material.coatIor, 1, iorDrag) != InspectorDragResult::Idle)
         {
-            for(auto& value : material.conductorN)
-            {
-                value = (std::max)(value, 0.0f);
-            }
+            material.coatIor = (std::max)(material.coatIor, (std::numeric_limits<float>::min)());
         }
 
-        if(InspectorDragFloats("Conductor K (>= 0)", material.conductorK.data(), 3, conductorDrag) != InspectorDragResult::Idle)
+        InspectorDragFloats("Darkening", &material.coatDarkening, 1, unitIntervalDrag);
+        int coatNormal = material.coatFollowsBaseNormal ? 1 : 0;
+
+        if(ImGui::Combo("Coat normal", &coatNormal, "Smooth\0Same as base\0"))
         {
-            for(auto& value : material.conductorK)
-            {
-                value = (std::max)(value, 0.0f);
-            }
+            material.coatFollowsBaseNormal = coatNormal == 1;
         }
+
+        ImGui::PopID();
+    }
+
+    if(ImGui::CollapsingHeader("Fuzz", material.fuzzWeight > 0.0f ? ImGuiTreeNodeFlags_DefaultOpen : 0))
+    {
+        ImGui::PushID("Fuzz");
+        InspectorDragFloats("Weight", &material.fuzzWeight, 1, unitIntervalDrag);
+        ImGui::ColorEdit3("Color", material.fuzzColor.data());
+        InspectorDragFloats("Roughness", &material.fuzzRoughness, 1, unitIntervalDrag);
+        ImGui::PopID();
+    }
+
+    if(ImGui::CollapsingHeader("Thin film", material.thinFilmWeight > 0.0f ? ImGuiTreeNodeFlags_DefaultOpen : 0))
+    {
+        ImGui::PushID("ThinFilm");
+        InspectorDragFloats("Weight", &material.thinFilmWeight, 1, unitIntervalDrag);
+        constexpr InspectorDragSpec thicknessDrag{0.005f, 0.0f, 2.0f, false, "%.3f um"};
+
+        if(InspectorDragFloats("Thickness", &material.thinFilmThickness, 1, thicknessDrag) != InspectorDragResult::Idle)
+        {
+            material.thinFilmThickness = (std::max)(material.thinFilmThickness, 0.0f);
+        }
+
+        if(InspectorDragFloats("IOR", &material.thinFilmIor, 1, iorDrag) != InspectorDragResult::Idle)
+        {
+            material.thinFilmIor = (std::max)(material.thinFilmIor, (std::numeric_limits<float>::min)());
+        }
+
+        ImGui::PopID();
+    }
+
+    ImGui::SeparatorText("Ambient occlusion");
+    ImGui::TextDisabled("Legacy lighting always applies the AO map.");
+    InspectorDragFloats("AO in path tracing: diffuse", &material.aoDiffuse, 1, unitIntervalDrag);
+    InspectorDragFloats("AO in path tracing: specular", &material.aoSpecularWeight, 1, unitIntervalDrag);
+
+    if(ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Path tracing computes occlusion itself. These let a baked AO map add small-scale occlusion "
+            "the geometry lacks; 0 is OpenPBR's behaviour.");
     }
 
     ImGui::SeparatorText("Surface detail");
 
     if(ImGui::Combo("Mode", &detail, "NormalOnly\0ParallaxOcclusion\0GeometryWithParallaxFallback\0"))
     {
+        const bool enteringParallax = material.surfaceDetailMode == SurfaceDetailMode::NormalOnly &&
+            static_cast<SurfaceDetailMode>(detail) != SurfaceDetailMode::NormalOnly;
         material.surfaceDetailMode = static_cast<SurfaceDetailMode>(detail);
+
+        // A coat over parallax relief defaults to following the base normal (the smooth normal reads as a flat sheet of
+        // glass over the relief; POM report decision 4). The Layers section can set it back.
+        if(enteringParallax)
+        {
+            material.coatFollowsBaseNormal = true;
+        }
     }
 
     constexpr InspectorDragSpec heightDrag{0.001f};
@@ -1374,6 +1432,54 @@ void InspectorPanel::DrawMaterial(
     ImGui::PopID();
     ImGui::PopID();
     ImGui::PopID();
+}
+
+void InspectorPanel::DrawMetalPresets(MaterialAssetData& material)
+{
+    // The presets and the complex-IOR helper fill base_color and specular_color with F82-tint colours and make the base
+    // fully metallic. They are conveniences: nothing about the choice is stored.
+    if(ImGui::BeginCombo("Metal preset", "Choose..."))
+    {
+        for(const auto& preset : OpenPBRMaterialParameters::MetalPresets)
+        {
+            const std::string name(preset.name);
+
+            if(ImGui::Selectable(name.c_str()))
+            {
+                material.baseColor = preset.baseColor;
+                material.specularColor = preset.edgeTint;
+                material.metallic = 1.0f;
+            }
+        }
+
+        ImGui::EndCombo();
+    }
+
+    ImGui::SameLine();
+
+    if(ImGui::Button("From n, k..."))
+    {
+        ImGui::OpenPopup("MetalFromComplexIor");
+    }
+
+    if(ImGui::BeginPopup("MetalFromComplexIor"))
+    {
+        constexpr InspectorDragSpec complexIorDrag{0.01f, 0.0f, 20.0f, false, "%.3f"};
+        InspectorDragFloats("n (R, G, B)", m_metalComplexIorN.data(), 3, complexIorDrag);
+        InspectorDragFloats("k (R, G, B)", m_metalComplexIorK.data(), 3, complexIorDrag);
+
+        if(ImGui::Button("Apply"))
+        {
+            const OpenPBRMaterialParameters::MetalColors colors =
+                OpenPBRMaterialParameters::MetalColorsFromComplexIor(m_metalComplexIorN, m_metalComplexIorK);
+            material.baseColor = colors.baseColor;
+            material.specularColor = colors.edgeTint;
+            material.metallic = 1.0f;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
 }
 
 void InspectorPanel::DrawTextureReference(

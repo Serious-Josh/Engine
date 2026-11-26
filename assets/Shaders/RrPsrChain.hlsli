@@ -38,6 +38,9 @@ struct PathTracePayload
     float3 shadingNormal;
     float2 uv;
     uint materialIndex;
+    // OpenPBR's packed coat smooth normal and anisotropy tangent (PathTraceReference.hlsl's payload).
+    uint packedSmoothNormal;
+    uint packedTangent;
 };
 
 float3 PathTraceOffsetRayOrigin(float3 position, float3 normal)
@@ -53,11 +56,6 @@ float3 PathTraceOffsetRayOrigin(float3 position, float3 normal)
 
 float PathTraceResolveMetallic(GPUMaterial material, float2 uv, bool useARM, float sampledARMMetallic)
 {
-    if(material.model != 0u)
-    {
-        return material.metallic;
-    }
-
     float metallic = saturate(material.metallic);
 
     if(useARM)
@@ -102,11 +100,8 @@ bool PathTraceBuildSurface(PathTracePayload payload, float3 rayDirection, out Pa
     }
 
     GPUMaterial material = materials[payload.materialIndex];
-
-    if(material.model > 2u)
-    {
-        return false;
-    }
+    surface.packedSmoothNormal = payload.packedSmoothNormal;
+    surface.packedTangent = payload.packedTangent;
 
     Texture2D<float4> baseColorTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.textureIndex)];
     surface.baseColor = max(material.baseColor * baseColorTexture.SampleLevel(materialSampler, payload.uv, 0.0f).rgb, 0.0f);
@@ -215,7 +210,7 @@ bool RrPsrSecondMirror(PsrRecoveredMirror mirror, PathTraceBSDFSample mirrorSamp
 
     // PathTracePsrPureMirror: B must be a pure-delta mirror, as the path tracer's chain requires.
     if(payload.hitDistance < 0.0f || !PathTraceBuildSurface(payload, ray.Direction, chainSurface) ||
-        !(chainSurface.deltaSpecular && chainSurface.specularProbability >= 1.0f))
+        !(chainSurface.deltaSpecular && chainSurface.deltaProbability >= 1.0f))
     {
         return false;
     }

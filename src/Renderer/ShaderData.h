@@ -34,7 +34,9 @@ struct CameraConstants
     std::uint32_t psrResolution[2] = {};
     Matrix4 psrInverseCameraRelativeViewProjection;
     float psrCameraPosition[3] = {};
-    float psrPadding = 0.0f;
+    // Non-zero on Path Tracing frames with a raster primary, which always carry the camera above: Triangle.hlsl stores
+    // the path tracer's lift scale as the geometric normal's length (PathTracePrimaryRasterLiftScale).
+    std::uint32_t primarySurfaceLiftScale = 0;
 };
 
 struct ObjectConstants
@@ -209,10 +211,19 @@ struct PathTraceReferenceConstants
     std::uint32_t skyBackgroundEquirect = 0;
     // S5: the physical sky's frame information (SkyFrame.hlsli), or 0xFFFFFFFF.
     std::uint32_t skyFrameInfoIndex = 0xFFFFFFFFu;
-    std::uint32_t skyBackgroundPadding[1] = {};
+    // OpenPBR path-traced AO (former padding): the G-buffer motion target (alpha = material AO) for the raster primary,
+    // or 0xFFFFFFFF.
+    std::uint32_t gBufferMotionIndex = 0xFFFFFFFFu;
+
+    // ReSTIR PT brightness (2026-11-26), appended: the indirect luminance clamp's threshold in render units, 0 for none.
+    // The default is the real-time modes' PATH_TRACE_INDIRECT_LUMINANCE_CLAMP; the reference mode sets 0
+    // (RecordPathTraceReference).
+    float indirectLuminanceClamp = 10.0f;
+    std::uint32_t indirectLuminanceClampPadding[3]{};
 };
 
-static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 4 * 16);
+static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 5 * 16);
+static_assert(offsetof(PathTraceReferenceConstants, indirectLuminanceClamp) == 64 + 7 * 16 + 64 + 4 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, sunDirectionToLight) == 64 + 4 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, inverseCameraRelativeViewProjection) == 64 + 7 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, rawDiffuseHitDistanceIndex) == 272);
@@ -392,9 +403,24 @@ struct LightSamplingConstants
 
 static_assert(sizeof(LightSamplingConstants) == 96, "LightSamplingConstants must match LightSampling.hlsli.");
 
+// GPUMaterial::lobeFlags: which optional OpenPBR lobes a material has (assets/Shaders/MaterialLighting.hlsli mirrors
+// these values), so the BSDF skips a lobe entirely where its weight is 0.
+namespace GpuMaterialLobeFlags
+{
+    inline constexpr unsigned int Coat = 1u;
+    inline constexpr unsigned int Fuzz = 2u;
+    inline constexpr unsigned int ThinFilm = 4u;
+    inline constexpr unsigned int Anisotropy = 8u;
+    inline constexpr unsigned int CoatFollowsBaseNormal = 16u;
+    inline constexpr unsigned int PathTracedAO = 32u;
+}
+
+// One material's OpenPBR Surface parameters as the shaders read them (assets/Shaders/MaterialLighting.hlsli), in
+// 16-byte rows so the same layout also packs into a constant buffer. The authored parameters keep their OpenPBR
+// meaning; dielectricF0, coatF0, coatInternalReflection and lobeFlags are derived (Renderer/OpenPBRMaterialParameters.h).
 struct GPUMaterial
 {
-    unsigned int model;
+    unsigned int lobeFlags;
     float roughness;
     float ior;
     float metallic;
@@ -402,22 +428,51 @@ struct GPUMaterial
     float baseColor[3];
     unsigned int textureIndex;
 
-    float conductorN[3];
+    float specularColor[3];
     unsigned int roughnessTextureIndex;
 
-    float conductorK[3];
+    float coatColor[3];
     unsigned int metallicTextureIndex;
 
-    float averageConductorFresnel[3];
+    float fuzzColor[3];
     unsigned int normalTextureIndex;
+
     unsigned int armTextureIndex;
     unsigned int preferARM;
     uint32_t aoTextureIndex;
-
     uint32_t surfaceDetailMode;
+
     uint32_t heightTextureIndex;
     float heightScale;
     float heightBias;
+    float baseWeight;
+
+    float diffuseRoughness;
+    float specularWeight;
+    float dielectricF0;
+    float anisotropy;
+
+    float anisotropyRotation;
+    float coatWeight;
+    float coatRoughness;
+    float coatIor;
+
+    float coatDarkening;
+    float coatF0;
+    float coatInternalReflection;
+    float fuzzWeight;
+
+    float fuzzRoughness;
+    float thinFilmWeight;
+    float thinFilmThickness;
+    float thinFilmIor;
+
+    float aoDiffuse;
+    float aoSpecularWeight;
+    // 1 in the table; the path tracer's surface builders replace it by the AO-to-diffuse factor (MaterialLighting.hlsli
+    // OpenPBRApplyOcclusion).
+    float diffuseOcclusion;
+    uint32_t reserved1;
 };
 
 struct RayTracingInstanceData
@@ -450,18 +505,18 @@ static_assert(offsetof(ReconstructionConstants, motionIndex) == 80);
 static_assert(offsetof(ReconstructionConstants, skyViewIndex) == 84);
 static_assert(offsetof(ReconstructionConstants, backgroundEquirectIndex) == 88);
 static_assert(offsetof(ReconstructionConstants, skyFrameInfoIndex) == 92);
-static_assert(sizeof(GPUMaterial) == 108);
-static_assert(offsetof(GPUMaterial, model) == 0);
+static_assert(sizeof(GPUMaterial) == 192);
+static_assert(offsetof(GPUMaterial, lobeFlags) == 0);
 static_assert(offsetof(GPUMaterial, roughness) == 4);
 static_assert(offsetof(GPUMaterial, ior) == 8);
 static_assert(offsetof(GPUMaterial, metallic) == 12);
 static_assert(offsetof(GPUMaterial, baseColor) == 16);
 static_assert(offsetof(GPUMaterial, textureIndex) == 28);
-static_assert(offsetof(GPUMaterial, conductorN) == 32);
+static_assert(offsetof(GPUMaterial, specularColor) == 32);
 static_assert(offsetof(GPUMaterial, roughnessTextureIndex) == 44);
-static_assert(offsetof(GPUMaterial, conductorK) == 48);
+static_assert(offsetof(GPUMaterial, coatColor) == 48);
 static_assert(offsetof(GPUMaterial, metallicTextureIndex) == 60);
-static_assert(offsetof(GPUMaterial, averageConductorFresnel) == 64);
+static_assert(offsetof(GPUMaterial, fuzzColor) == 64);
 static_assert(offsetof(GPUMaterial, normalTextureIndex) == 76);
 static_assert(offsetof(GPUMaterial, armTextureIndex) == 80);
 static_assert(offsetof(GPUMaterial, preferARM) == 84);
@@ -470,6 +525,27 @@ static_assert(offsetof(GPUMaterial, surfaceDetailMode) == 92);
 static_assert(offsetof(GPUMaterial, heightTextureIndex) == 96);
 static_assert(offsetof(GPUMaterial, heightScale) == 100);
 static_assert(offsetof(GPUMaterial, heightBias) == 104);
+static_assert(offsetof(GPUMaterial, baseWeight) == 108);
+static_assert(offsetof(GPUMaterial, diffuseRoughness) == 112);
+static_assert(offsetof(GPUMaterial, specularWeight) == 116);
+static_assert(offsetof(GPUMaterial, dielectricF0) == 120);
+static_assert(offsetof(GPUMaterial, anisotropy) == 124);
+static_assert(offsetof(GPUMaterial, anisotropyRotation) == 128);
+static_assert(offsetof(GPUMaterial, coatWeight) == 132);
+static_assert(offsetof(GPUMaterial, coatRoughness) == 136);
+static_assert(offsetof(GPUMaterial, coatIor) == 140);
+static_assert(offsetof(GPUMaterial, coatDarkening) == 144);
+static_assert(offsetof(GPUMaterial, coatF0) == 148);
+static_assert(offsetof(GPUMaterial, coatInternalReflection) == 152);
+static_assert(offsetof(GPUMaterial, fuzzWeight) == 156);
+static_assert(offsetof(GPUMaterial, fuzzRoughness) == 160);
+static_assert(offsetof(GPUMaterial, thinFilmWeight) == 164);
+static_assert(offsetof(GPUMaterial, thinFilmThickness) == 168);
+static_assert(offsetof(GPUMaterial, thinFilmIor) == 172);
+static_assert(offsetof(GPUMaterial, aoDiffuse) == 176);
+static_assert(offsetof(GPUMaterial, aoSpecularWeight) == 180);
+static_assert(offsetof(GPUMaterial, diffuseOcclusion) == 184);
+static_assert(offsetof(GPUMaterial, reserved1) == 188);
 static_assert(sizeof(ShadowConstants) == 256);
 static_assert(sizeof(GPULight) == 64);
 static_assert(offsetof(GPULight, direction) == 16);

@@ -69,9 +69,24 @@
     uint materialStride;
     materials.GetDimensions(materialCount, materialStride);
 
-    // Tangent-space normal mapping, identical to the RTGI/G-buffer convention.
-    if(instance.materialIndex < materialCount && instance.tangentOffset != 0xFFFFFFFFu &&
-        materials[instance.materialIndex].normalTextureIndex != 0xFFFFFFFFu)
+    // OpenPBR layers: a coat's smooth normal is the interpolated normal, and anisotropy needs the surface tangent. Both
+    // stay OPENPBR_PACKED_VECTOR_NONE for materials without those lobes.
+    bool materialValid = instance.materialIndex < materialCount;
+    uint lobeFlags = materialValid ? materials[instance.materialIndex].lobeFlags : 0u;
+    bool hasTangents = instance.tangentOffset != 0xFFFFFFFFu;
+    bool normalMapped = materialValid && hasTangents &&
+        materials[instance.materialIndex].normalTextureIndex != 0xFFFFFFFFu;
+    bool anisotropic = materialValid && hasTangents && (lobeFlags & GPU_MATERIAL_LOBE_ANISOTROPY) != 0u;
+    uint packedSmoothNormal = OPENPBR_PACKED_VECTOR_NONE;
+    uint packedTangent = OPENPBR_PACKED_VECTOR_NONE;
+
+    if((lobeFlags & GPU_MATERIAL_LOBE_COAT) != 0u)
+    {
+        packedSmoothNormal = OpenPBRPackUnitVector(worldNormal);
+    }
+
+    // Tangent-space normal mapping, identical to the RTGI/G-buffer convention, and the anisotropy tangent.
+    if(normalMapped || anisotropic)
     {
         GPUMaterial material = materials[instance.materialIndex];
         float4 objectTangent = PathTraceLoadTangent(vertexBuffer, indices.x, instance) * barycentrics.x +
@@ -80,30 +95,40 @@
         float3 tangent = mul((float3x3)PATH_TRACE_HIT_OBJECT_TO_WORLD, objectTangent.xyz);
         tangent -= worldNormal * dot(worldNormal, tangent);
         float tangentLengthSquared = dot(tangent, tangent);
-        float instanceDeterminant = determinant((float3x3)PATH_TRACE_HIT_OBJECT_TO_WORLD);
-        float handedness = objectTangent.w * (instanceDeterminant < 0.0f ? -1.0f : 1.0f);
+        bool tangentValid = all(isfinite(tangent)) && isfinite(tangentLengthSquared) && tangentLengthSquared > 1.0e-8f;
 
-        Texture2D<float4> normalTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.normalTextureIndex)];
-        float2 normalXY = normalTexture.SampleLevel(materialSampler, uv, 0.0f).rg * 2.0f - 1.0f;
-        float3 sampledNormal = float3(normalXY, sqrt(saturate(1.0f - dot(normalXY, normalXY))));
-        float sampledLengthSquared = dot(sampledNormal, sampledNormal);
-
-        bool frameValid = all(isfinite(tangent)) && isfinite(tangentLengthSquared) && tangentLengthSquared > 1.0e-8f &&
-            all(isfinite(sampledNormal)) && sampledLengthSquared > 1.0e-8f && isfinite(handedness) &&
-            abs(handedness) > 1.0e-8f && isfinite(instanceDeterminant) && instanceDeterminant != 0.0f;
-
-        if(frameValid)
+        if(anisotropic && tangentValid)
         {
-            sampledNormal = normalize(sampledNormal);
-            float3 tangentDirection = normalize(tangent);
-            float3 bitangent = cross(worldNormal, tangentDirection) * handedness;
-            float3 mappedNormal = tangentDirection * sampledNormal.x + bitangent * sampledNormal.y +
-                worldNormal * sampledNormal.z;
-            float mappedLengthSquared = dot(mappedNormal, mappedNormal);
+            packedTangent = OpenPBRPackUnitVector(tangent * rsqrt(tangentLengthSquared));
+        }
 
-            if(all(isfinite(mappedNormal)) && isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
+        if(normalMapped)
+        {
+            float instanceDeterminant = determinant((float3x3)PATH_TRACE_HIT_OBJECT_TO_WORLD);
+            float handedness = objectTangent.w * (instanceDeterminant < 0.0f ? -1.0f : 1.0f);
+
+            Texture2D<float4> normalTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.normalTextureIndex)];
+            float2 normalXY = normalTexture.SampleLevel(materialSampler, uv, 0.0f).rg * 2.0f - 1.0f;
+            float3 sampledNormal = float3(normalXY, sqrt(saturate(1.0f - dot(normalXY, normalXY))));
+            float sampledLengthSquared = dot(sampledNormal, sampledNormal);
+
+            bool frameValid = tangentValid && all(isfinite(sampledNormal)) && sampledLengthSquared > 1.0e-8f &&
+                isfinite(handedness) && abs(handedness) > 1.0e-8f && isfinite(instanceDeterminant) &&
+                instanceDeterminant != 0.0f;
+
+            if(frameValid)
             {
-                shadingNormal = mappedNormal * rsqrt(mappedLengthSquared);
+                sampledNormal = normalize(sampledNormal);
+                float3 tangentDirection = normalize(tangent);
+                float3 bitangent = cross(worldNormal, tangentDirection) * handedness;
+                float3 mappedNormal = tangentDirection * sampledNormal.x + bitangent * sampledNormal.y +
+                    worldNormal * sampledNormal.z;
+                float mappedLengthSquared = dot(mappedNormal, mappedNormal);
+
+                if(all(isfinite(mappedNormal)) && isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
+                {
+                    shadingNormal = mappedNormal * rsqrt(mappedLengthSquared);
+                }
             }
         }
     }
@@ -113,3 +138,5 @@
     payload.shadingNormal = shadingNormal;
     payload.uv = uv;
     payload.materialIndex = instance.materialIndex;
+    payload.packedSmoothNormal = packedSmoothNormal;
+    payload.packedTangent = packedTangent;

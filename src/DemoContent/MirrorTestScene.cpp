@@ -102,8 +102,9 @@ bool MirrorTestScene::Initialize(
     pipelineDescription.rootParameters.push_back(
         {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_ALL});
 
+    // ObjectConstants: the pixel shader reads the model matrix too (Triangle.hlsl's primary surface lift scale).
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
+        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_ALL});
 
     pipelineDescription.depthEnabled = true;
     pipelineDescription.mirroredWindingVariant = true;
@@ -422,7 +423,6 @@ bool MirrorTestScene::Initialize(
     m_mirrorAMaterial.pipeline = &m_pipeline;
     m_mirrorAMaterial.texture = &m_whiteTexture;
 
-    m_mirrorAMaterial.model = MaterialModel::MetallicRoughness;
 
     m_mirrorAMaterial.roughness = 0.0f;
     m_mirrorAMaterial.metallic = 1.0f;
@@ -436,7 +436,6 @@ bool MirrorTestScene::Initialize(
     m_mirrorBMaterial.pipeline = &m_pipeline;
     m_mirrorBMaterial.texture = &m_whiteTexture;
 
-    m_mirrorBMaterial.model = MaterialModel::MetallicRoughness;
 
     m_mirrorBMaterial.roughness = 0.10f;
     m_mirrorBMaterial.metallic = 1.0f;
@@ -455,7 +454,6 @@ bool MirrorTestScene::Initialize(
     m_coloredMaterial.armTexture = &m_armTexture;
     m_coloredMaterial.preferARM = true;
 
-    m_coloredMaterial.model = MaterialModel::MetallicRoughness;
 
     m_coloredMaterial.roughness = 1.0f;
     m_coloredMaterial.metallic = 0.0f;
@@ -474,7 +472,6 @@ bool MirrorTestScene::Initialize(
     m_floorMaterial.pipeline = &m_pipeline;
     m_floorMaterial.texture = &m_whiteTexture;
 
-    m_floorMaterial.model = MaterialModel::Dielectric;
 
     m_floorMaterial.roughness = 0.7f;
     m_floorMaterial.ior = 1.5f;

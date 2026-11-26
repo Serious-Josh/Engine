@@ -41,6 +41,7 @@
 #include "Scene/SceneFileCreation.h"
 #include "Scene/SceneDocumentCache.h"
 #include "Scene/SceneSerializer.h"
+#include "Scene/SceneEnvironmentResolution.h"
 #include "Project/ProjectCreation.h"
 
 #include "Project/ProjectLocator.h"
@@ -187,6 +188,16 @@ namespace
         {
             report += std::string(" | DLSS: on (") + DlssQualityPresetName(*requestedPreset) + ", " +
                 std::to_string(resolution.renderWidth) + "x" + std::to_string(resolution.renderHeight) + " to " +
+                std::to_string(resolution.outputWidth) + "x" + std::to_string(resolution.outputHeight) + ")";
+            return;
+        }
+
+        // Ray Reconstruction replaces Super Resolution on its frames and upscales from the same render extent itself, so
+        // the saved quality preset is in effect even though Super Resolution did not run.
+        if(renderer.IsRayReconstructionActiveLastFrame())
+        {
+            report += std::string(" | DLSS: upscaled by Ray Reconstruction (") + DlssQualityPresetName(*requestedPreset) +
+                ", " + std::to_string(resolution.renderWidth) + "x" + std::to_string(resolution.renderHeight) + " to " +
                 std::to_string(resolution.outputWidth) + "x" + std::to_string(resolution.outputHeight) + ")";
             return;
         }
@@ -1789,6 +1800,8 @@ void Engine::ReportPackagedLightingMode(double renderMilliseconds)
     const RendererLightingMode requested = m_packagedRenderingConfiguration.lightingMode;
     std::string report = std::string("Requested: ") + DescribeLightingMode(requested) +
         " | Effective: " + DescribeLightingMode(status.active);
+    // The requested mode is not rendering yet only because it is still being prepared: reported, but not a warning.
+    bool preparing = false;
 
     if(status.active != requested)
     {
@@ -1798,19 +1811,52 @@ void Engine::ReportPackagedLightingMode(double renderMilliseconds)
         case LightingModeTransitionStage::Queued:
         case LightingModeTransitionStage::Compiling:
             report += " | Preparing: shader libraries";
+            preparing = true;
             break;
         case LightingModeTransitionStage::PreparingPipelines:
             report += " | Preparing: DXR pipelines (background)";
+            preparing = true;
             break;
         case LightingModeTransitionStage::CreatingPipeline:
         case LightingModeTransitionStage::InitializingResources:
         case LightingModeTransitionStage::ReadyToActivate:
             report += " | Preparing: activating";
+            preparing = true;
             break;
         default:
-            report += " | Reason: " + (status.diagnostic.empty() ?
-                std::string("the renderer reported no reason") : status.diagnostic);
+        {
+            // The packaged runtime prepares its whole configuration before it switches (ConfigurationPreparation). Until
+            // then the renderer is not asked for the mode at all, so its own transition is idle and holds no reason.
+            const ConfigurationPreparationStatus& preparation = m_renderer.GetConfigurationPreparationStatus();
+
+            if(preparation.pending && preparation.state == ConfigurationPreparationState::Preparing)
+            {
+                // The detail reads "<what> preparing"; the label already says that.
+                std::string waitingFor = preparation.detail.empty() ? "the rendering configuration" : preparation.detail;
+                const std::string suffix = " preparing";
+
+                if(waitingFor.size() > suffix.size() &&
+                    waitingFor.compare(waitingFor.size() - suffix.size(), suffix.size(), suffix) == 0)
+                {
+                    waitingFor.erase(waitingFor.size() - suffix.size());
+                }
+
+                report += " | Preparing: " + waitingFor;
+                preparing = true;
+            }
+            else if(preparation.pending && preparation.state == ConfigurationPreparationState::Failed &&
+                !preparation.detail.empty())
+            {
+                report += " | Reason: " + preparation.detail;
+            }
+            else
+            {
+                report += " | Reason: " + (status.diagnostic.empty() ?
+                    std::string("the renderer reported no reason") : status.diagnostic);
+            }
+
             break;
+        }
         }
     }
 
@@ -1818,11 +1864,14 @@ void Engine::ReportPackagedLightingMode(double renderMilliseconds)
 
     if(IsRasterPrimaryReSTIRMode(status.active))
     {
-        // PS.5F: the effective denoiser, and the requested one while it prepares or after it failed.
+        // PS.5F: the effective denoiser, and the requested one while it prepares or after it failed. Ray Reconstruction
+        // denoises in NRD Hybrid's place (the configuration's denoiser stays NRD Hybrid), so it is named when it ran.
         const std::string failure = m_renderer.GetPathTraceDenoiserFailure();
         const PathTraceDenoiserMode effectiveDenoiser = m_renderer.GetPathTraceDenoiserMode();
         const PathTraceDenoiserMode requestedDenoiser = m_packagedRenderingConfiguration.denoiser;
-        report += std::string(" | Denoiser: ") + DescribeDenoiser(effectiveDenoiser);
+        const bool rayReconstructionActive = m_renderer.IsRayReconstructionActiveLastFrame();
+        report += std::string(" | Denoiser: ") +
+            (rayReconstructionActive ? "DLSS Ray Reconstruction" : DescribeDenoiser(effectiveDenoiser));
 
         if(effectiveDenoiser != requestedDenoiser)
         {
@@ -1880,6 +1929,18 @@ void Engine::ReportPackagedLightingMode(double renderMilliseconds)
         }
 
         AppendPackagedDlssStatus(m_renderer, m_packagedRenderingConfiguration, report);
+
+        // Cooked-game port: a saved Ray Reconstruction request that did not denoise the last frame, and why.
+        if(m_packagedRenderingConfiguration.rayReconstructionRequested && !rayReconstructionActive)
+        {
+            const DlssRayReconstructionStatus& rayReconstruction = m_renderer.GetDlssStatus().rayReconstruction;
+            const std::string reason = !m_renderer.GetRayReconstructionFailure().empty() ?
+                m_renderer.GetRayReconstructionFailure() :
+                rayReconstruction.availability != DlssRayReconstructionAvailability::Available ?
+                std::string(DlssRayReconstructionAvailabilityName(rayReconstruction.availability)) + ": " +
+                rayReconstruction.detail : std::string("waiting for an eligible frame");
+            report += " | Ray Reconstruction: off (requested; " + reason + ")";
+        }
     }
     else if(status.active == RendererLightingMode::PathTracedReference)
     {
@@ -1890,6 +1951,48 @@ void Engine::ReportPackagedLightingMode(double renderMilliseconds)
     // PS.5F: every mode presents through the saved tone mapper.
     report += std::string(" | Tone map: ") +
         (m_packagedRenderingConfiguration.toneMapOperator == ToneMapOperator::GT7 ? "GT7" : "AgX");
+
+    // Cooked-game port: DLSS Frame Generation when saved, with why the last frame had no generated frame.
+    if(IsFrameGenerationRequested(m_packagedRenderingSettings))
+    {
+        const DlssFrameGenerationStatus& frameGeneration = m_renderer.GetDlssStatus().frameGeneration;
+        std::string reason;
+
+        if(m_renderer.IsFrameGenerationActiveLastFrame())
+        {
+            report += " | Frame Generation: on";
+        }
+        else
+        {
+            if(frameGeneration.availability != DlssFrameGenerationAvailability::Available)
+            {
+                reason = std::string(DlssFrameGenerationAvailabilityName(frameGeneration.availability)) + ": " +
+                    frameGeneration.detail;
+            }
+            else if(!m_renderer.IsFrameGenerationPresentationActive())
+            {
+                reason = "its present path is not running";
+            }
+            else if(!m_renderer.GetFrameGenerationInactiveReason().empty())
+            {
+                reason = m_renderer.GetFrameGenerationInactiveReason();
+            }
+            else
+            {
+                reason = "waiting for a frame to generate from";
+            }
+
+            report += " | Frame Generation: off (requested; " + reason + ")";
+        }
+    }
+
+    // NVIDIA Reflex when the cooked settings ask for it (Frame Generation turns it on).
+    const ReflexStatus& reflex = m_renderer.GetReflexStatus();
+
+    if(reflex.requested != ReflexMode::Off)
+    {
+        report += " | Reflex: " + DescribeReflexStatus(reflex);
+    }
 
     const double sinceStart = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - m_initializationStarted).count();
@@ -1912,7 +2015,7 @@ void Engine::ReportPackagedLightingMode(double renderMilliseconds)
     const std::string timing = " (" + std::to_string(sinceStart) + " ms from startup; this frame's Render " +
         std::to_string(renderMilliseconds) + " ms)";
 
-    if(status.active == requested && report.find("unavailable") == std::string::npos)
+    if((status.active == requested || preparing) && report.find("unavailable") == std::string::npos)
     {
         Log::Info("Packaged lighting mode: " + report + timing);
     }
@@ -1968,7 +2071,7 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
             if(!m_startupArchive->provider->ArchiveEntry(PackagedBootstrap::ShaderID())) throw std::runtime_error("Missing required packaged shader bootstrap entry 00000000-0000-0000-0000-000000000035.");
             environmentImage=CookedEnvironment::ReadArchive(*m_startupArchive);
             environmentIdentity=CookedEnvironment::ArchiveIdentity(*m_startupArchive);
-            shaderBytes=m_startupArchive->provider->ReadEntry(PackagedBootstrap::ShaderID(),EngineAssetPak::Type::Shader,1,64*1024*1024);
+            shaderBytes=m_startupArchive->provider->ReadEntry(PackagedBootstrap::ShaderID(),EngineAssetPak::Type::Shader,1,ShaderLibrary::MaximumBootstrapBytes);
             ShaderLibrary validation;
             if(!validation.InitializePackaged(shaderBytes)) throw std::runtime_error("Invalid packaged shader bootstrap.");
             validation.Shutdown();
@@ -3359,12 +3462,7 @@ ReflexMode Engine::GetRequestedReflexMode()
     const bool packaged = m_startup.mode == EngineStartup::Mode::PackagedRuntime;
     RenderingSettings settings = packaged ? m_packagedRenderingSettings : m_renderer.GetDebugUI().GetEffectiveRenderingSettings();
 
-    // FG.3: built games do not run Frame Generation yet, so its saved toggle does not lock Reflex there.
-    if(packaged)
-    {
-        settings.frameGeneration.enabled = false;
-    }
-
+    // Cooked-game port: built games run Frame Generation too, so its saved toggle locks Reflex on there as in the Editor.
     if(const std::optional<ProjectReflexMode> modeOverride = GetReflexModeOverrideForTesting())
     {
         settings.latency.reflex = *modeOverride;
@@ -3507,6 +3605,9 @@ void Engine::Frame()
         // S0.5: as in the Editor frame, observe the scene environment request (failure handling).
         PollSceneEnvironment();
         options.exposureReset = std::exchange(m_exposureResetPending, false);
+        // Cooked-game port: the cooked DLSS Frame Generation toggle, as the Editor passes its saved one each frame (Render
+        // switches the present path between frames while Frame Generation is available).
+        m_renderer.SetFrameGenerationRequested(IsFrameGenerationRequested(m_packagedRenderingSettings));
 
         const auto renderStarted = std::chrono::steady_clock::now();
         m_renderer.MarkLatencyRenderSubmitStart();
@@ -7750,6 +7851,69 @@ void Engine::AdvanceAutomaticMeshResidency()
     scheduler.retryAfter = now + std::chrono::seconds(1);
 }
 
+void Engine::CookEffectiveEnvironment(SceneDocument& document) const
+{
+    if(document.kind != SceneKind::Local || document.owningWorld.empty())
+    {
+        return;
+    }
+
+    // The World is read as a document only, as FileBackedDemoScene::ReadEnvironmentWorld reads it for the Editor preview.
+    std::optional<SceneDocument> world;
+    std::string worldProblem;
+    const std::optional<AssetID> worldID = AssetID::Parse(document.owningWorld);
+    const AssetRecord* record = worldID ? m_projectAssetRegistry.Find(*worldID) : nullptr;
+
+    if(!record || record->type != AssetType::Scene)
+    {
+        worldProblem = "The owning World " + document.owningWorld + " is not a registered scene.";
+    }
+    else
+    {
+        SceneDocument loaded;
+        std::string error;
+
+        if(LoadSceneDocument(GetActiveProject().GetRoot() / record->relativePath, loaded, &error))
+        {
+            world = std::move(loaded);
+        }
+        else
+        {
+            worldProblem = "The owning World " + record->relativePath.generic_string() + " is not a valid scene: " + error;
+        }
+    }
+
+    // The scene's own stored values, to name the groups the World changes in the log.
+    EffectiveSceneEnvironment stored;
+    stored.skyType = document.skyType;
+    stored.physicalSky = document.physicalSky;
+    stored.environmentReference = document.environmentReference;
+    stored.lightingSettings = document.lightingSettings;
+    stored.environmentalHaze = document.environmentalHaze;
+    stored.mistRendering = document.mistRendering;
+    stored.airEnvironment = document.airEnvironment;
+    stored.airSimulation = document.airSimulation;
+
+    const EffectiveSceneEnvironment effective = ResolveSceneEnvironment(document, world ? &*world : nullptr,
+        worldProblem);
+    const SceneEnvironmentOverrides overrides = document.environmentOverrides;
+    StoreEnvironment(document, effective);
+    document.environmentOverrides = SceneEnvironmentOverrides{};
+
+    if(effective.source == EffectiveSceneEnvironment::Source::InvalidWorld)
+    {
+        Log::Warning("Build Game: " + effective.worldProblem + " The startup scene's inherited environment groups are "
+            "cooked with the Engine defaults, as the Editor shows them.");
+    }
+    else if(!(overrides == SceneEnvironmentOverrides{}))
+    {
+        Log::Info("Build Game: the startup scene inherits environment groups from World '" + effective.worldName +
+            "'; the game is cooked with the effective environment the Editor shows" +
+            (DescribeEnvironmentDifferences(stored, effective).empty() ? std::string(".") : " (" +
+            DescribeEnvironmentDifferences(stored, effective) + " differ from the scene's own values)."));
+    }
+}
+
 bool Engine::StartBuildGame(BuildGame::Settings settings, std::string& error, bool saveStartupScene,
     bool* startupSceneUnsaved)
 {
@@ -7863,6 +8027,7 @@ bool Engine::StartBuildGame(BuildGame::Settings settings, std::string& error, bo
 
     Log::Info("Build Game startup scene: " + startupName +
         (startup.configured ? " (configured in the project manifest)." : " (active saved scene fallback)."));
+    CookEffectiveEnvironment(document);
 
     BuildGame::Request request{std::move(settings), std::move(document), m_projectAssetRegistry,
         GetActiveProject().GetRoot(), WindowsWindow::GetExecutableDirectory() / "assets" / "Shaders",

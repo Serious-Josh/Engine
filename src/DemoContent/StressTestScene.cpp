@@ -52,8 +52,9 @@ bool StressTestScene::Initialize(
     pipelineDescription.rootParameters.push_back(
         {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_ALL});
 
+    // ObjectConstants: the pixel shader reads the model matrix too (Triangle.hlsl's primary surface lift scale).
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
+        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_ALL});
 
     pipelineDescription.depthEnabled = true;
     pipelineDescription.mirroredWindingVariant = true;
@@ -120,7 +121,6 @@ bool StressTestScene::Initialize(
     m_roughMaterial.texture = &m_whiteTexture;
     m_roughMaterial.normalTexture = &m_normalTexture;
 
-    m_roughMaterial.model = MaterialModel::Dielectric;
     m_roughMaterial.roughnessTexture = &m_roughnessTexture;
     m_roughMaterial.roughness = 1.0f;
     m_roughMaterial.ior = 1.5f;
@@ -132,7 +132,6 @@ bool StressTestScene::Initialize(
     m_glossyMaterial.pipeline = &m_pipeline;
     m_glossyMaterial.texture = &m_whiteTexture;
     m_glossyMaterial.normalTexture = &m_normalTexture;
-    m_glossyMaterial.model = MaterialModel::Dielectric;
 
     m_glossyMaterial.roughnessTexture = &m_roughnessTexture;
     m_glossyMaterial.roughness = 1.0f;
@@ -145,7 +144,6 @@ bool StressTestScene::Initialize(
     m_metalMaterial.pipeline = &m_pipeline;
     m_metalMaterial.texture = &m_whiteTexture;
     m_metalMaterial.normalTexture = &m_normalTexture;
-    m_metalMaterial.model = MaterialModel::MetallicRoughness;
 
     m_metalMaterial.roughnessTexture = &m_roughnessTexture;
     m_metalMaterial.roughness = 1.0f;
@@ -158,7 +156,6 @@ bool StressTestScene::Initialize(
     m_floorMaterial.pipeline = &m_pipeline;
     m_floorMaterial.texture = &m_whiteTexture;
     m_floorMaterial.normalTexture = &m_normalTexture;
-    m_floorMaterial.model = MaterialModel::Dielectric;
 
     m_floorMaterial.roughness = 0.65f;
     m_floorMaterial.ior = 1.5f;

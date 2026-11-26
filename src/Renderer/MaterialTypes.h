@@ -2,13 +2,6 @@
 
 #include <cstdint>
 
-enum class MaterialModel
-{
-    MetallicRoughness,
-    Dielectric,
-    Conductor
-};
-
 enum class SurfaceDetailMode : std::uint32_t
 {
     NormalOnly = 0,

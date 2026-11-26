@@ -21,6 +21,9 @@ struct VSOutput
     float2 viewDepths : TEXCOORD3;
     float4 worldTangent : TEXCOORD4;
     float3 worldPosition : TEXCOORD5;
+    // The mesh's own position, for the path tracer's lift scale (PathTracePrimaryRasterLiftScale): interpolated here and
+    // transformed in the pixel shader, it keeps the surface's precision on triangles kilometres long.
+    float3 objectPosition : TEXCOORD6;
 };
 
 struct PSOutput
@@ -65,6 +68,9 @@ cbuffer CameraConstants : register(b1)
     uint2 psrResolution;
     row_major float4x4 psrInverseCameraRelativeViewProjection;
     float3 psrCameraPosition;
+    // Non-zero on Path Tracing frames with a raster primary: the geometric normal is stored with the pixel's lift scale as
+    // its length, measured with the camera above (which those frames always set).
+    uint primarySurfaceLiftScale;
 }
 
 float4 SampleMaterialTexture(Texture2D<float4> materialTexture, SamplerState materialSampler, float2 uv)
@@ -459,6 +465,7 @@ VSOutput VSMain(VSInput input)
         );
 
     output.worldPosition = worldPosition.xyz;
+    output.objectPosition = input.position;
     output.currentClipPosition =
         mul(
             unjitteredViewProjection,
@@ -638,21 +645,18 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
 
     output.surface = float4(mappedNormal, float(materialIndex));
 
-    float effectiveMetallic = 0.0f;
-    if(material.model == 0u)
+    // Every OpenPBR material has a metalness (base_metalness), textured by ARM blue or the metallic texture.
+    float effectiveMetallic = saturate(material.metallic);
+    if(useARM)
     {
-        effectiveMetallic = saturate(material.metallic);
-        if(useARM)
-        {
-            effectiveMetallic = saturate(effectiveMetallic * armRoughnessMetallic.y);
-        }
-        else if(material.metallicTextureIndex != 0xFFFFFFFFu)
-        {
-            Texture2D<float4> metallicTexture = ResourceDescriptorHeap[
-                NonUniformResourceIndex(material.metallicTextureIndex)];
-            float sampledMetallic = SampleMaterialTexture(metallicTexture, sampler0, resolvedMaterialUV).r;
-            effectiveMetallic = saturate(effectiveMetallic * sampledMetallic);
-        }
+        effectiveMetallic = saturate(effectiveMetallic * armRoughnessMetallic.y);
+    }
+    else if(material.metallicTextureIndex != 0xFFFFFFFFu)
+    {
+        Texture2D<float4> metallicTexture = ResourceDescriptorHeap[
+            NonUniformResourceIndex(material.metallicTextureIndex)];
+        float sampledMetallic = SampleMaterialTexture(metallicTexture, sampler0, resolvedMaterialUV).r;
+        effectiveMetallic = saturate(effectiveMetallic * sampledMetallic);
     }
 
     output.geometricNormal = float4(normalize(input.worldNormal), effectiveMetallic);
@@ -674,6 +678,20 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
         {
             output.identity.x |= PSR_IDENTITY_ELIGIBLE;
         }
+    }
+
+    // The path tracer's lift scale, as the stored geometric normal's length. An eligible mirror keeps its unit normal:
+    // PSR recovers the mirror from its triangle, not from this sample.
+    if(primarySurfaceLiftScale != 0u && !PsrIdentityEligible(output.identity.x))
+    {
+        PathTracePrimaryCamera camera;
+        camera.inverseCameraRelativeViewProjection = psrInverseCameraRelativeViewProjection;
+        camera.cameraPosition = psrCameraPosition;
+        camera.resolution = psrResolution;
+        float3 surfacePosition = mul(model, float4(input.objectPosition, 1.0f)).xyz;
+
+        output.geometricNormal.xyz *= PathTracePrimaryRasterLiftScale(uint2(input.position.xy), input.position.z,
+            surfacePosition, output.geometricNormal.xyz, camera);
     }
 
     if(all(isfinite(input.currentClipPosition)) &&

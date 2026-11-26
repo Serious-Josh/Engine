@@ -249,7 +249,7 @@ void CSMain(uint3 dispatchThread : SV_DispatchThreadID)
             all(isfinite(materialData)) && dot(surface.xyz, surface.xyz) > 1.0e-8f && materialIndex >= 0.0f &&
             materialIndex < float(materialCount) && materialIndex < PATH_TRACE_PRIMARY_MAXIMUM_MATERIALS;
 
-        if(decodable && materials[uint(materialIndex)].model <= 2u)
+        if(decodable)
         {
             worldPosition /= worldPosition.w;
             const GPUMaterial material = materials[uint(materialIndex)];

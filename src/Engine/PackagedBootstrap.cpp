@@ -118,7 +118,11 @@ void Cook(const std::filesystem::path& inputTOC,const std::filesystem::path& inp
         assets.push_back({entry.id,entry.type,entry.payloadVersion,entry.generation,owned.back(),entry.alignment});
     }
     owned.push_back(ShaderLibrary::CookBootstrap(shaderRoot, GetPackagedShaderInventory(), GetPackagedLibraryInventory()));
-    if(owned.back().size()>64*1024*1024) throw std::runtime_error("Shader bundle exceeds 64 MiB.");
+    if(owned.back().size()>ShaderLibrary::MaximumBootstrapBytes)
+    {
+        throw std::runtime_error("Shader bundle exceeds " +
+            std::to_string(ShaderLibrary::MaximumBootstrapBytes / (1024 * 1024)) + " MiB.");
+    }
     assets.push_back({ShaderID(),EngineAssetPak::Type::Shader,1,1,owned.back(),16});
     owned.push_back(ReadBundledMaterialTables(shaderRoot));
     assets.push_back({MaterialTablesID(),EngineAssetPak::Type::Resource,MaterialTablesPayloadVersion,1,owned.back(),16});

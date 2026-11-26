@@ -188,6 +188,85 @@ static bool g_restirPtHistoryScene = false;
         query.TraceRayInline(scene, flags, 0xFF, ray); \
     }
 
+#include "../PsrIdentity.hlsli"
+
+// OpenPBR anisotropy at the raster primary (PathTracePrimaryTangent): the triangle the identity target names for this
+// frame's pixel, its vertex tangents interpolated at the pixel's barycentrics in world space (the current transforms).
+// No ray, so the spatial pairs' neighbour decodes cost no traversal. The tangent is left unorthogonalized
+// (PathTraceFinalizeSurface does it); OPENPBR_PACKED_VECTOR_NONE for another material (a PSR-replaced pixel), a mesh
+// without tangents or a degenerate triangle. False only when the identity target is unavailable.
+bool RestirPtPrimaryTangentFromIdentity(uint2 pixel, float3 position, uint materialIndex, out uint packedTangent)
+{
+    packedTangent = OPENPBR_PACKED_VECTOR_NONE;
+
+    if(restirPtIdentityIndex == 0xFFFFFFFFu || any(pixel >= resolution))
+    {
+        return false;
+    }
+
+    Texture2D<uint2> identityTexture = ResourceDescriptorHeap[restirPtIdentityIndex];
+    const uint2 identity = identityTexture.Load(int3(pixel, 0));
+    const uint identityInstance = PsrIdentityInstance(identity.x);
+
+    if(identityInstance == 0u || identityInstance == PSR_IDENTITY_UNMAPPED)
+    {
+        return false;
+    }
+
+    const uint instanceID = identityInstance - 1u;
+    StructuredBuffer<RayTracingInstanceData> instances = ResourceDescriptorHeap[instanceDataIndex];
+    RayTracingInstanceData instance = instances[instanceID];
+
+    if(instance.tangentOffset == 0xFFFFFFFFu || ResolveHitMaterial(instance, identity.y) != materialIndex)
+    {
+        return true;
+    }
+
+    const RestirPtInstanceTransform transform = restirPtTransforms[instanceID];
+    ByteAddressBuffer vertexBuffer = ResourceDescriptorHeap[NonUniformResourceIndex(instance.vertexBufferIndex)];
+    const uint3 indices = PathTraceTriangleIndices(instance, identity.y);
+    const float3 position0 = mul(transform.objectToWorld,
+        float4(PathTraceLoadPosition(vertexBuffer, indices.x, instance.vertexStride), 1.0f));
+    const float3 position1 = mul(transform.objectToWorld,
+        float4(PathTraceLoadPosition(vertexBuffer, indices.y, instance.vertexStride), 1.0f));
+    const float3 position2 = mul(transform.objectToWorld,
+        float4(PathTraceLoadPosition(vertexBuffer, indices.z, instance.vertexStride), 1.0f));
+
+    // Barycentrics of the pixel's point projected onto the triangle's plane.
+    const float3 edge1 = position1 - position0;
+    const float3 edge2 = position2 - position0;
+    const float3 offset = position - position0;
+    const float d11 = dot(edge1, edge1);
+    const float d12 = dot(edge1, edge2);
+    const float d22 = dot(edge2, edge2);
+    const float denominator = d11 * d22 - d12 * d12;
+
+    if(!(abs(denominator) > 1.0e-30f) || !isfinite(denominator))
+    {
+        return true;
+    }
+
+    const float offset1 = dot(offset, edge1);
+    const float offset2 = dot(offset, edge2);
+    float3 barycentrics;
+    barycentrics.y = saturate((d22 * offset1 - d12 * offset2) / denominator);
+    barycentrics.z = saturate((d11 * offset2 - d12 * offset1) / denominator);
+    barycentrics.x = saturate(1.0f - barycentrics.y - barycentrics.z);
+
+    const float4 objectTangent = PathTraceLoadTangent(vertexBuffer, indices.x, instance) * barycentrics.x +
+        PathTraceLoadTangent(vertexBuffer, indices.y, instance) * barycentrics.y +
+        PathTraceLoadTangent(vertexBuffer, indices.z, instance) * barycentrics.z;
+    const float3 tangent = mul((float3x3)transform.objectToWorld, objectTangent.xyz);
+    const float lengthSquared = dot(tangent, tangent);
+
+    if(lengthSquared > 1.0e-16f && isfinite(lengthSquared))
+    {
+        packedTangent = OpenPBRPackUnitVector(tangent * rsqrt(lengthSquared));
+    }
+
+    return true;
+}
+
 RestirPtInstanceTransform RestirPtLoadInstanceTransform(uint instanceID)
 {
     RestirPtInstanceTransform transform = restirPtTransforms[instanceID];
@@ -540,7 +619,8 @@ static const uint RESTIR_PT_COUNTER_SAMPLES = 3u;
 static const uint RESTIR_PT_COUNTER_SELECTED_LENGTH = 4u;
 // Gate validity: per-vertex contributions (NEE sum or escape at x_j, j >= 2) whose luminance exceeds the production path
 // tracer's PATH_TRACE_INDIRECT_LUMINANCE_CLAMP. Configuration B has no clamp (the paper's estimator is unbiased); a
-// comparison against the clamped production reference is valid only where this stays negligible.
+// comparison against a clamped reference (PathTraceReferenceSettings::referenceIndirectLuminanceClamp, off by default) is
+// valid only where this stays negligible.
 static const uint RESTIR_PT_COUNTER_CLAMP_WOULD_ENGAGE = 9u;
 
 // Random-number dimensions of a vertex (counter-based: any vertex's numbers are addressable for replay).
@@ -584,14 +664,32 @@ float RestirPtRandom(uint seed, uint vertex, uint dimension)
 }
 
 // -----------------------------------------------------------------------------
-// Lobe-indexed BSDF (specification section 4.2). The two sampled lobes partition PathTraceEvaluateBSDFLobes exactly:
-// the GGX lobe is the GGX single scatter (VNDF sampling, or the delta mirror on a delta surface); the cosine lobe is the
-// multiple scatter plus the diffuse term (cosine sampling). Their selection probabilities are the production ones.
+// Lobe-indexed BSDF (specification section 4.2). The three sampled lobes partition PathTraceEvaluateBSDFLobes exactly
+// (PathTraceBSDF.hlsli, the OpenPBR lobe mixture): the GGX lobe is the glossy strategy (the base single scatter through
+// its layers and a rough coat, bounded VNDF sampling of either); the cosine lobe is the broad strategy (the base
+// multiple scatter and diffuse through their layers, and the fuzz; cosine or fuzz LTC sampling); the delta lobe is the
+// mirror event (a mirror base or a smooth coat). Their selection probabilities are the production ones.
 // -----------------------------------------------------------------------------
 
 float RestirPtLobeProbability(PathTraceSurface surface, uint lobe)
 {
-    return lobe == RESTIR_PT_LOBE_COSINE ? 1.0f - surface.specularProbability : surface.specularProbability;
+    if(lobe == RESTIR_PT_LOBE_COSINE)
+    {
+        return 1.0f - surface.specularProbability;
+    }
+
+    if(lobe == RESTIR_PT_LOBE_DELTA)
+    {
+        return surface.deltaProbability;
+    }
+
+    return PathTraceGlossyProbability(surface);
+}
+
+// True when the surface has a glossy (non-delta specular) lobe: a non-mirror base or a rough coat.
+bool RestirPtHasGlossyLobe(PathTraceSurface surface)
+{
+    return !PathTraceBaseIsMirror(surface) || (PathTraceCoatWeight(surface) > 0.0f && !PathTraceCoatIsMirror(surface));
 }
 
 // f_lobe without the cosine; diffuseValue is its EON diffuse part (the extraction's diffuse signal).
@@ -599,27 +697,17 @@ float3 RestirPtEvaluateLobe(PathTraceSurface surface, uint lobe, float3 directio
 {
     diffuseValue = float3(0.0f, 0.0f, 0.0f);
 
-    if(lobe == RESTIR_PT_LOBE_DELTA || !PathTraceDirectionAboveSurface(surface, direction))
+    if(lobe == RESTIR_PT_LOBE_DELTA)
     {
         return float3(0.0f, 0.0f, 0.0f);
     }
 
     if(lobe == RESTIR_PT_LOBE_GGX)
     {
-        return surface.deltaSpecular ? float3(0.0f, 0.0f, 0.0f) : PathTraceEvaluateGGXSingleScatter(surface, direction);
+        return PathTraceEvaluateGlossyLobe(surface, direction);
     }
 
-    const float normalDotLight = dot(surface.normal, direction);
-    const float3 multipleScatter = PathTraceEvaluateMultipleScatter(surface, normalDotLight);
-
-    if(surface.material.model == 2u)
-    {
-        return multipleScatter;
-    }
-
-    diffuseValue = PathTraceDiffuseWeight(surface, normalDotLight) * EvaluateEONDiffuse(PathTraceDiffuseAlbedo(surface),
-        surface.material.roughness, surface.normal, direction, surface.view);
-    return diffuseValue + multipleScatter;
+    return PathTraceEvaluateBroadLobe(surface, direction, diffuseValue);
 }
 
 // The lobe's own solid-angle density (without its selection probability).
@@ -627,10 +715,10 @@ float RestirPtLobePdf(PathTraceSurface surface, uint lobe, float3 direction)
 {
     if(lobe == RESTIR_PT_LOBE_COSINE)
     {
-        return max(dot(surface.normal, direction), 0.0f) * INV_PI;
+        return PathTraceBroadPdf(surface, direction);
     }
 
-    if(lobe == RESTIR_PT_LOBE_GGX && !surface.deltaSpecular)
+    if(lobe == RESTIR_PT_LOBE_GGX && RestirPtHasGlossyLobe(surface))
     {
         return PathTraceVisibleNormalPdf(surface, direction);
     }
@@ -663,30 +751,38 @@ RestirPtLobeSample RestirPtSampleLobe(PathTraceSurface surface, float3 random)
 
     const bool chooseSpecular = random.x < surface.specularProbability;
 
-    if(surface.deltaSpecular && chooseSpecular)
+    if(surface.deltaSpecular && random.x < surface.deltaProbability)
     {
         result.lobe = RESTIR_PT_LOBE_DELTA;
-        result.direction = reflect(-surface.view, surface.normal);
+        result.direction = PathTraceDeltaDirection(surface);
 
-        if(dot(surface.geometricNormal, result.direction) <= 0.0f || surface.specularProbability <= 0.0f)
+        if(dot(surface.geometricNormal, result.direction) <= 0.0f || surface.deltaProbability <= 0.0f)
         {
             return result;
         }
 
-        result.weight = surface.deltaFresnel / surface.specularProbability;
+        result.weight = surface.deltaFresnel / surface.deltaProbability;
         result.valid = all(isfinite(result.weight));
         return result;
     }
 
     if(chooseSpecular)
     {
+        // The glossy strategy; random.x, rescaled to the strategy's interval, selects the coat or the base VNDF.
         result.lobe = RESTIR_PT_LOBE_GGX;
-        result.direction = reflect(-surface.view, PathTraceSampleVisibleNormal(surface, random.yz));
+        const float glossyProbability = PathTraceGlossyProbability(surface);
+        const float selection = glossyProbability > 0.0f ?
+            saturate((random.x - surface.deltaProbability) / glossyProbability) : 0.0f;
+        result.direction = PathTraceSampleGlossyDirection(surface, selection, random.yz);
     }
     else
     {
+        // The broad strategy; random.x, rescaled likewise, selects the fuzz LTC or cosine.
         result.lobe = RESTIR_PT_LOBE_COSINE;
-        result.direction = PathTraceSampleCosine(surface, random.yz);
+        const float broadProbability = 1.0f - surface.specularProbability;
+        const float selection = broadProbability > 0.0f ?
+            saturate((random.x - surface.specularProbability) / broadProbability) : 0.0f;
+        result.direction = PathTraceSampleBroadDirection(surface, selection, random.yz);
     }
 
     if(!PathTraceDirectionAboveSurface(surface, result.direction))
@@ -2319,18 +2415,19 @@ float3 RestirPtSingleLightNee(PathTraceSurface surface, float3 position, PathTra
 
 // BSDF-sampled escape radiance with balance-heuristic weights against the sun and environment light samples.
 // Physical sky S5B: the sun through the clouds' shadow at origin, the vertex the escape leaves (as the reference path tracer's
-// miss and the sun's NEE); a shift passes its own vertex.
+// miss and the sun's NEE); a shift passes its own vertex. A delta continuation (a mirror) sees the reference's delta miss:
+// the sky-view map or HDRI background, the display-limited sun disk, the stars and moon, and the clouds over them.
 float3 RestirPtEscapeRadiance(float3 origin, float3 direction, bool previousDelta, float previousPdfAll)
 {
+    if(previousDelta)
+    {
+        return PathTraceMissRadiance(origin, direction, true, 0.0f, false);
+    }
+
     const PathTraceEnvironment environment = PathTraceFrameEnvironment();
     const PathTraceSun sun = PathTraceFrameSun();
     const float3 environmentRadiance = PathTraceEnvironmentRadiance(environment, environmentSampler, direction);
     const float3 sunRadiance = PathTraceSunRadiance(sun, direction) * SkyFrameCloudShadow(skyFrameInfoIndex, origin);
-
-    if(previousDelta)
-    {
-        return environmentRadiance + sunRadiance;
-    }
 
     const float environmentWeight = PathTraceEnvironmentSamplingEnabled(environment) ?
         RestirPtBalanceHeuristic(previousPdfAll, PathTraceEnvironmentPdf(environment, direction)) : 1.0f;
@@ -2496,7 +2593,8 @@ bool RestirPtRebuildVertex(uint instanceID, uint primitive, float2 storedBarycen
 }
 
 // Criterion 1 (and the original's x_(k-1) test) on the sampled lobe: the cosine lobe counts as rough, a delta lobe never,
-// the GGX lobe when its alpha (perceptual roughness squared, as the BSDF uses) reaches alpha_min.
+// the GGX lobe when its smallest alpha (perceptual roughness squared, as the BSDF uses; the base's narrower anisotropic
+// axis or a rough coat, PathTraceGlossyMinimumAlpha) reaches alpha_min.
 bool RestirPtLobeRough(PathTraceSurface surface, uint lobe)
 {
     if(lobe == RESTIR_PT_LOBE_DELTA)
@@ -2504,8 +2602,7 @@ bool RestirPtLobeRough(PathTraceSurface surface, uint lobe)
         return false;
     }
 
-    return lobe == RESTIR_PT_LOBE_COSINE || surface.material.roughness * surface.material.roughness >=
-        restirPtReconnectionRoughness;
+    return lobe == RESTIR_PT_LOBE_COSINE || PathTraceGlossyMinimumAlpha(surface) >= restirPtReconnectionRoughness;
 }
 
 // The original criteria's x_k test [P 14]: the material's roughness (GGX alpha) reaches alpha_min, never a delta surface.
@@ -2548,9 +2645,10 @@ bool RestirPtInverseFootprintPasses(PathTraceSurface vertexSurface, float3 outgo
     return RestirPtFootprintPasses(PathTracePdf(vertexSurface, outgoing), previousCosine, distance, threshold);
 }
 
+// A smooth coat is a delta lobe, so a surface under one is never rough; a rough coat's alpha counts with the base's.
 bool RestirPtSurfaceRough(PathTraceSurface surface)
 {
-    return !surface.deltaSpecular && surface.material.roughness * surface.material.roughness >= restirPtReconnectionRoughness;
+    return !surface.deltaSpecular && PathTraceGlossyMinimumAlpha(surface) >= restirPtReconnectionRoughness;
 }
 
 float RestirPtLobeDensity(PathTraceSurface surface, uint lobe, float3 direction)
@@ -3035,7 +3133,7 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
     [loop]
     for(uint vertex = 1u; vertex <= maxPathDepth; ++vertex)
     {
-        const bool hasNonDeltaLobe = !surface.deltaSpecular || surface.specularProbability < 1.0f;
+        const bool hasNonDeltaLobe = !surface.deltaSpecular || surface.deltaProbability < 1.0f;
         // A k = 2 candidate's diffuse part is its own lobe split; deeper candidates carry x1's (diffuseShare).
         const bool primary = vertex == 1u;
         // M5.1-4: at the reconnection vertex x_k, x_k as a shift sees it (seen along omega'), for its cached terms. If it
@@ -3491,8 +3589,13 @@ RestirPtPrimarySurface RestirPtLoadPreviousPrimary(int2 pixel)
     StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
     PathTracePrimaryVertex vertex;
 
-    if(!PathTraceReconstructPrimaryVertex(uint2(pixel), gBuffer, camera, materials, materialTableIndex,
-        materialAverageTableIndex, materialTableCosineMapping, vertex))
+    // The previous frame's pixels are not what this frame's identity target describes (PathTracePrimaryTangent).
+    g_pathTracePrimaryPreviousFrame = true;
+    const bool reconstructed = PathTraceReconstructPrimaryVertex(uint2(pixel), gBuffer, camera, materials,
+        materialTableIndex, materialAverageTableIndex, materialTableCosineMapping, vertex);
+    g_pathTracePrimaryPreviousFrame = false;
+
+    if(!reconstructed)
     {
         return primary;
     }

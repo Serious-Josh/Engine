@@ -144,10 +144,11 @@ PreparationStep Renderer::PrepareConfiguration(const ConfigurationIdentity& iden
         }
     }
 
-    // ReSTIR PT Enhanced (Editor-only): its compute pipelines, prepared on their own worker (usually in the background while
-    // Path Tracing was presented) and adopted here, and its radiance cache's NVIDIA SHARC libraries (the cache-feedback set
-    // its SHARC gate selects), so the switching frame creates no pipeline and renders the cache from its first frame.
-    if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT && !m_packagedRuntime)
+    // ReSTIR PT Enhanced: its compute pipelines, prepared on their own worker (usually in the background while Path Tracing
+    // was presented, in the Editor) and adopted here, and its radiance cache's NVIDIA SHARC libraries (the cache-feedback
+    // set its SHARC gate selects), so the switching frame creates no pipeline and renders the cache from its first frame. A
+    // packaged game creates them from its cooked shaders.
+    if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT)
     {
         if(due(16u))
         {
@@ -162,7 +163,7 @@ PreparationStep Renderer::PrepareConfiguration(const ConfigurationIdentity& iden
             note("ReSTIR PT pipelines", pipelines, 16u);
         }
 
-        if(m_restirPtSettings.sharc && NvidiaSharcCapabilityFailure().empty() && due(32u))
+        if(m_restirPtSettings.sharc && ReSTIRPTSharcAvailable() && due(32u))
         {
             PathTraceLibraryNeeds cacheNeeds = GetPathTraceLibraryNeeds(mode, identity.denoiser, true);
             cacheNeeds.radianceCacheImplementation = PathTraceRadianceCacheImplementation::Nvidia;
@@ -257,10 +258,14 @@ float Renderer::EstimatePreparationProgress(const ConfigurationIdentity& identit
     expectedSets |= identity.sharc ? 2u : 0u;
     expectedSets |= identity.psrChain != 0 ? 8u : 0u;
 
-    // ReSTIR PT Enhanced's pipelines and, with its radiance cache on, the cache's libraries (PrepareConfiguration).
-    if(identity.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT && !m_packagedRuntime)
+    // ReSTIR PT Enhanced's pipelines and, with its radiance cache on, the cache's libraries (PrepareConfiguration). In a
+    // packaged game the cache also needs its cooked SHARC twins (ReSTIRPTSharcAvailable).
+    if(identity.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT)
     {
-        const bool nvidiaSharcUsable = m_sharcNvidiaCapabilityFailure && m_sharcNvidiaCapabilityFailure->empty();
+        const bool sharcTwinsCooked = !m_shaderLibrary.IsPackaged() || m_shaderLibrary.HasPackagedShader(
+            "ReSTIRPT/RestirPtInitialSharc.hlsl", "RestirPtInitialCS", ShaderStage::Compute);
+        const bool nvidiaSharcUsable = m_sharcNvidiaCapabilityFailure && m_sharcNvidiaCapabilityFailure->empty() &&
+            sharcTwinsCooked;
         expectedSets |= 16u;
         expectedSets |= m_restirPtSettings.sharc && nvidiaSharcUsable ? 32u : 0u;
     }
@@ -290,9 +295,11 @@ const RenderingConfiguration& Renderer::SelectPresentedConfiguration(const Rende
         preparation.PresentInitial(requested);
     }
 
-    // ReSTIR PT Enhanced (Editor-only): its pipelines are prepared in the background once a path-traced configuration is
+    // ReSTIR PT Enhanced: in the Editor its pipelines are prepared in the background once a path-traced configuration is
     // presented (its estimator is offered there) and the startup request is done, so a later switch to it finds them
-    // ready. Only their worker runs (no GPU resource is created until ReSTIR PT is requested); a poll is cheap.
+    // ready. Only their worker runs (no GPU resource is created until ReSTIR PT is requested); a poll is cheap. A packaged
+    // game prepares them only when its configuration asks for ReSTIR PT (PrepareConfiguration), so a game on another
+    // estimator never copies the cooked bootstrap for them.
     const ConfigurationPreparationStatus& status = preparation.GetStatus();
 
     if(!m_packagedRuntime && !status.startupPreparing && status.presented.lightingMode != RendererLightingMode::Legacy)
@@ -459,11 +466,11 @@ void Renderer::ReleaseUnusedLegacyTextures()
     Log::Info("Released the unused Legacy lighting textures: the starting configuration does not render Legacy.");
 }
 
-// Ray Reconstruction (Editor only) denoises the raster-primary ReSTIR modes' extraction, so only their requests with a
-// denoiser and the RR selection prepare its input pipelines.
+// Ray Reconstruction denoises the raster-primary ReSTIR modes' extraction, so only their requests with a denoiser and the
+// RR selection prepare its input pipelines.
 bool Renderer::RequestsRayReconstructionInputs(const ConfigurationIdentity& identity) const
 {
-    return m_pendingRayReconstructionRequested && !m_packagedRuntime && IsRasterPrimaryReSTIRMode(identity.lightingMode) &&
+    return m_pendingRayReconstructionRequested && IsRasterPrimaryReSTIRMode(identity.lightingMode) &&
         identity.denoiser != PathTraceDenoiserMode::Off;
 }
 
@@ -476,16 +483,16 @@ bool Renderer::RequestsNrdHybridInstance(const ConfigurationIdentity& identity) 
 }
 
 // Lighting Mode switch hitch: the Ray Reconstruction input pipelines, built on the pipeline worker (with its own
-// ShaderLibrary) and adopted here on the renderer thread, so the first RR frame creates none. Ready as well when they
-// cannot be prepared (no worker, or the job failed): the first RR frame then creates them as before and reports a failure
-// itself, so this step never fails a configuration.
+// ShaderLibrary, over the cooked bootstrap in a packaged game) and adopted here on the renderer thread, so the first RR
+// frame creates none. Ready as well when they cannot be prepared (no worker, or the job failed): the first RR frame then
+// creates them as before and reports a failure itself, so this step never fails a configuration.
 ShaderLibraryPreparation Renderer::PrepareRrInputPipelines()
 {
     ShaderLibraryPreparation result{};
     result.state = ShaderLibraryPreparationState::Ready;
 
     if(m_rrPipelinePreparationDone || m_rrInputPreparationPass.HasPipelines() || !m_pipelineWorkerRunning ||
-        !m_pipelineWorker || m_shaderLibrary.IsPackaged())
+        !m_pipelineWorker)
     {
         return result;
     }
@@ -513,16 +520,19 @@ ShaderLibraryPreparation Renderer::PrepareRrInputPipelines()
     {
         auto prepared = std::make_shared<RrInputPreparationPass::PreparedPipelines>();
         const std::filesystem::path shaderRoot = m_shaderLibrary.GetShaderRoot();
+        const std::shared_ptr<const std::vector<std::byte>> packagedShaders =
+            m_shaderLibrary.IsPackaged() ? m_packagedShaderPayload : nullptr;
         // Read only by the job (free-threaded device methods); Shutdown joins the worker before the device is released.
         ID3D12Device* device = m_graphicsDevice.GetDevice();
         RayTracingPipelineRequest request{};
         request.key = key;
         request.device = m_graphicsDevice.GetRayTracingDevice();
-        request.prepareAuxiliary = [prepared, shaderRoot, device]()
+        request.prepareAuxiliary = [prepared, shaderRoot, packagedShaders, device]()
         {
             ShaderLibrary shaders;
-            const bool ready = shaders.Initialize(shaderRoot) &&
-                RrInputPreparationPass::PreparePipelines(device, shaders, *prepared);
+            const bool shadersReady = packagedShaders ? shaders.InitializePackaged(*packagedShaders) :
+                shaders.Initialize(shaderRoot);
+            const bool ready = shadersReady && RrInputPreparationPass::PreparePipelines(device, shaders, *prepared);
             shaders.Shutdown();
             return ready;
         };

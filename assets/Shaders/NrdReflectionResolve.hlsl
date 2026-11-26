@@ -92,25 +92,11 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     float3 V = normalize(mul(transpose((float3x3)constants.view), -viewPosition));
     float3 F0;
 
-    if(material.model == 0)
+    // Legacy's F0 of the OpenPBR base (MaterialLighting.hlsli), with the G-buffer's metalness.
     {
         Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[constants.geometricNormalIndex];
         float effectiveMetallic = saturate(geometricNormalTexture.Load(int3(pixel, 0)).a);
-        F0 = lerp(float3(0.04f, 0.04f, 0.04f), materialData.rgb, effectiveMetallic);
-    }
-    else if(material.model == 1)
-    {
-        float difference = material.ior - 1.0f;
-        float sum = material.ior + 1.0f;
-        F0 = (difference * difference / max(sum * sum, 1.0e-6f)).xxx;
-    }
-    else if(material.model == 2)
-    {
-        F0 = FresnelConductor(1.0f, material.conductorN, material.conductorK);
-    }
-    else
-    {
-        return;
+        F0 = LegacyMaterialF0(material, materialData.rgb, effectiveMetallic);
     }
 
     float3 diffuseFactor, specularFactor;

@@ -157,8 +157,8 @@ RenderingConfiguration ResolveRenderingConfiguration(const RenderingSettings& se
     const PathTracingRenderingSettings& pathTracing = settings.pathTracing;
     RendererLightingMode mode = ToRendererLightingMode(settings.lightingMode);
 
-    // M5.1: Path Tracing's estimator selects the experimental ReSTIR PT Enhanced mode (the renderer refuses it in packaged
-    // runtimes and renders ReSTIR DI there).
+    // M5.1: Path Tracing's estimator selects the experimental ReSTIR PT Enhanced mode, in the Editor and in packaged games
+    // (which cook its production kernels).
     if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI &&
         pathTracing.estimator == ProjectPathTraceEstimator::ReSTIRPTEnhanced)
     {

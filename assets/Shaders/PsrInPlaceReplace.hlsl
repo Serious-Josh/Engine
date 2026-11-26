@@ -202,6 +202,9 @@ struct PathTracePayload
     float3 shadingNormal;
     float2 uv;
     uint materialIndex;
+    // OpenPBR's packed coat smooth normal and anisotropy tangent (PathTraceReference.hlsl's payload).
+    uint packedSmoothNormal;
+    uint packedTangent;
 };
 
 // PathTraceClosestHit with the committed RayQuery hit in place of the closest-hit intrinsics.
@@ -321,16 +324,13 @@ PathTracePayload PsrClosestHit(RayQuery<RAY_FLAG_NONE> query)
     payload.shadingNormal = shadingNormal;
     payload.uv = uv;
     payload.materialIndex = instance.materialIndex;
+    payload.packedSmoothNormal = OPENPBR_PACKED_VECTOR_NONE;
+    payload.packedTangent = OPENPBR_PACKED_VECTOR_NONE;
     return payload;
 }
 
 float PathTraceResolveMetallic(GPUMaterial material, float2 uv, bool useARM, float sampledARMMetallic)
 {
-    if(material.model != 0u)
-    {
-        return material.metallic;
-    }
-
     float metallic = saturate(material.metallic);
 
     if(useARM)
@@ -378,11 +378,8 @@ bool PathTraceBuildSurface(PathTracePayload payload, float3 rayDirection, out Pa
     }
 
     GPUMaterial material = materials[payload.materialIndex];
-
-    if(material.model > 2u)
-    {
-        return false;
-    }
+    surface.packedSmoothNormal = payload.packedSmoothNormal;
+    surface.packedTangent = payload.packedTangent;
 
     Texture2D<float4> baseColorTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.textureIndex)];
     surface.baseColor = max(material.baseColor * baseColorTexture.SampleLevel(materialSampler, payload.uv, 0.0f).rgb, 0.0f);
@@ -567,8 +564,7 @@ PixelOutput PSMain(VertexOutput input)
     const float3 planePoint = mirrorPoint;
     const float3 originPoint = cameraPosition + mirrorPoint;
 #else
-    const float lift = PATH_TRACE_PRIMARY_SURFACE_LIFT * length(mirror.cameraRelativePosition);
-    const float3 planePoint = mirror.cameraRelativePosition - mirror.surface.geometricNormal * lift;
+    const float3 planePoint = mirror.cameraRelativePosition - mirror.surface.geometricNormal * mirror.lift;
 #if PSR_REPLACEMENT_ORIGIN == 1
     const float3 originPoint = cameraPosition + planePoint;
 #else
@@ -612,7 +608,7 @@ PixelOutput PSMain(VertexOutput input)
     float3 chainPlaneNormal = float3(0.0f, 0.0f, 1.0f);
     uint chainInstance = 0u;
 
-    if(built && replacement.deltaSpecular && replacement.specularProbability >= 1.0f)
+    if(built && replacement.deltaSpecular && replacement.deltaProbability >= 1.0f)
     {
         float3 chainShare;
         bool chainStrategy;
@@ -751,14 +747,14 @@ PixelOutput PSMain(VertexOutput input)
         PsrReflectDirection(payload.geometricNormal * facing, chainPlaneNormal) : payload.geometricNormal * facing;
     output.surface = float4(PsrReflectDirection(chainedShadingNormal, planeNormal), -(float(payload.materialIndex) + 1.0f));
     output.geometricNormal = float4(PsrReflectDirection(chainedGeometricNormal, planeNormal),
-        replacement.material.model == 0u ? replacement.material.metallic : 0.0f);
+        replacement.material.metallic);
     // The chain length (M2-A.1's key): 1.0 as the K = 1 pass writes, 2.0 for a two-mirror chain.
     motion.w = chained ? 2.0f : 1.0f;
 #else
     output.surface = float4(PsrReflectDirection(payload.shadingNormal * facing, planeNormal),
         -(float(payload.materialIndex) + 1.0f));
     output.geometricNormal = float4(PsrReflectDirection(payload.geometricNormal * facing, planeNormal),
-        replacement.material.model == 0u ? replacement.material.metallic : 0.0f);
+        replacement.material.metallic);
 #endif
     output.motion = motion;
     output.depth = virtualDepth;

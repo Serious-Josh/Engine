@@ -230,9 +230,6 @@ float3 ShadeGIWhiteDiffuseSecondary(float3 secondaryNormal)
 
 float GISecondarySurfaceMetallic(GPUMaterial material, float2 uv)
 {
-    if(material.model != 0u)
-        return material.metallic;
-
     float metallic = saturate(material.metallic);
     if(material.armTextureIndex != 0xFFFFFFFFu && material.preferARM != 0u)
     {
@@ -278,10 +275,9 @@ float3 ShadeGISecondaryEnvironmentOnly(GIPayload surface, float3 secondaryPositi
     }
 
     GPUMaterial material = materials[surface.materialIndex];
-    // Model 0 is metallic-roughness, model 1 dielectric; conductors have no diffuse lobe.
+    // Every OpenPBR material has a diffuse lobe weighted by (1 - metalness) base_weight (Legacy RTGI is Lambertian).
 
-    if(material.model > 1u || !all(isfinite(material.baseColor)) ||
-       (material.model == 0u && !isfinite(material.metallic)))
+    if(!all(isfinite(material.baseColor)) || !isfinite(material.metallic))
     {
         return 0.0f;
     }
@@ -294,9 +290,8 @@ float3 ShadeGISecondaryEnvironmentOnly(GIPayload surface, float3 secondaryPositi
         return 0.0f;
     }
 
-    float3 diffuseColor = max(material.baseColor * sampledColor, 0.0f);
+    float3 diffuseColor = max(saturate(material.baseWeight) * material.baseColor * sampledColor, 0.0f);
 
-    if(material.model == 0u)
     {
         float effectiveMetallic = GISecondarySurfaceMetallic(material, surface.uv);
         if(!isfinite(effectiveMetallic))
@@ -350,10 +345,9 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
     }
 
     GPUMaterial material = materials[surface.materialIndex];
-    // Model 0 is metallic-roughness, model 1 dielectric; conductors have no diffuse lobe.
+    // Every OpenPBR material has a diffuse lobe weighted by (1 - metalness) base_weight (Legacy RTGI is Lambertian).
 
-    if(material.model > 1u || !all(isfinite(material.baseColor)) ||
-       (material.model == 0u && !isfinite(material.metallic)))
+    if(!all(isfinite(material.baseColor)) || !isfinite(material.metallic))
     {
         return 0.0f;
     }
@@ -366,9 +360,8 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
         return 0.0f;
     }
 
-    float3 diffuseColor = max(material.baseColor * sampledColor, 0.0f);
+    float3 diffuseColor = max(saturate(material.baseWeight) * material.baseColor * sampledColor, 0.0f);
 
-    if(material.model == 0u)
     {
         float effectiveMetallic = GISecondarySurfaceMetallic(material, surface.uv);
         if(!isfinite(effectiveMetallic))
