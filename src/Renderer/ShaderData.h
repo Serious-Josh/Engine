@@ -29,14 +29,21 @@ struct CameraConstants
     // UPSCALING.3D: material texture mip bias (Triangle.hlsl); non-zero only on DLSS frames.
     float textureMipBias = 0.0f;
     // PSR.2: non-zero only on Path Tracing frames with in-place replacement enabled (Triangle.hlsl marks PSR-eligible
-    // mirrors in identity.x bit 31), with the path tracer's camera for the decode it evaluates.
+    // mirrors in identity.x bit 31).
     std::uint32_t psrEligibility = 0;
+    // The camera Triangle.hlsl measures lift scales with (PrimarySurfaceLift.hlsli), which is the path tracer's camera
+    // for the decode the eligibility evaluates. Set on every frame: a parallax pixel stores its lift scale in every
+    // lighting mode.
     std::uint32_t psrResolution[2] = {};
     Matrix4 psrInverseCameraRelativeViewProjection;
     float psrCameraPosition[3] = {};
-    // Non-zero on Path Tracing frames with a raster primary, which always carry the camera above: Triangle.hlsl stores
-    // the path tracer's lift scale as the geometric normal's length (PathTracePrimaryRasterLiftScale).
+    // Non-zero on Path Tracing frames with a raster primary: Triangle.hlsl stores every pixel's lift scale as the
+    // geometric normal's length (PathTracePrimaryRasterLiftScale).
     std::uint32_t primarySurfaceLiftScale = 0;
+    // Silhouette parallax occlusion mapping: the ray tracing instance records (RayTracingInstanceData), through which
+    // Triangle.hlsl finds a parallax pixel's triangle and its silhouette edges, or 0xFFFFFFFF.
+    std::uint32_t instanceDataIndex = 0xFFFFFFFFu;
+    std::uint32_t cameraPadding[3] = {};
 };
 
 struct ObjectConstants
@@ -82,7 +89,10 @@ struct ShadowConstants
 
     unsigned int accumulatedFrameCount;
     unsigned int geometricNormalIndex;
-    float padding[2];
+    // For a parallax pixel's self-shadowing (RayTracedShadow.hlsl GetReliefVisibility): the ray tracing instance
+    // records and the material buffer.
+    unsigned int instanceDataIndex;
+    unsigned int materialBufferIndex;
 };
 
 struct ReflectionConstants
@@ -305,7 +315,8 @@ struct AOConstants
     unsigned int depthIndex = 0;
     unsigned int surfaceIndex = 0;
     unsigned int frameIndex = 0;
-    unsigned int padding0 = 0;
+    // The G-buffer's geometric normal, whose length is the pixel's lift scale (PrimarySurfaceLift.hlsli).
+    unsigned int geometricNormalIndex = 0;
 
     float maxDistance = 1.5f;
     float originBias = 0.01f;
@@ -413,6 +424,9 @@ namespace GpuMaterialLobeFlags
     inline constexpr unsigned int Anisotropy = 8u;
     inline constexpr unsigned int CoatFollowsBaseNormal = 16u;
     inline constexpr unsigned int PathTracedAO = 32u;
+    // Silhouette parallax occlusion mapping: a parallax pixel whose relief point leaves the mesh across a silhouette edge
+    // is discarded (SurfaceDetailSilhouette.hlsli).
+    inline constexpr unsigned int ParallaxSilhouette = 64u;
 }
 
 // One material's OpenPBR Surface parameters as the shaders read them (assets/Shaders/MaterialLighting.hlsli), in
@@ -491,11 +505,16 @@ struct RayTracingInstanceData
     unsigned int triangleSlotOffset;
     unsigned int slotMaterialBufferIndex;
     unsigned int slotMaterialOffset;
+
+    // Silhouette parallax occlusion mapping: the mesh's per-triangle silhouette edges
+    // (Mesh::GetSilhouetteEdgeDescriptorIndex), or UINT_MAX for none.
+    unsigned int silhouetteEdgeBufferIndex = 0xFFFFFFFFu;
+    unsigned int padding[3] = {};
 };
 
 static_assert(sizeof(MaterialConstants) == 32);
 static_assert(sizeof(Matrix4) == 64);
-static_assert(sizeof(CameraConstants) == 416);
+static_assert(sizeof(CameraConstants) == 432);
 static_assert(sizeof(ObjectConstants) == 192);
 static_assert(sizeof(ReconstructionConstants) == 96);
 static_assert(offsetof(ReconstructionConstants, inverseViewProjection) == 0);
@@ -556,7 +575,8 @@ static_assert(offsetof(GPULight, range) == 28);
 static_assert(offsetof(GPULight, cosOuterCone) == 44);
 static_assert(sizeof(SceneLightConstants) == 16);
 static_assert(sizeof(ReflectionConstants) == 160);
-static_assert(sizeof(RayTracingInstanceData) == 48);
+static_assert(sizeof(RayTracingInstanceData) == 64);
+static_assert(offsetof(RayTracingInstanceData, silhouetteEdgeBufferIndex) == 48);
 static_assert(offsetof(RayTracingInstanceData, triangleSlotBufferIndex) == 32);
 static_assert(offsetof(RayTracingInstanceData, slotMaterialBufferIndex) == 40);
 static_assert(offsetof(GIConstants, importanceConditionalCDFIndex) == 112);

@@ -8,36 +8,22 @@
 // G-buffer encodings (Triangle.hlsl):
 //   material         RGBA8 UNORM: base colour (clamped to [0, 1], 8-bit), final roughness
 //   surface          RGBA16F: shading normal (normal-mapped, unflipped), material index as float
-//   geometric normal RGBA16F: normalized interpolated vertex normal (not the triangle face normal the
-//                    reference path tracer uses), effective metalness (textured)
-//   depth            D3D depth, near 0, far 1; 1 is background
+//   geometric normal RGBA16F: interpolated vertex normal (not the triangle face normal the reference path
+//                    tracer uses) with the pixel's lift scale as its length (PrimarySurfaceLift.hlsli; 1
+//                    on ordinary pixels), effective metalness (textured)
+//   depth            D3D depth, near 0, far 1; 1 is background. A parallax occlusion mapping pixel stores
+//                    the depth of the point the view ray meets on the relief, at or behind the triangle
 // These encodings, and the parallax UV offset the G-buffer applies, are the known differences from an
 // RT-primary hit. R3 measures them; nothing here hides them.
 
 #include "PathTraceBSDF.hlsli"
+// The lift's constants, its distance before the scale and the stored scale's decode (PathTracePrimaryLiftScale).
+#include "PrimarySurfaceLift.hlsli"
 
 // The material index is stored as fp16, which represents every integer exactly only up to 2048. The
 // renderer refuses the raster-primary mode for larger material tables
 // (PathTraceRasterPrimaryMaximumMaterials); this check rejects anything else that is not an exact index.
 static const float PATH_TRACE_PRIMARY_MAXIMUM_MATERIALS = 2048.0f;
-
-// A reconstructed point lies up to ~5e-5 x camera distance off the true surface, either side (RTXPT.2 R3,
-// measured), while an RT hit lies on it. Behind the surface, PathTraceOffsetRayOrigin's offset (as small as
-// 1/65536 near the world axes) cannot clear it, and every ray from the point self-shadows. The shaded point is
-// therefore lifted along the facing geometric normal by 4x that error. RT hits are unaffected.
-static const float PATH_TRACE_PRIMARY_SURFACE_LIFT = 2.0e-4f;
-
-// Far from the camera the depth target's resolution takes over. The stored depth is near 1 there, so one unit in its
-// last place (2^-24) moves the reconstructed point by distance^2 / near x 2^-24 along the view ray: 0.6 m at 1 km and
-// 15 m at 5 km with a 0.1 m near plane, against a proportional lift of 0.2 m and 1 m. A float32 model of the raster path
-// (Triangle.hlsl's vertex shader, an ideal rasterizer, the D32 store and the unprojection below) puts points up to 5
-// units behind distant surfaces. The lift covers 4 units, which passes the proportional lift about 80 m away; the
-// G-buffer pass's lift scale (PathTracePrimaryRasterLiftScale) covers whatever is left.
-static const float PATH_TRACE_PRIMARY_DEPTH_RESOLUTION = 4.0f / 16777216.0f;
-
-// The lift scale is stored as the length of the G-buffer's geometric normal, a power of two up to this (fp16 holds it
-// exactly, and every reader of that target normalizes it).
-static const float PATH_TRACE_PRIMARY_MAXIMUM_LIFT_SCALE = 32768.0f;
 
 struct PathTraceGBufferSample
 {
@@ -88,37 +74,13 @@ float3 PathTraceUnprojectCameraRelative(uint2 pixel, float depth, PathTracePrima
     return relative.xyz / relative.w;
 }
 
-// How far a decoded point is lifted along its geometric normal, before the lift scale: the proportional lift, or the
-// depth target's resolution at this pixel where that is larger. The resolution is an error along the view ray, so only
-// its component along the normal counts (a grazing surface's point mostly slides within the surface). With W the
-// unprojection's homogeneous coordinate, the distance changes by distance x |dW/d(depth)| / |W| per unit of depth.
+// How far a decoded point is lifted along its geometric normal, before the lift scale (PrimarySurfaceLiftDistance, with
+// this camera).
 float PathTracePrimarySurfaceLift(uint2 pixel, float depth, float3 cameraRelativePosition, float3 geometricNormal,
     PathTracePrimaryCamera camera)
 {
-    const float proportionalLift = PATH_TRACE_PRIMARY_SURFACE_LIFT * length(cameraRelativePosition);
-
-    const float2 uv = (float2(pixel) + 0.5f) / float2(camera.resolution);
-    const float4 ndc = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, depth, 1.0f);
-    const float homogeneousW = dot(camera.inverseCameraRelativeViewProjection[3], ndc);
-    const float depthLift = abs(dot(geometricNormal, cameraRelativePosition)) *
-        abs(camera.inverseCameraRelativeViewProjection[3][2]) * PATH_TRACE_PRIMARY_DEPTH_RESOLUTION / abs(homogeneousW);
-
-    // Near surfaces keep exactly the proportional lift they always had.
-    return max(proportionalLift, depthLift);
-}
-
-// The lift scale the G-buffer pass stored for this pixel (PathTracePrimaryRasterLiftScale): the stored geometric
-// normal's length, rounded to its power of two. A unit normal gives exactly 1, whatever its fp16 rounding.
-float PathTracePrimaryLiftScale(float3 storedGeometricNormal)
-{
-    const float lengthSquared = dot(storedGeometricNormal, storedGeometricNormal);
-
-    if(!(lengthSquared > 2.0f))
-    {
-        return 1.0f;
-    }
-
-    return min(exp2(round(0.5f * log2(lengthSquared))), PATH_TRACE_PRIMARY_MAXIMUM_LIFT_SCALE);
+    return PrimarySurfaceLiftDistance(pixel, camera.resolution, depth, cameraRelativePosition, geometricNormal,
+        camera.inverseCameraRelativeViewProjection[3]);
 }
 
 // For the G-buffer pass (Triangle.hlsl): the lift scale of a pixel, 1 unless the lift above cannot clear the surface.
@@ -160,6 +122,62 @@ float PathTracePrimaryRasterLiftScale(uint2 pixel, float depth, float3 surfacePo
     }
 
     return min(exp2(ceil(log2(requiredLift / lift))), PATH_TRACE_PRIMARY_MAXIMUM_LIFT_SCALE);
+}
+
+// For the G-buffer pass's relief pixels: a parallax occlusion mapping pixel whose depth is the point where the view ray
+// meets the relief, below the mesh. Every ray from that point would hit the mesh's own triangle, so the pixel's lift
+// must bring it back to the mesh surface: the same measurement as PathTracePrimaryRasterLiftScale on the depth the pixel
+// is about to store, with two differences.
+//
+// The scale is not rounded up to a power of two. The gap is centimetres against a lift of a fraction of a millimetre,
+// and an origin lifted up to twice too far would float above the surface, where it loses contact shadows and leaks
+// light. The stored length keeps the scale to a fraction of a percent (PATH_TRACE_PRIMARY_RELIEF_LIFT_HEADROOM).
+//
+// The gap is measured against the triangle's own plane (planeNormal, facing either way), not the plane of the
+// interpolated normal: the stored normal is the interpolated one, and on a curved mesh the point under a tilted face
+// would otherwise stay a few millimetres under it. The lift still runs along the stored normal, so it is divided by
+// what that normal climbs against the plane. A plane normal that is unusable (a degenerate derivative) or nearly at
+// right angles to the stored normal gives way to the stored normal.
+//
+// The lifted point ends at least half the unscaled lift above the triangle, as an ordinary pixel's does.
+float PathTracePrimaryReliefLiftScale(uint2 pixel, float depth, float3 surfacePosition, float3 geometricNormal,
+    float3 planeNormal, PathTracePrimaryCamera camera)
+{
+    const float3 cameraRelativePosition = PathTraceUnprojectCameraRelative(pixel, depth, camera);
+
+    if(!all(isfinite(cameraRelativePosition)) || !(dot(cameraRelativePosition, cameraRelativePosition) > 0.0f))
+    {
+        return 1.0f;
+    }
+
+    // Facing the viewer, as the decode turns it.
+    const float3 facingNormal = dot(geometricNormal, cameraRelativePosition) > 0.0f ? -geometricNormal : geometricNormal;
+    float3 facingPlaneNormal = facingNormal;
+    const float planeLengthSquared = dot(planeNormal, planeNormal);
+
+    if(planeLengthSquared > 0.0f && isfinite(planeLengthSquared))
+    {
+        const float3 unitPlaneNormal = planeNormal * rsqrt(planeLengthSquared);
+        const float3 candidate = dot(unitPlaneNormal, cameraRelativePosition) > 0.0f ? -unitPlaneNormal : unitPlaneNormal;
+
+        if(dot(candidate, facingNormal) > 0.25f)
+        {
+            facingPlaneNormal = candidate;
+        }
+    }
+
+    const float height = dot(facingPlaneNormal, cameraRelativePosition - (surfacePosition - camera.cameraPosition));
+    const float lift = PathTracePrimarySurfaceLift(pixel, depth, cameraRelativePosition, facingNormal, camera);
+    const float requiredLift = (0.5f * lift - height) / dot(facingPlaneNormal, facingNormal);
+
+    // Also the answer for a non-finite measurement.
+    if(!(requiredLift > lift))
+    {
+        return 1.0f;
+    }
+
+    return clamp(requiredLift / lift * PATH_TRACE_PRIMARY_RELIEF_LIFT_HEADROOM,
+        PATH_TRACE_PRIMARY_MINIMUM_RELIEF_LIFT_SCALE, PATH_TRACE_PRIMARY_MAXIMUM_LIFT_SCALE);
 }
 
 // Decodes the G-buffer into a surface without PathTraceFinalizeSurface (which applies the BSDF's own

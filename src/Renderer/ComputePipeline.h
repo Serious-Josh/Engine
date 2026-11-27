@@ -13,6 +13,10 @@ struct ComputePipelineDescription
     std::vector<RootParameterDescription> rootParameters;
 
     std::vector<D3D12_STATIC_SAMPLER_DESC> staticSamplers;
+
+    // Layered prep (F3): create through the persistent pipeline cache (PipelineStateCache), so a pipeline seen before on
+    // this adapter and driver skips the driver's compile, whichever executable compiled it first.
+    bool persistentCache = false;
 };
 
 // PSR.2 Stage 3B: Triangle.hlsl's material sampler (Pipeline's default trilinear clamp) at register s<shaderRegister>, for
@@ -52,7 +56,15 @@ class ComputePipeline
 
     ID3D12RootSignature* GetRootSignature() const;
 
+    // Layered prep (F3): whether the last Initialize took the pipeline from the persistent cache (no driver compile).
+    bool WasCreatedFromCache() const
+    {
+        return m_createdFromCache;
+    }
+
     private:
+    bool m_createdFromCache = false;
+
     ID3D12RootSignature* m_rootSignature = nullptr;
 
     ID3D12PipelineState* m_pipelineState = nullptr;

@@ -123,6 +123,13 @@ public:
     void RecordUploads(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex, std::uint64_t lastSubmissionFence,
         std::uint64_t completedFence, std::uint64_t submissionLifetime);
 
+    // AIR async compute: whether the last RecordUploads wrote any residency buffer (a region copy or a table publication). While
+    // it did, readers on another queue must not overlap this frame's recording.
+    bool RecordedWritesLastFrame() const noexcept
+    {
+        return m_recordedWrites;
+    }
+
     const VoxelWorldBinding& GetBinding() const noexcept
     {
         return m_binding;
@@ -205,4 +212,5 @@ private:
     VoxelWorldBinding m_binding;
     std::uint64_t m_bytesUploaded = 0;
     std::uint64_t m_tablesPublished = 0;
+    bool m_recordedWrites = false;
 };

@@ -44,6 +44,9 @@ struct ShaderBootstrapStatistics
     std::size_t libraries = 0;
     std::size_t optionalLibraries = 0;
     std::size_t libraryCacheHits = 0;
+    // Startup work (4.4): graphics and compute shaders served by the persistent DXIL cache, and the cook's thread count.
+    std::size_t shaderCacheHits = 0;
+    unsigned int threads = 0;
     std::uint64_t bytes = 0;
     std::uint64_t largestRecordBytes = 0;
     double seconds = 0.0;

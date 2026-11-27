@@ -6,6 +6,7 @@
 #include "assets/ProjectAssetRegistry.h"
 
 #include <imgui.h>
+#include <windows.h>
 
 #include <algorithm>
 #include <cstring>
@@ -65,26 +66,69 @@ namespace
     }
 }
 
+SceneMembershipPanel::~SceneMembershipPanel()
+{
+    if(m_read)
+    {
+        m_read->cancel = true;
+    }
+
+    if(m_readThread.joinable())
+    {
+        m_readThread.join();
+    }
+}
+
 void SceneMembershipPanel::Refresh(const ProjectPaths& paths, const ProjectAssetRegistry& registry)
 {
-    if(!m_stale && m_root == paths.GetRoot())
+    // A finished read is adopted (unless the project changed meanwhile; the next call reads it again).
+    if(m_read && m_read->done)
+    {
+        m_readThread.join();
+
+        if(m_read->root == m_root)
+        {
+            m_scenes = std::move(m_read->scenes);
+            m_problems = std::move(m_read->problems);
+
+            for(const auto& problem : ProjectSceneMembership::ValidateProject(m_scenes))
+            {
+                m_problems.push_back(problem);
+            }
+
+            m_placementDrafts.clear();
+            m_worldEnvironmentDraft.reset();
+            m_worldBuiltinEnvironmentDraft.clear();
+        }
+
+        m_read.reset();
+    }
+
+    if(m_read || (!m_stale && m_root == paths.GetRoot()))
     {
         return;
     }
 
     m_root = paths.GetRoot();
     m_stale = false;
-    m_problems.clear();
-    ProjectSceneMembership::ReadScenes(paths, registry, m_scenes, m_problems);
-
-    for(const auto& problem : ProjectSceneMembership::ValidateProject(m_scenes))
+    auto read = std::make_shared<PendingRead>();
+    read->root = m_root;
+    m_read = read;
+    m_readThread = std::thread([read, readPaths = paths, readRegistry = registry]()
     {
-        m_problems.push_back(problem);
-    }
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
-    m_placementDrafts.clear();
-    m_worldEnvironmentDraft.reset();
-    m_worldBuiltinEnvironmentDraft.clear();
+        try
+        {
+            ProjectSceneMembership::ReadScenes(readPaths, readRegistry, read->scenes, read->problems, &read->cancel);
+        }
+        catch(const std::exception& exception)
+        {
+            read->problems.push_back(std::string("Scene membership could not be read: ") + exception.what());
+        }
+
+        read->done = true;
+    });
 }
 
 const SceneInfo* SceneMembershipPanel::FindByPath(const fs::path& absolutePath) const
@@ -126,7 +170,8 @@ std::string SceneMembershipPanel::Describe(const fs::path& absolutePath) const
 
     if(!scene)
     {
-        return "Scene (not yet registered; reopen the project to register it)";
+        return m_read ? "Scene (reading the project's scenes...)" :
+            "Scene (not yet registered; reopen the project to register it)";
     }
 
     if(scene->kind == SceneKind::World)

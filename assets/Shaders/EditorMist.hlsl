@@ -206,6 +206,27 @@ cbuffer EditorMistConstants : register(b0)
     // Raymarch dither experiment (diagnostic, temporary): PixelOffset's pattern. 0 the production Bayer 4 x 4 with a hashed offset per
     // 4 x 4 block, 1 the Bayer 4 x 4 alone, 2 the R2 low-discrepancy dither.
     uint ditherMode;
+    // Fog step 1, the render volume (CSBuildRenderVolume; the *Volume marches): three 3D textures over the AIR window, indexed by slot.
+    // Their UAVs for the build, their SRVs for the march. renderVolumeFilter: RenderVolumeManual, RenderVolumeHardware or
+    // RenderVolumeHybrid (manual within renderVolumeNearDistance metres of the camera, hardware beyond). renderVolumeCounterIndex: the
+    // *VolumeCount marches' two counters (occupied samples, fast-path samples), cleared by the build.
+    uint renderVolumeMistIndex;
+    uint renderVolumeVelocityIndex;
+    uint renderVolumeFlagsIndex;
+    uint renderVolumeFilter;
+    float renderVolumeNearDistance;
+    uint renderVolumeCounterIndex;
+    // Step 1b: nonzero also takes labelled footprints (blocked voxels, no split cell) on the fast path.
+    uint renderVolumeExtended;
+    // Fog step 2 (hybrid froxel lighting; the *VolumeLights marches): the near-Light mask volume (R32G32_UINT; its UAV for
+    // CSFroxelHybridLights, its SRV for the march) and the camera distance the froxels reach (beyond it, every Light per sample). The far
+    // light volume is froxelLocalLightIndex; the froxel mapping and near radius are the froxel block's (froxelSize, froxelNear, ...,
+    // froxelNearLightRadius).
+    uint froxelLightMaskIndex;
+    float froxelLightFar;
+    // Fog step 2b: CSCountFogLights' output (one uint: the table Lights that reach the lit fog), read back for the automatic choice.
+    uint fogLightCountIndex;
+    uint fogLightPadding;
 };
 
 // AIR.4F F4.3: the scene's Light table (SceneLightConstants), as deferred lighting binds it.
@@ -438,6 +459,408 @@ void CSSunVisibility(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID)
 
     RWByteAddressBuffer visibility = ResourceDescriptorHeap[NonUniformResourceIndex(visibilityIndex)];
     visibility.Store(AirVelocityAddress(field, slot) / 4, bits);
+}
+
+// ================================================================================================ Fog step 1: the render volume
+//
+// A hardware-filterable copy of the mist for the march's footprints (Volumetric_Fog_Optimization_Report.md, section 3.4 and item 1).
+// Three 3D textures the size of the AIR window, indexed by slot (AirSlotOf), so a texel's +1 neighbour on each axis is the next slot and
+// wraps exactly where the toroidal storage does:
+//   - mist (RGBA32F): piece 0's premultiplied colour and density;
+//   - velocity (RGBA32F): piece 0's velocity (xyz) and its decoded sun visibility (w; 1 without a visibility buffer);
+//   - flags (RG32F): x describes the 2 x 2 x 2 footprint whose minimum corner is this cell (below); y is piece 0's decoded indirect
+//     fill (0 without a visibility buffer).
+//
+// Footprints (x):
+//   - RenderVolumeOpen: all 8 cells inside the window and whole (no blocked voxel), exactly when AirRenderMistAndVelocity takes its
+//     open path with no corner outside the window. The fast path blends all 8 corners as that path does.
+//   - Step 1b, a corner label word (0 to 2^24 - 1): all 8 cells inside the window and none split (piece 1 empty). Each corner's 3 bits
+//     (corner c at bit 3c) name its piece's connected component among the 8 pieces under AirPieceLink; a corner without a piece (a
+//     solid cell) has the label 7, which no piece then uses (with an empty corner there are at most 7 components). AirSearchCorners'
+//     links are symmetric, so from the sample's own piece it reaches exactly the corners of that piece's component, each through piece
+//     0 (no piece 1 exists, so the tie rule never applies); AirRenderCorners keeps those corners with their full weights and drops the
+//     others, and its blend is the open path's sum over the kept corners, term for term, in the same order. The fast path keeps the
+//     corners whose label is the sample's own corner's, after checking the sample's own sub-cell: outside its cell's piece,
+//     AirRenderMistAndVelocity returns nothing, and so does the fast path. Word 0: every corner in one component.
+//   - RenderVolumeEdge (the window's last layer) or RenderVolumeSplit (a cell holds two pieces): AirRenderMistAndVelocity, unchanged.
+//     The edge layer therefore never blends with the opposite face.
+// With fp32 textures and the manual filter the fast path is bit-identical to AirRenderMistAndVelocity. The hardware filter takes only
+// footprints that keep all 8 corners (open, or word 0).
+//
+// CSBuildRenderVolume rebuilds the cells of every brick a march sample can reach (the brick or one of its 26 neighbours is occupied, as
+// CSSunVisibility decides) every frame, after the sun visibility and the indirect fill: those change every frame, so the volume does too.
+// A brick no sample can reach is left as it was; nothing reads it.
+
+static const uint RenderVolumeManual = 0;
+static const uint RenderVolumeHardware = 1;
+static const uint RenderVolumeHybrid = 2;
+
+// The flags texture's footprint codes (x) besides the label words. 2^24 and every label word are exact in fp32.
+static const float RenderVolumeEdge = -1.0;
+static const float RenderVolumeSplit = -2.0;
+static const float RenderVolumeOpen = 16777216.0;
+static const uint RenderVolumeEmptyLabel = 7;
+
+// The counting marches' counters (uint each): occupied samples and fast-path samples; slow samples at the window's edge, beside a split
+// cell, and in labelled footprints with renderVolumeExtended off; fast samples in open footprints, in labelled footprints keeping all 8
+// corners (word 0), and in labelled footprints dropping corners.
+static const uint RenderVolumeCounters = 8;
+
+// Whether a cell (by slot) holds no blocked voxel, which CSBuildPieces settles as one whole piece (AirRenderLoadCell).
+bool RenderVolumeWhole(ByteAddressBuffer obstacles, uint3 slot)
+{
+    return ((obstacles.Load(AirObstacleWord(field, slot) * 4) >> ((slot.x % AirSlotsPerObstacleWord) * 2)) & AirObstacleBlocked) == 0;
+}
+
+// Step 1b: the label word of a footprint whose 8 cells hold one piece or none each (see above). Components join corners whose pieces
+// share an open sub-face (AirPieceLink > 0, AirSearchCorners' link), numbered in corner order from 0.
+uint RenderVolumeLabels(AirCell corners[8])
+{
+    // Each corner's component as its lowest corner index (8: no piece), by repeated relaxation over the 12 edges.
+    uint lowest[8];
+
+    for(uint corner = 0; corner < 8; ++corner)
+    {
+        lowest[corner] = corners[corner].piece0 != 0 ? corner : 8u;
+    }
+
+    for(uint round = 0; round < 7; ++round)
+    {
+        for(uint axis = 0; axis < 3; ++axis)
+        {
+            for(uint corner = 0; corner < 8; ++corner)
+            {
+                const uint other = corner | (1u << axis);
+
+                if(other == corner || lowest[corner] == 8u || lowest[other] == 8u)
+                {
+                    continue;
+                }
+
+                if(AirPieceLink(corners[corner].piece0, corners[other].piece0, axis) > 0)
+                {
+                    const uint joined = min(lowest[corner], lowest[other]);
+                    lowest[corner] = joined;
+                    lowest[other] = joined;
+                }
+            }
+        }
+    }
+
+    // Renumbered 0, 1, ... in corner order; a component's lowest corner comes first, so its number is known by then.
+    uint number[8];
+    uint next = 0;
+    uint word = 0;
+
+    for(uint corner = 0; corner < 8; ++corner)
+    {
+        uint label = RenderVolumeEmptyLabel;
+
+        if(lowest[corner] != 8u)
+        {
+            if(lowest[corner] == corner)
+            {
+                number[corner] = next;
+                ++next;
+            }
+
+            label = number[lowest[corner]];
+        }
+
+        word |= label << (3u * corner);
+    }
+
+    return word;
+}
+
+groupshared uint g_renderVolumeNeeded;
+
+[numthreads(8, 8, 8)]
+void CSBuildRenderVolume(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID, uint threadIndex : SV_GroupIndex)
+{
+    // The counting marches' counters start from 0 each frame (the march runs after this pass's barrier).
+    if(renderVolumeCounterIndex != 0xFFFFFFFFu && all(group == 0) && threadIndex == 0)
+    {
+        RWByteAddressBuffer counters = ResourceDescriptorHeap[NonUniformResourceIndex(renderVolumeCounterIndex)];
+        counters.Store4(0, uint4(0, 0, 0, 0));
+        counters.Store4(16, uint4(0, 0, 0, 0));
+    }
+
+    // CSSunVisibility's test (the brick or one of its 26 neighbours occupied), one neighbour per thread for the group.
+    if(threadIndex == 0)
+    {
+        g_renderVolumeNeeded = 0;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if(threadIndex < 27)
+    {
+        const int3 counts = int3(BrickCounts());
+        ByteAddressBuffer occupancy = ResourceDescriptorHeap[NonUniformResourceIndex(occupancyIndex)];
+        const int neighbour = int(threadIndex);
+        const int3 brick = (int3(group) + int3(neighbour % 3, (neighbour / 3) % 3, neighbour / 9) - 1 + counts) % counts;
+
+        if(occupancy.Load((brick.x + counts.x * (brick.y + counts.y * brick.z)) * 4) != 0)
+        {
+            InterlockedOr(g_renderVolumeNeeded, 1u);
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if(g_renderVolumeNeeded == 0)
+    {
+        return;
+    }
+
+    const uint3 slot = group * BrickCells + thread;
+    const int3 local = AirCellOfSlot(field, slot) - field.minimum;
+    ByteAddressBuffer obstacles = ResourceDescriptorHeap[NonUniformResourceIndex(field.obstacleIndex)];
+    // The footprint's 8 cells: this one and its +1 neighbours, all inside the window (so none is the edge layer's wrap).
+    float code = RenderVolumeEdge;
+
+    if(all(local + 1 < int3(field.dimensions)))
+    {
+        const uint3 highSlot = select(slot + 1 == field.dimensions, uint3(0, 0, 0), slot + 1);
+        bool open = true;
+
+        [unroll]
+        for(uint corner = 0; corner < 8; ++corner)
+        {
+            const bool3 upper = bool3((corner & 1u) != 0, (corner & 2u) != 0, (corner & 4u) != 0);
+            open = open && RenderVolumeWhole(obstacles, select(upper, highSlot, slot));
+        }
+
+        code = RenderVolumeOpen;
+
+        // Step 1b: a footprint with blocked voxels, by its cells' pieces (AirRenderLoadCell, as AirRenderCorners loads them).
+        if(!open)
+        {
+            AirCell corners[8];
+            bool split = false;
+
+            for(uint corner = 0; corner < 8; ++corner)
+            {
+                const bool3 upper = bool3((corner & 1u) != 0, (corner & 2u) != 0, (corner & 4u) != 0);
+                corners[corner] = AirRenderLoadCell(Path(), select(upper, highSlot, slot));
+                split = split || corners[corner].piece1 != 0;
+            }
+
+            code = split ? RenderVolumeSplit : float(RenderVolumeLabels(corners));
+        }
+    }
+
+    const uint index = AirRenderSlotIndex(field, slot);
+    AirPathBuffer mistValues = ResourceDescriptorHeap[NonUniformResourceIndex(mist0Index)];
+    AirPathBuffer velocityValues = ResourceDescriptorHeap[NonUniformResourceIndex(field.velocityIndex)];
+    const float4 mist = asfloat(mistValues.Load4(index * 16));
+    const float3 velocity = asfloat(velocityValues.Load3(index * 16));
+    float sunVisibility = 1.0;
+    float indirect = 0.0;
+
+    if(visibilityIndex != AirNoVisibility)
+    {
+        ByteAddressBuffer visibility = ResourceDescriptorHeap[NonUniformResourceIndex(visibilityIndex)];
+        const uint word = visibility.Load(index * 4);
+        sunVisibility = AirUnpackSunVisibility(word, 0);
+        indirect = AirUnpackIndirect(word, 0);
+    }
+
+    RWTexture3D<float4> mistVolume = ResourceDescriptorHeap[NonUniformResourceIndex(renderVolumeMistIndex)];
+    RWTexture3D<float4> velocityVolume = ResourceDescriptorHeap[NonUniformResourceIndex(renderVolumeVelocityIndex)];
+    RWTexture3D<float2> flagVolume = ResourceDescriptorHeap[NonUniformResourceIndex(renderVolumeFlagsIndex)];
+    mistVolume[slot] = mist;
+    velocityVolume[slot] = float4(velocity, sunVisibility);
+    flagVolume[slot] = float2(code, indirect);
+}
+
+// The march's sample from the render volume when its footprint is open or (step 1b, renderVolumeExtended) labelled: `result` then holds
+// what AirRenderMistAndVelocity returns (exactly, with fp32 textures and the manual filter; with the hardware filter, to its 8-bit
+// weights); false otherwise. `minimumSlot` is AirSlotOf(field.minimum), once per ray. `t` (metres along the ray) picks the hybrid
+// filter's side. `code` receives the footprint's flag (RenderVolumeEdge outside the window's interior).
+bool RenderVolumeSample(float3 position, float t, bool withVelocity, bool withVisibility, uint3 minimumSlot, out AirRenderSample result,
+    out float code)
+{
+    code = RenderVolumeEdge;
+    result.mist = float4(0.0, 0.0, 0.0, 0.0);
+    result.velocity = float3(0.0, 0.0, 0.0);
+    result.sunVisibility = 1.0;
+    result.indirect = 0.0;
+    const float3 shifted = position - 0.5;
+    const int3 base = int3(floor(shifted));
+
+    // The flag is the edge code on the window's last layer; outside the window there is no texel to load.
+    if(any(base < 0) || any(base + 1 >= int3(field.dimensions)))
+    {
+        return false;
+    }
+
+    const uint3 unwrapped = minimumSlot + uint3(base);
+    const uint3 lowSlot = select(unwrapped >= field.dimensions, unwrapped - field.dimensions, unwrapped);
+    Texture3D<float2> flagVolume = ResourceDescriptorHeap[NonUniformResourceIndex(renderVolumeFlagsIndex)];
+    code = flagVolume.Load(int4(lowSlot, 0)).x;
+    const bool open = code == RenderVolumeOpen;
+
+    if(code < 0.0 || (!open && renderVolumeExtended == 0))
+    {
+        return false;
+    }
+
+    const uint3 highSlot = select(lowSlot + 1 == field.dimensions, uint3(0, 0, 0), lowSlot + 1);
+    // Step 1b: a labelled footprint keeps the corners in the sample's own corner's component.
+    const uint word = open ? 0u : uint(code);
+    uint homeLabel = 0;
+
+    if(!open)
+    {
+        // The sample's own sub-cell must lie in its cell's piece (piece 0, the only one); outside it AirRenderMistAndVelocity returns
+        // nothing, and so does this (the result as initialized).
+        const int3 home = int3(floor(position));
+        const int3 homeOffset = home - base;
+        const AirCell holder = AirRenderLoadCell(Path(), select(homeOffset != 0, highSlot, lowSlot));
+        const int3 subcell = clamp(int3(floor(position * 4.0)) - home * 4, 0, 3);
+
+        if(AirPieceOfSubcell(holder, subcell) != 0)
+        {
+            return true;
+        }
+
+        homeLabel = (word >> (3u * uint(homeOffset.x + 2 * homeOffset.y + 4 * homeOffset.z))) & 7u;
+    }
+
+    const float3 fraction = shifted - float3(base);
+    Texture3D<float4> mistVolume = ResourceDescriptorHeap[NonUniformResourceIndex(renderVolumeMistIndex)];
+    Texture3D<float4> velocityVolume = ResourceDescriptorHeap[NonUniformResourceIndex(renderVolumeVelocityIndex)];
+    // The hardware filter blends all 8 corners, so a footprint dropping corners always takes the manual blend.
+    const bool manual = renderVolumeFilter == RenderVolumeManual || (renderVolumeFilter == RenderVolumeHybrid && t < renderVolumeNearDistance) ||
+        word != 0;
+
+    if(manual)
+    {
+        // AirRenderMistOpen, AirRenderVelocityOpen and the open path's visibility gather (AirRenderMistAndVelocity's link-search path
+        // over the kept corners): the same weights, order and normalization.
+        float4 mistSum = float4(0.0, 0.0, 0.0, 0.0);
+        float total = 0.0;
+
+        [unroll]
+        for(uint corner = 0; corner < 8; ++corner)
+        {
+            const int3 offset = int3(corner & 1u, (corner >> 1) & 1u, (corner >> 2) & 1u);
+            const float3 axisWeight = lerp(1.0 - fraction, fraction, float3(offset));
+            const float weight = axisWeight.x * axisWeight.y * axisWeight.z;
+
+            if(weight > 0.0 && ((word >> (3u * corner)) & 7u) == homeLabel)
+            {
+                mistSum += mistVolume.Load(int4(select(offset != 0, highSlot, lowSlot), 0)) * weight;
+                total += weight;
+            }
+        }
+
+        result.mist = mistSum / total;
+
+        if(result.mist.a > 0.0 && (withVelocity || withVisibility))
+        {
+            float4 velocitySum = float4(0.0, 0.0, 0.0, 0.0);
+            float indirectSum = 0.0;
+
+            [unroll]
+            for(uint corner = 0; corner < 8; ++corner)
+            {
+                const int3 offset = int3(corner & 1u, (corner >> 1) & 1u, (corner >> 2) & 1u);
+                const float3 axisWeight = lerp(1.0 - fraction, fraction, float3(offset));
+                const float weight = axisWeight.x * axisWeight.y * axisWeight.z;
+
+                if(weight > 0.0 && ((word >> (3u * corner)) & 7u) == homeLabel)
+                {
+                    const int4 texel = int4(select(offset != 0, highSlot, lowSlot), 0);
+                    velocitySum += velocityVolume.Load(texel) * weight;
+
+                    if(withVisibility)
+                    {
+                        indirectSum += flagVolume.Load(texel).y * weight;
+                    }
+                }
+            }
+
+            if(withVelocity)
+            {
+                result.velocity = velocitySum.xyz / total;
+            }
+
+            if(withVisibility)
+            {
+                result.sunVisibility = velocitySum.w / total;
+                result.indirect = indirectSum / total;
+            }
+        }
+
+        return true;
+    }
+
+    // Hardware trilinear (s0: linear, wrap): texel centres sit at (slot + 0.5) / dimensions, so this point blends lowSlot and its +1
+    // neighbours by `fraction`, wrapping with the storage.
+    const float3 uvw = (float3(lowSlot) + fraction + 0.5) / float3(field.dimensions);
+    result.mist = mistVolume.SampleLevel(noiseSampler, uvw, 0.0);
+
+    if(result.mist.a > 0.0 && (withVelocity || withVisibility))
+    {
+        const float4 velocity = velocityVolume.SampleLevel(noiseSampler, uvw, 0.0);
+
+        if(withVelocity)
+        {
+            result.velocity = velocity.xyz;
+        }
+
+        if(withVisibility)
+        {
+            result.sunVisibility = velocity.w;
+            result.indirect = flagVolume.SampleLevel(noiseSampler, uvw, 0.0).y;
+        }
+    }
+
+    return true;
+}
+
+// A *Volume march's sample: the render volume's fast path where the footprint allows it, AirRenderMistAndVelocity otherwise. `counting`
+// (a literal; the *VolumeCount kernels) adds this wave's samples to RenderVolumeCounters.
+AirRenderSample MarchSample(float3 position, float t, bool withVelocity, uint sampleVisibility, bool counting, uint3 minimumSlot)
+{
+    AirRenderSample sample;
+    float code;
+    const bool fast = RenderVolumeSample(position, t, withVelocity, sampleVisibility != AirNoVisibility, minimumSlot, sample, code);
+
+    if(!fast)
+    {
+        sample = AirRenderMistAndVelocity(Path(), Mist(), position, withVelocity, sampleVisibility);
+    }
+
+    if(counting)
+    {
+        const bool labelled = code >= 0.0 && code != RenderVolumeOpen;
+        uint counts[RenderVolumeCounters];
+        counts[0] = WaveActiveCountBits(true);
+        counts[1] = WaveActiveCountBits(fast);
+        counts[2] = WaveActiveCountBits(code == RenderVolumeEdge);
+        counts[3] = WaveActiveCountBits(code == RenderVolumeSplit);
+        counts[4] = WaveActiveCountBits(labelled && !fast);
+        counts[5] = WaveActiveCountBits(code == RenderVolumeOpen && fast);
+        counts[6] = WaveActiveCountBits(labelled && fast && code == 0.0);
+        counts[7] = WaveActiveCountBits(labelled && fast && code != 0.0);
+
+        if(WaveIsFirstLane())
+        {
+            RWByteAddressBuffer counters = ResourceDescriptorHeap[NonUniformResourceIndex(renderVolumeCounterIndex)];
+
+            [unroll]
+            for(uint counter = 0; counter < RenderVolumeCounters; ++counter)
+            {
+                counters.InterlockedAdd(counter * 4, counts[counter]);
+            }
+        }
+    }
+
+    return sample;
 }
 
 // AIR.4F F4.3: the Henyey-Greenstein phase function (per steradian) for the cosine between the direction toward the light and the ray's
@@ -1477,6 +1900,253 @@ float FroxelIndirectFiltered(float2 uv, float distance)
     return volume.SampleLevel(froxelSampler, coordinate, 0.0);
 }
 
+// ================================================================================================ Fog step 2: hybrid froxel lighting
+//
+// Volumetric_Fog_Optimization_Report.md, section 3.4 (the hybrid's lighting part). The production march's table Lights split by
+// distance, as V1d's integrated renderer splits them (FarLightShare): each point or spot Light's in-scattering at a point is
+//   share(d) x L  from a froxel volume (far: CSFroxelHybridLights at each froxel's centre, read trilinearly), plus
+//   (1 - share(d)) x L  evaluated at the sample itself (near),
+// with share(d) = smoothstep(r, 2r, d), d the distance to the Light and r froxelNearLightRadius (0: every Light is far). Directional
+// table Lights are always far. The two parts sum to each Light's whole contribution wherever the far part is exact (at froxel centres);
+// between centres the far part is interpolated, which is the approximation. The haze takes the same split (it used the per-sample loop).
+//
+// So the per-sample loop visits only the Lights near the sample: CSFroxelHybridLights also writes, per froxel, a mask of the Lights
+// whose 2r sphere reaches the froxel (its centre within 2r plus the froxel's bounding radius), Lights 0 to 63; the march walks the mask
+// of the froxel holding the sample. Lights from 64 on are evaluated per sample as before (their near part only: their far part is in the
+// volume). The froxels cover camera distances up to froxelLightFar; a sample beyond it (the haze tail) takes the whole per-sample loop.
+// The volume is this frame's outgoing light toward this camera (the phase uses each froxel's ray), with no history.
+
+// Lights 0 to 63 in the near mask (two words per froxel).
+static const uint HybridMaskedLights = 64;
+
+// A point or spot Light's far share at distance d (V1d's FarLightShare, which is defined after the march).
+float HybridFarShare(float d)
+{
+    return froxelNearLightRadius > 0.0 ? smoothstep(froxelNearLightRadius, 2.0 * froxelNearLightRadius, d) : 1.0;
+}
+
+// The froxel holding camera distance t along the pixel ray through uv (slice 0 also holds every distance before the near face).
+uint3 HybridFroxelOf(float2 uv, float t)
+{
+    const float3 coordinate = float3(uv * float2(froxelSize.xy), FroxelSliceOf(t));
+    return uint3(clamp(int3(floor(coordinate)), int3(0, 0, 0), int3(froxelSize) - 1));
+}
+
+[numthreads(4, 4, 4)]
+void CSFroxelHybridLights(uint3 froxel : SV_DispatchThreadID)
+{
+    if(any(froxel >= froxelSize))
+    {
+        return;
+    }
+
+    const float2 uv = (float2(froxel.xy) + 0.5) / float2(froxelSize.xy);
+    const float3 rayDirection = FroxelRayDirection(uv);
+    const float3 world = cameraPosition + rayDirection * FroxelDistanceOf(float(froxel.z) + 0.5);
+
+    // The froxel's bounding radius about its centre: the farthest of its 8 corners (its rays' corners at the slice's two faces).
+    const float near = froxel.z == 0 ? 0.0 : FroxelDistanceOf(float(froxel.z));
+    const float far = FroxelDistanceOf(float(froxel.z) + 1.0);
+    float radius = 0.0;
+
+    for(uint corner = 0; corner < 4; ++corner)
+    {
+        const float2 cornerUV = (float2(froxel.xy) + float2(corner & 1u, corner >> 1)) / float2(froxelSize.xy);
+        const float3 cornerDirection = FroxelRayDirection(cornerUV);
+        radius = max(radius, length(cameraPosition + cornerDirection * near - world));
+        radius = max(radius, length(cameraPosition + cornerDirection * far - world));
+    }
+
+    float3 farLight = float3(0.0, 0.0, 0.0);
+    uint2 mask = uint2(0, 0);
+    const uint count = sceneLightCount;
+    const float reach = 2.0 * froxelNearLightRadius + radius;
+
+    for(uint index = 0; index < count; ++index)
+    {
+        const GPULight light = SceneLightLoad(sceneLightBufferIndex, index);
+        float3 directionToLight;
+        const float3 incidence = EvaluateSceneLightIncidence(light, world, directionToLight);
+        const bool directional = light.type == SCENE_LIGHT_DIRECTIONAL;
+        const float distance = directional ? 1e30 : length(light.position - world);
+
+        if(any(incidence > 0.0))
+        {
+            farLight += (directional ? 1.0 : HybridFarShare(distance)) * incidence * HenyeyGreenstein(dot(directionToLight, rayDirection), anisotropy);
+        }
+
+        // A Light that may be near some point of this froxel (within its range: beyond it the Light gives nothing).
+        if(!directional && froxelNearLightRadius > 0.0 && index < HybridMaskedLights && distance < reach &&
+            distance < abs(light.range) + radius)
+        {
+            if(index < 32)
+            {
+                mask.x |= 1u << index;
+            }
+            else
+            {
+                mask.y |= 1u << (index - 32);
+            }
+        }
+    }
+
+    RWTexture3D<float4> farVolume = ResourceDescriptorHeap[NonUniformResourceIndex(froxelLocalLightIndex)];
+    RWTexture3D<uint2> maskVolume = ResourceDescriptorHeap[NonUniformResourceIndex(froxelLightMaskIndex)];
+    farVolume[froxel] = float4(all(isfinite(farLight)) ? max(farLight, 0.0) : float3(0.0, 0.0, 0.0), 1.0);
+    maskVolume[froxel] = mask;
+}
+
+// Fog step 2b: the automatic choice. EditorMistPass takes the hybrid lights when at least 8 table Lights reach the lit fog (and leaves them
+// once at most 6 do), counted here every frame it decides and read back a few frames later. A Light reaches the fog when it is
+// directional, when its range sphere meets the AIR window's box while the mist is marched, or (with haze) when it lies within its range
+// of the froxels' reach around the camera (froxelLightFar). Lights out of reach light nothing in either path; the per-sample loop's
+// cost grows with the Lights that do.
+groupshared uint g_fogLightCount;
+
+bool FogLightReaches(GPULight light)
+{
+    if(light.type == SCENE_LIGHT_DIRECTIONAL)
+    {
+        return true;
+    }
+
+    const float range = abs(light.range);
+    const float3 low = float3(field.minimum) * field.cellSize;
+    const float3 high = float3(field.minimum + int3(field.dimensions)) * field.cellSize;
+    const float3 nearest = clamp(light.position, low, high);
+    const float3 offset = nearest - light.position;
+    const bool mist = mistActive != 0 && dot(offset, offset) < range * range;
+    const bool haze = hazeEnabled != 0 && length(light.position - cameraPosition) < froxelLightFar + range;
+    return mist || haze;
+}
+
+[numthreads(64, 1, 1)]
+void CSCountFogLights(uint thread : SV_GroupIndex)
+{
+    if(thread == 0)
+    {
+        g_fogLightCount = 0;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    for(uint index = thread; index < sceneLightCount; index += 64)
+    {
+        if(FogLightReaches(SceneLightLoad(sceneLightBufferIndex, index)))
+        {
+            InterlockedAdd(g_fogLightCount, 1u);
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if(thread == 0)
+    {
+        RWByteAddressBuffer output = ResourceDescriptorHeap[NonUniformResourceIndex(fogLightCountIndex)];
+        output.Store(0, g_fogLightCount);
+    }
+}
+
+// One Light's near part at a point, per unit scattering coefficient: (1 - share) x its in-scattering toward rayDirection.
+float3 HybridNearLight(uint index, float3 world, float3 rayDirection)
+{
+    const GPULight light = SceneLightLoad(sceneLightBufferIndex, index);
+
+    if(light.type == SCENE_LIGHT_DIRECTIONAL)
+    {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    const float nearShare = 1.0 - HybridFarShare(length(light.position - world));
+
+    if(nearShare <= 0.0)
+    {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    float3 directionToLight;
+    const float3 incidence = EvaluateSceneLightIncidence(light, world, directionToLight);
+    return any(incidence > 0.0) ? nearShare * incidence * HenyeyGreenstein(dot(directionToLight, rayDirection), anisotropy) :
+        float3(0.0, 0.0, 0.0);
+}
+
+// The table Lights' in-scattering at a march sample (camera distance t on the pixel ray through uv): the far volume plus the near Lights
+// of the sample's froxel; beyond the froxels, every Light per sample (AddSceneLights).
+float3 HybridSceneLights(float2 uv, float t, float3 world, float3 rayDirection)
+{
+    if(!(t <= froxelLightFar))
+    {
+        return AddSceneLights(world, rayDirection, float3(0.0, 0.0, 0.0));
+    }
+
+    Texture3D<float4> farVolume = ResourceDescriptorHeap[NonUniformResourceIndex(froxelLocalLightIndex)];
+    Texture3D<uint2> maskVolume = ResourceDescriptorHeap[NonUniformResourceIndex(froxelLightMaskIndex)];
+    float3 light = farVolume.SampleLevel(froxelSampler, float3(uv, FroxelSliceOf(t) / float(froxelSize.z)), 0.0).rgb;
+    const uint2 mask = maskVolume.Load(int4(HybridFroxelOf(uv, t), 0));
+
+    for(uint word = 0; word < 2; ++word)
+    {
+        uint remaining = word == 0 ? mask.x : mask.y;
+
+        while(remaining != 0)
+        {
+            const uint bit = firstbitlow(remaining);
+            remaining &= remaining - 1;
+            light += HybridNearLight(word * 32 + bit, world, rayDirection);
+        }
+    }
+
+    for(uint index = HybridMaskedLights; index < sceneLightCount; ++index)
+    {
+        light += HybridNearLight(index, world, rayDirection);
+    }
+
+    return light;
+}
+
+// InScattered with the table Lights' term split (HybridSceneLights); the ambient, sun and indirect terms are InScattered's own.
+float3 InScatteredHybrid(float2 uv, float t, float3 world, float3 rayDirection, float sunVisibility, float3 ambientRadiance, float isotropy,
+    float indirect)
+{
+    return InScatteredBase(world, rayDirection, sunVisibility, ambientRadiance, isotropy, indirect) + HybridSceneLights(uv, t, world, rayDirection);
+}
+
+// AddHazeInterval with the haze lit through HazeLight's hybrid counterpart (each subinterval's middle, as there). A separate function, so
+// AddHazeInterval itself and the production kernels compile as before.
+void AddHazeIntervalHybrid(float2 uv, float from, float to, uint subintervals, float3 rayDirection, float3 ambientRadiance, bool bounded,
+    inout float3 color, inout float transmittance, inout float opticalDepth)
+{
+    if(hazeEnabled == 0 || !(to > from))
+    {
+        return;
+    }
+
+    const float length = (to - from) / float(subintervals);
+    const float3 albedo = lightingEnabled != 0 ? hazeAlbedo * scatteringTint * scattering : hazeAlbedo;
+    const float meanAlbedo = dot(albedo, float3(1.0, 1.0, 1.0) / 3.0);
+
+    for(uint index = 0; index < subintervals; ++index)
+    {
+        const float start = from + float(index) * length;
+        const float end = index + 1 == subintervals ? to : start + length;
+        const float depth = HazeDepth(start, end, rayDirection, bounded);
+
+        if(depth <= 0.0)
+        {
+            continue;
+        }
+
+        const float isotropy = ScatteringIsotropy(opticalDepth, meanAlbedo);
+        const float middle = 0.5 * (start + end);
+        const float3 world = cameraPosition + rayDirection * middle;
+        const float3 light = lightingEnabled != 0 ? InScatteredHybrid(uv, middle, world, rayDirection, 1.0, ambientRadiance, isotropy, 0.0) :
+            float3(1.0, 1.0, 1.0);
+        color += transmittance * OneMinusExp(depth) * albedo * light;
+        transmittance *= exp(-depth);
+        opticalDepth += depth;
+    }
+}
+
 // ================================================================================================ V1c-4: froxel local lights
 //
 // AirVolumetricV1c4Report.md. The table Lights' in-scattering (AddSceneLights) at each froxel's centre, along that froxel's own
@@ -1649,8 +2319,11 @@ float FroxelSunVisibilityFrom(uint sunSource, float2 uv, float distance)
 
 // The whole ray through mist and haze (see the comment above): (premultiplied colour, transmittance). V1a: `sunSource` (a literal at
 // each kernel, so the production kernels compile without the froxel code) picks the mist's sun visibility (FroxelSunVisibilityFrom).
-float4 MarchAtmosphere(uint2 pixel, float2 clip, float3 direction, float sceneDistance, bool bounded, uint sunSource)
+float4 MarchAtmosphere(uint2 pixel, float2 clip, float3 direction, float sceneDistance, bool bounded, uint sunSource,
+    bool renderVolume = false, bool counting = false, bool froxelLights = false)
 {
+    // Fog step 2: the pixel's uv, for the hybrid lighting's froxel lookups (the *VolumeLights kernels only).
+    const float2 pixelUV = float2(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
     // The sky lies at the camera's far plane along this ray.
     const float rayEnd = sceneDistance < NoGeometry ? sceneDistance : length(WorldAt(clip, 1.0) - cameraPosition);
     float3 color = float3(0.0, 0.0, 0.0);
@@ -1674,7 +2347,15 @@ float4 MarchAtmosphere(uint2 pixel, float2 clip, float3 direction, float sceneDi
         if(span.x < span.y)
         {
             // Before the window (only when the camera is outside it): haze alone.
-            AddHazeInterval(0.0, span.x, 1, direction, hazeAmbientRadiance, bounded, color, transmittance, opticalDepth);
+            if(froxelLights)
+            {
+                AddHazeIntervalHybrid(pixelUV, 0.0, span.x, 1, direction, hazeAmbientRadiance, bounded, color, transmittance, opticalDepth);
+            }
+            else
+            {
+                AddHazeInterval(0.0, span.x, 1, direction, hazeAmbientRadiance, bounded, color, transmittance, opticalDepth);
+            }
+
             tailStart = span.x;
             const float step = max(minimumStep, (span.y - span.x) / float(maxSteps));
             const float offset = jitterEnabled != 0 ? PixelOffset(pixel) : 0.0;
@@ -1682,6 +2363,8 @@ float4 MarchAtmosphere(uint2 pixel, float2 clip, float3 direction, float sceneDi
             const float3 rayCells = direction * field.inverseCellSize;
             ByteAddressBuffer occupancy = ResourceDescriptorHeap[NonUniformResourceIndex(occupancyIndex)];
             const float3 hazeScattering = lightingEnabled != 0 ? hazeAlbedo * scatteringTint * scattering : hazeAlbedo;
+            // Fog step 1: the window minimum's slot, for the render volume's texel addresses.
+            const uint3 minimumSlot = AirSlotOf(field, field.minimum);
             uint index = 0;
 
             // Segments as the march above: k covers [span.x + k step, span.x + (k + 1) step), the last cut off at span.y.
@@ -1715,12 +2398,34 @@ float4 MarchAtmosphere(uint2 pixel, float2 clip, float3 direction, float sceneDi
                     const float exitT = t + brickSpan.y;
                     index = max(index + 1, uint(ceil((exitT - span.x) / step - offset)));
                     tailStart = min(span.x + float(index) * step, span.y);
-                    AddHazeInterval(start, tailStart, 1, direction, hazeAmbientRadiance, bounded, color, transmittance, opticalDepth);
+                    if(froxelLights)
+                    {
+                        AddHazeIntervalHybrid(pixelUV, start, tailStart, 1, direction, hazeAmbientRadiance, bounded, color, transmittance,
+                            opticalDepth);
+                    }
+                    else
+                    {
+                        AddHazeInterval(start, tailStart, 1, direction, hazeAmbientRadiance, bounded, color, transmittance, opticalDepth);
+                    }
+
                     continue;
                 }
 
-                const AirRenderSample sample = AirRenderMistAndVelocity(Path(), Mist(), position, detailEnabled != 0,
-                    lightingEnabled != 0 ? visibilityIndex : AirNoVisibility);
+                // Fog step 1: the render volume only in the *Volume kernels; the production kernels keep their sample exactly (any other
+                // formulation reorders their DXIL).
+                AirRenderSample sample;
+
+                if(renderVolume)
+                {
+                    sample = MarchSample(position, t, detailEnabled != 0, lightingEnabled != 0 ? visibilityIndex : AirNoVisibility, counting,
+                        minimumSlot);
+                }
+                else
+                {
+                    sample = AirRenderMistAndVelocity(Path(), Mist(), position, detailEnabled != 0,
+                        lightingEnabled != 0 ? visibilityIndex : AirNoVisibility);
+                }
+
                 const float3 world = cameraPosition + direction * t;
                 // AIR.4F.2d.3b: each medium with its own clearance; the haze with its height profile.
                 const float mistWeight = NearWeight(t, mistNearDistance, mistNearTransition);
@@ -1764,17 +2469,33 @@ float4 MarchAtmosphere(uint2 pixel, float2 clip, float3 direction, float sceneDi
                                 sample.sunVisibility;
                             const float indirect = sunSource == SunFromFroxelLit || sunSource == SunFromFroxelLitLocal ?
                                 FroxelIndirectFiltered(uv, t) : sample.indirect;
-                            radiance += mistShare * mistScattering * (sunSource == SunFromFroxelLitLocal ?
-                                InScatteredFroxelLights(world, direction, sunVisibility, ambientRadiance, isotropy, indirect, FroxelLocalLightsFiltered(uv, t)) :
-                                InScattered(world, direction, sunVisibility, ambientRadiance, isotropy, indirect));
+                            if(froxelLights)
+                            {
+                                radiance += mistShare * mistScattering * InScatteredHybrid(uv, t, world, direction, sunVisibility, ambientRadiance,
+                                    isotropy, indirect);
+                            }
+                            else
+                            {
+                                radiance += mistShare * mistScattering * (sunSource == SunFromFroxelLitLocal ?
+                                    InScatteredFroxelLights(world, direction, sunVisibility, ambientRadiance, isotropy, indirect, FroxelLocalLightsFiltered(uv, t)) :
+                                    InScattered(world, direction, sunVisibility, ambientRadiance, isotropy, indirect));
+                            }
                         }
 
                         if(hazeShare > 0.0)
                         {
                             const float2 uv = float2(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
-                            radiance += hazeShare * hazeScattering * (sunSource == SunFromFroxelLitLocal ?
-                                InScatteredFroxelLights(world, direction, 1.0, hazeAmbientRadiance, isotropy, 0.0, FroxelLocalLightsFiltered(uv, t)) :
-                                InScattered(world, direction, 1.0, hazeAmbientRadiance, isotropy, 0.0));
+                            if(froxelLights)
+                            {
+                                radiance += hazeShare * hazeScattering * InScatteredHybrid(uv, t, world, direction, 1.0, hazeAmbientRadiance,
+                                    isotropy, 0.0);
+                            }
+                            else
+                            {
+                                radiance += hazeShare * hazeScattering * (sunSource == SunFromFroxelLitLocal ?
+                                    InScatteredFroxelLights(world, direction, 1.0, hazeAmbientRadiance, isotropy, 0.0, FroxelLocalLightsFiltered(uv, t)) :
+                                    InScattered(world, direction, 1.0, hazeAmbientRadiance, isotropy, 0.0));
+                            }
                         }
                     }
 
@@ -1791,12 +2512,21 @@ float4 MarchAtmosphere(uint2 pixel, float2 clip, float3 direction, float sceneDi
 
     // Beyond the mist march (beyond the window, or after the march stopped): the haze to the geometry or the sky, exactly. After an early
     // stop the mist left on the ray is not marched; the haze still is, so it never ends abruptly.
-    AddHazeInterval(tailStart, rayEnd, HazeSubintervals, direction, hazeAmbientRadiance, bounded, color, transmittance, opticalDepth);
+    if(froxelLights)
+    {
+        AddHazeIntervalHybrid(pixelUV, tailStart, rayEnd, HazeSubintervals, direction, hazeAmbientRadiance, bounded, color, transmittance,
+            opticalDepth);
+    }
+    else
+    {
+        AddHazeInterval(tailStart, rayEnd, HazeSubintervals, direction, hazeAmbientRadiance, bounded, color, transmittance, opticalDepth);
+    }
+
     return float4(color, transmittance);
 }
 
 // The mist march without haze or clearance. V1a: `sunSource` as in MarchAtmosphere.
-void RaymarchMist(uint3 thread, uint sunSource)
+void RaymarchMist(uint3 thread, uint sunSource, bool renderVolume = false, bool counting = false, bool froxelLights = false)
 {
     if(any(thread.xy >= reducedSize))
     {
@@ -1833,6 +2563,8 @@ void RaymarchMist(uint3 thread, uint sunSource)
         float opticalDepth = 0.0;
         // AIR.4F F4.3.1: the ambient radiance, once per ray.
         float3 ambientRadiance = float3(0.0, 0.0, 0.0);
+        // Fog step 1: the window minimum's slot, for the render volume's texel addresses.
+        const uint3 minimumSlot = AirSlotOf(field, field.minimum);
 
         if(lightingEnabled != 0 && ambient > 0.0)
         {
@@ -1873,8 +2605,21 @@ void RaymarchMist(uint3 thread, uint sunSource)
                 continue;
             }
 
-            const AirRenderSample sample = AirRenderMistAndVelocity(Path(), Mist(), position, detailEnabled != 0,
-                lightingEnabled != 0 ? visibilityIndex : AirNoVisibility);
+            // Fog step 1: the render volume only in the *Volume kernels; the production kernels keep their sample exactly (any other
+            // formulation reorders their DXIL).
+            AirRenderSample sample;
+
+            if(renderVolume)
+            {
+                sample = MarchSample(position, t, detailEnabled != 0, lightingEnabled != 0 ? visibilityIndex : AirNoVisibility, counting,
+                    minimumSlot);
+            }
+            else
+            {
+                sample = AirRenderMistAndVelocity(Path(), Mist(), position, detailEnabled != 0,
+                    lightingEnabled != 0 ? visibilityIndex : AirNoVisibility);
+            }
+
             const float4 mist = sample.mist;
 
             if(mist.a > 0.0)
@@ -1939,8 +2684,16 @@ void RaymarchMist(uint3 thread, uint sunSource)
                     const float isotropy = ScatteringIsotropy(opticalDepth, dot(tintedAlbedo, float3(1.0, 1.0, 1.0) / 3.0));
                     const float sunVisibility = sunSource != SunFromCells ? FroxelSunVisibilityFrom(sunSource, uv, t) :
                         sample.sunVisibility;
-                    color += transmittance * absorbed * tintedAlbedo * InScattered(world, direction, sunVisibility, ambientRadiance,
-                        isotropy, sample.indirect);
+                    if(froxelLights)
+                    {
+                        color += transmittance * absorbed * tintedAlbedo * InScatteredHybrid(uv, t, world, direction, sunVisibility,
+                            ambientRadiance, isotropy, sample.indirect);
+                    }
+                    else
+                    {
+                        color += transmittance * absorbed * tintedAlbedo * InScattered(world, direction, sunVisibility, ambientRadiance,
+                            isotropy, sample.indirect);
+                    }
                 }
                 else
                 {
@@ -1971,7 +2724,8 @@ void CSRaymarch(uint3 thread : SV_DispatchThreadID)
 // AIR.4F.2d.3: the combined march (MarchAtmosphere), a kernel of its own so CSRaymarch above keeps its code and its register use when
 // haze and the near clearance are off. EditorMistPass picks it whenever haze or the clearance is on or the AIR mist is not marched.
 // AIR.4F.2d.3b: the two atmosphere kernels differ only in the haze's height bounds (CSRaymarchAtmosphereBounded below).
-void RaymarchAtmosphere(uint3 thread, bool bounded, uint sunSource)
+void RaymarchAtmosphere(uint3 thread, bool bounded, uint sunSource, bool renderVolume = false, bool counting = false,
+    bool froxelLights = false)
 {
     if(any(thread.xy >= reducedSize))
     {
@@ -1989,7 +2743,8 @@ void RaymarchAtmosphere(uint3 thread, bool bounded, uint sunSource)
     const uint pixelIndex = thread.x + reducedSize.x * thread.y;
     RWByteAddressBuffer result = ResourceDescriptorHeap[NonUniformResourceIndex(resultIndex)];
     RWByteAddressBuffer distances = ResourceDescriptorHeap[NonUniformResourceIndex(distanceIndex)];
-    result.Store4(pixelIndex * 16, asuint(MarchAtmosphere(thread.xy, clip, direction, sceneDistance, bounded, sunSource)));
+    result.Store4(pixelIndex * 16, asuint(MarchAtmosphere(thread.xy, clip, direction, sceneDistance, bounded, sunSource, renderVolume,
+        counting, froxelLights)));
     distances.Store(pixelIndex * 4, asuint(sceneDistance));
 }
 
@@ -2005,6 +2760,63 @@ void CSRaymarchAtmosphere(uint3 thread : SV_DispatchThreadID)
 void CSRaymarchAtmosphereBounded(uint3 thread : SV_DispatchThreadID)
 {
     RaymarchAtmosphere(thread, true, SunFromCells);
+}
+
+// Fog step 1: the three production marches reading open footprints from the render volume (EditorMistPass picks them when the
+// request's renderVolume is on), and (diagnostic) the same with the fast-path counters.
+[numthreads(8, 8, 1)]
+void CSRaymarchVolume(uint3 thread : SV_DispatchThreadID)
+{
+    RaymarchMist(thread, SunFromCells, true, false);
+}
+
+[numthreads(8, 8, 1)]
+void CSRaymarchAtmosphereVolume(uint3 thread : SV_DispatchThreadID)
+{
+    RaymarchAtmosphere(thread, false, SunFromCells, true, false);
+}
+
+[numthreads(8, 8, 1)]
+void CSRaymarchAtmosphereBoundedVolume(uint3 thread : SV_DispatchThreadID)
+{
+    RaymarchAtmosphere(thread, true, SunFromCells, true, false);
+}
+
+// Fog step 2: the render volume marches with the hybrid froxel lighting (EditorMistPass picks them when the request's froxelLights is on).
+[numthreads(8, 8, 1)]
+void CSRaymarchVolumeLights(uint3 thread : SV_DispatchThreadID)
+{
+    RaymarchMist(thread, SunFromCells, true, false, true);
+}
+
+[numthreads(8, 8, 1)]
+void CSRaymarchAtmosphereVolumeLights(uint3 thread : SV_DispatchThreadID)
+{
+    RaymarchAtmosphere(thread, false, SunFromCells, true, false, true);
+}
+
+[numthreads(8, 8, 1)]
+void CSRaymarchAtmosphereBoundedVolumeLights(uint3 thread : SV_DispatchThreadID)
+{
+    RaymarchAtmosphere(thread, true, SunFromCells, true, false, true);
+}
+
+[numthreads(8, 8, 1)]
+void CSRaymarchVolumeCount(uint3 thread : SV_DispatchThreadID)
+{
+    RaymarchMist(thread, SunFromCells, true, true);
+}
+
+[numthreads(8, 8, 1)]
+void CSRaymarchAtmosphereVolumeCount(uint3 thread : SV_DispatchThreadID)
+{
+    RaymarchAtmosphere(thread, false, SunFromCells, true, true);
+}
+
+[numthreads(8, 8, 1)]
+void CSRaymarchAtmosphereBoundedVolumeCount(uint3 thread : SV_DispatchThreadID)
+{
+    RaymarchAtmosphere(thread, true, SunFromCells, true, true);
 }
 
 // V1a diagnostics: the three marches with the froxel volume's sun visibility (EditorMistPass picks them only on request).

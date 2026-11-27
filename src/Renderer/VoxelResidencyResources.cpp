@@ -493,6 +493,7 @@ void VoxelResidencyResources::RecordUploads(ID3D12GraphicsCommandList* commandLi
     }
 
     CollectRetired(completedFence);
+    m_recordedWrites = false;
 
     if(!m_configured || !m_uploadReady || commandList == nullptr)
     {
@@ -533,6 +534,8 @@ void VoxelResidencyResources::RecordUploads(ID3D12GraphicsCommandList* commandLi
         m_slots.Retire(std::span<const std::uint32_t>(&slot, 1), lastSubmissionFence);
         region = m_regions.erase(region);
     }
+
+    m_recordedWrites = !touched.empty();
 
     // Copies done: every touched buffer returns to the read state before any pass of this frame.
     for(Buffer* buffer : touched)

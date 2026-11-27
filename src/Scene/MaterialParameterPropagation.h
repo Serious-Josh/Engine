@@ -46,6 +46,7 @@ namespace MaterialParameterPropagation
 
         material.heightScale = data.heightScale;
         material.heightBias = data.heightBias;
+        material.parallaxSilhouette = data.parallaxSilhouette;
         material.preferARM = data.preferARM;
     }
 

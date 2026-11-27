@@ -875,6 +875,9 @@ namespace
     // Under the allocator's lock: activates a render-thread target or buffer on the open frame recording, as a pending
     // activation of that recording. Buffers are zero-filled too, except acceleration-structure memory (it never leaves its
     // state, and builds write it in full).
+    // AIR async compute: activations recorded on frame recordings (GetFrameRecordingActivationCount).
+    std::atomic<std::uint64_t> g_frameRecordingActivations{0};
+
     void ActivateOnFrameRecording(AllocatorState& state, PlacedTextureSentinel& sentinel, PendingActivation& activation)
     {
         const std::uint64_t recording = ResourceStateTransaction::RecordingFor(state.frameList);
@@ -883,6 +886,8 @@ namespace
         {
             return;
         }
+
+        g_frameRecordingActivations.fetch_add(1, std::memory_order_relaxed);
 
         activation.recording = recording;
         state.keptAlive.push_back({activation.resource, recording});
@@ -1004,6 +1009,11 @@ bool TextureMemoryAllocator::BufferPoolEnabled()
     return enabled;
 }
 
+std::uint64_t TextureMemoryAllocator::GetFrameRecordingActivationCount()
+{
+    return g_frameRecordingActivations.load(std::memory_order_relaxed);
+}
+
 void TextureMemoryAllocator::BeginFrameRecording(ID3D12GraphicsCommandList* commandList)
 {
     AllocatorState& state = *GetState();
@@ -1037,6 +1047,18 @@ void TextureMemoryAllocator::BeginFrameRecording(ID3D12GraphicsCommandList* comm
         }
 
         ++entry;
+    }
+}
+
+void TextureMemoryAllocator::SwitchFrameRecordingList(ID3D12GraphicsCommandList* commandList)
+{
+    AllocatorState& state = *GetState();
+    const std::lock_guard lock(state.mutex);
+
+    if(state.frameList != nullptr && commandList != nullptr)
+    {
+        state.frameList = commandList;
+        state.lastFrameList = commandList;
     }
 }
 

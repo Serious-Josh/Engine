@@ -279,6 +279,36 @@ void Editor::DrawAirWindow(IDemoScene& scene, DebugUI& debugUI)
             "haze in the Editor and Play viewports; unlit mist always uses the raymarch.");
     }
 
+    // Fog step 1, session only (never saved): the Original Raymarch's render volume.
+    ImGui::BeginDisabled(air.volumetricRenderer != 0);
+    ImGui::Checkbox("Mist Render Volume (Experimental)", &air.mistRenderVolume);
+
+    if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    {
+        ImGui::SetTooltip("Session only. The Original Raymarch reads open mist (away from geometry and the air window's edge) from a\n"
+            "filterable copy built each frame, instead of gathering it from the air field. Same look; compare by toggling.");
+    }
+
+    // Fog step 2, session only (never saved): the hybrid froxel lighting (needs the render volume); step 2b: automatic by default.
+    ImGui::BeginDisabled(!air.mistRenderVolume);
+    static constexpr const char* FroxelLightModes[] = {"Auto (8+ Lights)", "Off", "On"};
+    int froxelLightsMode = std::clamp(air.mistFroxelLightsMode, 0, 2);
+
+    if(ImGui::Combo("Froxel Light Volume", &froxelLightsMode, FroxelLightModes, IM_ARRAYSIZE(FroxelLightModes)))
+    {
+        air.mistFroxelLightsMode = froxelLightsMode;
+    }
+
+    if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    {
+        ImGui::SetTooltip("Session only. On: lit mist and haze take the scene Lights from a camera-aligned volume built each frame, except\n"
+            "within 1.5-3 m of each Light, which is still lit per sample (faster with many Lights; far Lights are interpolated).\n"
+            "Off: every Light per sample (exact). Auto: on while 8 or more Lights reach the fog, off again at 6 or fewer.");
+    }
+
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+
 
     // V1d distant banding (temporary): the medium's adaptive depth sampling against the fixed 4 samples per slice.
     ImGui::BeginDisabled(air.volumetricRenderer != 1);

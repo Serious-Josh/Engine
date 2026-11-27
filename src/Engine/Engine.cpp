@@ -1170,8 +1170,14 @@ void Engine::ProcessProjectIndependentFrame()
 // one (the requested configuration presented; M0c.4 preparing frames are unlit). One flag test each when disabled.
 void Engine::NoteStartupFrame(Renderer::FrameRenderResult result)
 {
-    if(m_startupLitFrameNoted || !TransitionTiming::StartupEnabled() || result != Renderer::FrameRenderResult::Rendered)
+    if(!TransitionTiming::StartupEnabled() || result != Renderer::FrameRenderResult::Rendered)
     {
+        return;
+    }
+
+    if(m_startupLitFrameNoted)
+    {
+        NoteStartupTiers();
         return;
     }
 
@@ -1185,7 +1191,195 @@ void Engine::NoteStartupFrame(Renderer::FrameRenderResult result)
     {
         m_startupLitFrameNoted = true;
         TransitionTiming::StartupMilestone("first lit frame (requested configuration presented)");
+
+        // Startup diagnostics: ENGINE_STARTUP_EXIT_AT_LIT ends a timed start cleanly at the lit milestone, so the
+        // redirected log is flushed at exit.
+        static const bool exitAtLit = GetEnvironmentVariableA("ENGINE_STARTUP_EXIT_AT_LIT", nullptr, 0) != 0;
+
+        if(exitAtLit)
+        {
+            m_window.Close();
+        }
     }
+}
+
+// Layered prep (F5): the ReSTIR PT material tier the active scene's materials need by their definitions
+// (Renderer::SetSceneMaterialTierHint): layered lobes from the parameters, relief from the parallax mode with an assigned
+// height texture, resident or not. One pass over the render objects, only when the scene or the renderer's material table
+// changed, or while the scene's textures stream (their definitions arrive with them).
+void Engine::UpdateSceneMaterialTierHint()
+{
+    const IDemoScene* demo = m_demoSceneManager.TryGetActiveScene();
+    const auto* scene = dynamic_cast<const FileBackedDemoScene*>(demo);
+    const std::uint64_t revision = m_renderer.GetMaterialTableRevision();
+    const bool streaming = scene && !scene->IsTextureStreamingSettled();
+
+    if(!streaming && demo == m_sceneTierHintScene && revision == m_sceneTierHintRevision)
+    {
+        return;
+    }
+
+    m_sceneTierHintScene = demo;
+    m_sceneTierHintRevision = revision;
+    m_renderer.SetSceneMaterialTierHint(SceneMaterialTier(scene), revision);
+}
+
+ReSTIRPTMaterialTier Engine::SceneMaterialTier(const FileBackedDemoScene* scene)
+{
+    if(!scene)
+    {
+        return ReSTIRPTMaterialTier::Base;
+    }
+
+    constexpr unsigned int layeredFlags = GpuMaterialLobeFlags::Coat | GpuMaterialLobeFlags::Fuzz |
+        GpuMaterialLobeFlags::ThinFilm | GpuMaterialLobeFlags::Anisotropy;
+    bool layered = false;
+    bool parallax = false;
+    const auto note = [&](const Material* material)
+    {
+        if(!material)
+        {
+            return;
+        }
+
+        layered = layered || (material->LobeFlags() & layeredFlags) != 0u;
+        parallax = parallax || ((material->surfaceDetailMode == SurfaceDetailMode::ParallaxOcclusion ||
+            material->surfaceDetailMode == SurfaceDetailMode::GeometryWithParallaxFallback) &&
+            (material->heightTexture || material->heightTextureAssigned) && std::abs(material->heightScale) > 1.0e-6f);
+    };
+
+    for(const RenderObject& object : scene->GetScene().GetRenderObjects())
+    {
+        note(object.material);
+
+        for(const auto& [slot, material] : object.slotMaterials)
+        {
+            note(material);
+        }
+
+        if(layered && parallax)
+        {
+            break;
+        }
+    }
+
+    return ReSTIRPTMaterialTierFor(layered, parallax);
+}
+
+void Engine::NoteStartupTiers()
+{
+    const std::optional<ReSTIRPTMaterialTier> tier = m_renderer.GetSettledReSTIRPTMaterialTier();
+
+    if(!tier)
+    {
+        m_startupTierSettled = {};
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+
+    if(static_cast<int>(*tier) != m_startupTierNoted)
+    {
+        m_startupTierNoted = static_cast<int>(*tier);
+        m_startupTierSettled = now;
+        TransitionTiming::StartupMilestone(std::string("ReSTIR PT material tier settled: ") +
+            ReSTIRPTMaterialTierDescription(*tier));
+    }
+    else if(m_startupTierSettled == std::chrono::steady_clock::time_point{})
+    {
+        m_startupTierSettled = now;
+    }
+
+    static const bool exitAtTiers = GetEnvironmentVariableA("ENGINE_STARTUP_EXIT_AT_TIERS", nullptr, 0) != 0;
+
+    if(exitAtTiers && now - m_startupTierSettled >= std::chrono::seconds(4))
+    {
+        m_window.Close();
+    }
+}
+
+// Startup diagnostics: ENGINE_STARTUP_SWITCH_TEST=<seconds>[,rayqueryoff] (ReSTIR PT Enhanced projects). <seconds> after the
+// first lit frame the request becomes ReSTIR DI until it is presented lit; with rayqueryoff, RayQuery secondary shadows are
+// then turned off until the TraceRay visibility fallback renders; then ReSTIR PT is requested again until it is presented
+// lit, and the window closes. Each step is a startup milestone, so a log shows how long each waited (the presented
+// configuration keeps rendering). One flag test when unset.
+RenderingConfiguration Engine::ApplyStartupSwitchTest(RenderingConfiguration requested)
+{
+    static const std::string setting = []()
+    {
+        char value[64]{};
+        const DWORD length = GetEnvironmentVariableA("ENGINE_STARTUP_SWITCH_TEST", value, sizeof(value));
+        return length > 0 && length < sizeof(value) ? std::string(value, length) : std::string();
+    }();
+
+    if(setting.empty() || !m_startupLitFrameNoted || m_startupSwitchTestStage >= 4)
+    {
+        return requested;
+    }
+
+    static const double delaySeconds = std::atof(setting.c_str());
+    static const bool rayQueryOff = setting.find("rayqueryoff") != std::string::npos;
+    const auto now = std::chrono::steady_clock::now();
+    const RenderedConfiguration rendered = m_renderer.GetRenderedConfiguration();
+    const auto presented = [&](RendererLightingMode mode)
+    {
+        return rendered.lit && rendered.lightingMode == mode;
+    };
+
+    if(m_startupSwitchTestStage == 0)
+    {
+        if(m_startupSwitchTestLit == std::chrono::steady_clock::time_point{})
+        {
+            m_startupSwitchTestLit = now;
+        }
+
+        if(std::chrono::duration<double>(now - m_startupSwitchTestLit).count() < delaySeconds)
+        {
+            return requested;
+        }
+
+        m_startupSwitchTestStage = 1;
+        TransitionTiming::StartupMilestone("switch test: ReSTIR DI requested");
+    }
+
+    if(m_startupSwitchTestStage == 1 && presented(RendererLightingMode::PathTracedRasterPrimaryReSTIRDI))
+    {
+        m_startupSwitchTestStage = rayQueryOff ? 2 : 3;
+        m_startupSwitchTestRayQueryOff = rayQueryOff;
+        TransitionTiming::StartupMilestone(rayQueryOff ? "switch test: ReSTIR DI presented; RayQuery turned off" :
+            "switch test: ReSTIR DI presented; ReSTIR PT requested");
+    }
+    else if(m_startupSwitchTestStage == 2 && !m_renderer.GetPathTraceReferenceStatus().secondaryShadowRayQueryActive)
+    {
+        m_startupSwitchTestStage = 3;
+        TransitionTiming::StartupMilestone("switch test: TraceRay fallback rendering; ReSTIR PT requested");
+    }
+    else if(m_startupSwitchTestStage == 3 && presented(RendererLightingMode::PathTracedRasterPrimaryReSTIRPT))
+    {
+        m_startupSwitchTestStage = 4;
+        TransitionTiming::StartupMilestone("switch test: ReSTIR PT presented again");
+        m_window.Close();
+        return requested;
+    }
+
+    return StartupSwitchTestRequest(requested);
+}
+
+// The request the switch test's current stage makes (no stage change), for both reads of the configuration in a frame.
+RenderingConfiguration Engine::StartupSwitchTestRequest(RenderingConfiguration requested) const
+{
+    if(m_startupSwitchTestStage == 1 || m_startupSwitchTestStage == 2)
+    {
+        requested.lightingMode = RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
+    }
+
+    // Stage 2 is reached only with rayqueryoff; RayQuery stays off from then on.
+    if(m_startupSwitchTestStage >= 2 && m_startupSwitchTestRayQueryOff)
+    {
+        requested.pathTrace.secondaryShadowRayQuery = false;
+    }
+
+    return requested;
 }
 
 void Engine::ProcessProjectBrowserRequest(const ProjectBrowser::Request& request)
@@ -1325,6 +1519,8 @@ bool Engine::InitializeProjectScene()
     // it must not be disguised as a missing-file fallback.
     const bool initialized = InitializeScene(source);
     // M0c.5 Stage 5.5: the last poll before the first frame (the scene's activation took its time too).
+    // Layered prep (F5): the scene's ReSTIR PT material tier before its configuration's preparation is polled.
+    UpdateSceneMaterialTierHint();
     m_renderer.AdvanceConfigurationPreparation();
     return initialized;
 }
@@ -1593,6 +1789,25 @@ void Engine::BuildAirFrameRequest(AirFrameRequest& request, const AirSimulationS
     // AIR.4F.1b: buoyancy acts through the projection; AirField applies it only to projected steps.
     request.pressure.buoyancyGravity = simulation.buoyancy ? std::clamp(simulation.buoyancyGravity, 0.0f,
         AirSimulationSettings::MaximumBuoyancyGravity) : 0.0f;
+    // AIR optimization report items 2 and 4: dormant air and the adaptive recovery budget, on in the Editor and games;
+    // ENGINE_AIR_IDLE_OPTIMIZATIONS=0 turns both off (A/B measurement).
+    {
+        const char* idle = std::getenv("ENGINE_AIR_IDLE_OPTIMIZATIONS");
+        const bool idleOptimizations = idle == nullptr || std::string_view(idle) != "0";
+        request.solver.dormancy = idleOptimizations;
+        request.pressure.adaptiveRecovery = idleOptimizations;
+        // AIR solver restructure: ENGINE_AIR_LOCAL_RECOVERY_TIER=0 keeps local moving-solid updates at the full recovery budget (A/B).
+        const char* localTier = std::getenv("ENGINE_AIR_LOCAL_RECOVERY_TIER");
+        request.pressure.localRecoveryTier = localTier == nullptr || std::string_view(localTier) != "0";
+        // AIR solver restructure: ENGINE_AIR_ADAPTIVE_O21=1 restores the O2.1 adaptive solves (minimum 2 cycles, 2 sweeps; A/B).
+        const char* adaptiveO21 = std::getenv("ENGINE_AIR_ADAPTIVE_O21");
+
+        if(adaptiveO21 != nullptr && std::string_view(adaptiveO21) == "1")
+        {
+            request.pressure.adaptiveMinimumCycles = 2;
+            request.pressure.adaptiveSmoothingSweeps = 2;
+        }
+    }
 
     request.cameraPosition = camera;
     request.deltaSeconds = deltaSeconds;
@@ -2505,6 +2720,8 @@ bool Engine::InitializeProject()
 
     if(registryExists)
     {
+        const TransitionTiming::Scope registryTiming("Project asset registry load", 0.0, TransitionTiming::Startup);
+
         // Never overwrite an existing malformed or unreadable manifest.
         if(!AssetRegistrySerializer::LoadFromFile(
                 registryPath,
@@ -2622,6 +2839,8 @@ bool Engine::InitializeProject()
     }
 
     // M0c.5 Stage 5.5: libraries finished meanwhile have their DXR pipelines queued now, not at the first frame.
+    // Layered prep (F5): the scene's ReSTIR PT material tier before its configuration's preparation is polled.
+    UpdateSceneMaterialTierHint();
     m_renderer.AdvanceConfigurationPreparation();
 
     if(!reconciled)
@@ -2695,7 +2914,14 @@ bool Engine::InitializeProject()
         }
     }
 
-    if(!ProjectScriptAssets::Reconcile(projectPaths, m_projectAssetRegistry, projectError))
+    bool scriptsReconciled = false;
+
+    {
+        const TransitionTiming::Scope scriptTiming("Script asset discovery", 0.0, TransitionTiming::Startup);
+        scriptsReconciled = ProjectScriptAssets::Reconcile(projectPaths, m_projectAssetRegistry, projectError);
+    }
+
+    if(!scriptsReconciled)
     {
         // Script admission can be repaired independently of the authored scene.
         Log::Warning("Script discovery skipped; registry retained: " + projectError);
@@ -2739,6 +2965,8 @@ bool Engine::InitializeProject()
         LoadProjectAudioBanks(projectPaths);
     }
 
+    // Layered prep (F5): the scene's ReSTIR PT material tier before its configuration's preparation is polled.
+    UpdateSceneMaterialTierHint();
     m_renderer.AdvanceConfigurationPreparation();
 
 #if defined(_DEBUG)
@@ -2755,6 +2983,7 @@ bool Engine::InitializeProject()
 #endif
 
     // Inspect the reconciled registry without modifying it further.
+    const TransitionTiming::Scope scanTiming("Project asset scan", 0.0, TransitionTiming::Startup);
     std::size_t availableAssets = 0;
     std::size_t missingAssets = 0;
     std::size_t invalidAssets = 0;
@@ -2817,19 +3046,29 @@ bool Engine::InitializeProject()
         return false;
     }
 
-    if(!m_renderer.InitializeEditorResources())
     {
-        Log::Error("Failed to initialize project Editor preview resources.");
-        return false;
-    }
+        const TransitionTiming::Scope editorResourcesTiming("Editor preview resources and material thumbnails", 0.0,
+            TransitionTiming::Startup);
 
-    m_editor.ConfigureMaterialThumbnails(m_renderer, GetActiveProject());
+        if(!m_renderer.InitializeEditorResources())
+        {
+            Log::Error("Failed to initialize project Editor preview resources.");
+            return false;
+        }
+
+        m_editor.ConfigureMaterialThumbnails(m_renderer, GetActiveProject());
+    }
 
     if(!archiveDiagnostic) m_demoSceneManager.SetProjectAssets(GetActiveProject().GetRoot(), m_projectAssetRegistry);
 
     // Personal workspace state only after the project context is validated and installed.
-    LoadProjectWorkspace();
+    {
+        const TransitionTiming::Scope workspaceTiming("Project workspace", 0.0, TransitionTiming::Startup);
+        LoadProjectWorkspace();
+    }
 
+    // Layered prep (F5): the scene's ReSTIR PT material tier before its configuration's preparation is polled.
+    UpdateSceneMaterialTierHint();
     m_renderer.AdvanceConfigurationPreparation();
     m_state = EngineState::ProjectReady;
     return true;
@@ -3543,6 +3782,7 @@ void Engine::Frame()
         // PS.4: the cooked configuration through the shared application path. DLSS eligibility comes from
         // the renderer's own state, never the Debug panel.
         // M0c.4: the presented configuration; a different cooked request is prepared while it renders.
+        UpdateSceneMaterialTierHint();
         const RenderingConfiguration& configuration = m_renderer.SelectPresentedConfiguration(m_packagedRenderingConfiguration);
         ApplyRenderScale(configuration, m_renderer, m_renderer.IsPresentedDlssEligible(), false);
 
@@ -3948,8 +4188,9 @@ void Engine::Frame()
     // uses the panel's state before this frame's settings window is drawn, as it always has.
     // M0c.4: the presented configuration. A request whose identity differs is prepared while this one keeps rendering,
     // and its render scale applies in the frame that first presents it.
+    UpdateSceneMaterialTierHint();
     const RenderingConfiguration& presentedConfiguration =
-        m_renderer.SelectPresentedConfiguration(debugUI.GetRenderingConfiguration());
+        m_renderer.SelectPresentedConfiguration(ApplyStartupSwitchTest(debugUI.GetRenderingConfiguration()));
     ApplyRenderScale(presentedConfiguration, m_renderer, m_renderer.IsPresentedDlssEligible(), debugUI.ConsumeDlssRetry());
 
     if (sceneWidth == 0 || sceneHeight == 0 || (resizeScene && !m_renderer.ResizeScene(sceneWidth, sceneHeight)))
@@ -4428,7 +4669,7 @@ void Engine::Frame()
     // M0c.4: this frame's settings window may have changed the request; its per-frame values apply now, a new identity
     // from the next frame (the scale above was applied for the selected identity).
     const RenderingConfiguration frameRenderingConfiguration =
-        m_renderer.PresentConfiguration(debugUI.GetRenderingConfiguration());
+        m_renderer.PresentConfiguration(StartupSwitchTestRequest(debugUI.GetRenderingConfiguration()));
     ApplyRenderingConfiguration(frameRenderingConfiguration, m_renderer, rendererOptions);
     rendererOptions.frameDeltaSeconds = m_time.GetDeltaTime();
     // S0.5: observe the scene environment request (failure handling; the exposure snap is applied by the publication).
@@ -4668,6 +4909,13 @@ void Engine::Frame()
         fog.resolutionBasis = frameRenderingConfiguration.volumetricResolutionBasis;
         fog.mistVisible = airEnabled && air.showMist;
         rendererOptions.airMist = BuildFogRenderRequest(fog);
+
+        // Fog step 1 (Editor A/B, session only): the mist render volume.
+        if (rendererOptions.airMist)
+        {
+            rendererOptions.airMist->renderVolume = air.mistRenderVolume;
+            rendererOptions.airMist->froxelLights = static_cast<AirMistFroxelLights>(std::clamp(air.mistFroxelLightsMode, 0, 2));
+        }
 
         // V1d follow-up (Editor diagnostic): the experimental integrated froxel renderer.
         if (rendererOptions.airMist && air.volumetricRenderer == 1)

@@ -819,6 +819,25 @@ class Engine
     bool m_startupSceneFrameNoted = false;
     bool m_startupLitFrameNoted = false;
     void NoteStartupFrame(Renderer::FrameRenderResult result);
+    // Layered prep diagnostics (ENGINE_STARTUP_TIMING): after the lit frame, a milestone when the ReSTIR PT material tier
+    // the scene needs is adopted; with ENGINE_STARTUP_EXIT_AT_TIERS the window closes once that tier has stayed settled
+    // for a few seconds (a later texture can still raise the needed tier).
+    void NoteStartupTiers();
+    // Layered prep (F5): the ReSTIR PT tier the active scene's materials need by their definitions, given to the renderer
+    // before each SelectPresentedConfiguration (recomputed only when the scene or its material table changed, or while its
+    // textures stream).
+    void UpdateSceneMaterialTierHint();
+    static ReSTIRPTMaterialTier SceneMaterialTier(const FileBackedDemoScene* scene);
+    const IDemoScene* m_sceneTierHintScene = nullptr;
+    std::uint64_t m_sceneTierHintRevision = ~std::uint64_t{0};
+    int m_startupTierNoted = -1;
+    std::chrono::steady_clock::time_point m_startupTierSettled{};
+    // Startup diagnostics (ENGINE_STARTUP_SWITCH_TEST): the scripted ReSTIR PT -> ReSTIR DI -> ReSTIR PT switch.
+    RenderingConfiguration ApplyStartupSwitchTest(RenderingConfiguration requested);
+    int m_startupSwitchTestStage = 0;
+    std::chrono::steady_clock::time_point m_startupSwitchTestLit{};
+    bool m_startupSwitchTestRayQueryOff = false;
+    RenderingConfiguration StartupSwitchTestRequest(RenderingConfiguration requested) const;
 
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneDuplicationVerification;

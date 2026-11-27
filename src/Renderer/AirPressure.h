@@ -47,6 +47,10 @@ struct AirPressureSolveSettings
     // AIR.4F.3 F1a.3: after `cycles`, at most this many more V-cycles, each run only while the residual is above the convergence
     // criterion (AirPressure.hlsl's CSRecoveryGate, on the GPU); 0 records none.
     std::uint32_t recoveryCycles = 0;
+    // AIR solver restructure: how many of the first recovery cycles belong to the step's own cycle budget (AIR O2.1's adaptive warm cycles).
+    // The gate counts the cycles run beyond them separately (AirPressure.hlsl's TopologyRecoveryBeyondBudget), so the adaptive recovery
+    // budget tells true recovery from the warm budget's gated cycles.
+    std::uint32_t budgetedRecoveryCycles = 0;
 };
 
 // AIR.4F.3 F1a.3: a local hierarchy update after moving-solid geometry changes: the fine cells whose pieces or face connections changed,
@@ -227,6 +231,10 @@ public:
         std::uint32_t apertureIndex, const Vector3& ambientVelocity, const AirPressureSolveSettings& settings,
         const AirPressureBuoyancy& buoyancy = {}, const AirPressureWallSource& wallSource = {});
     // The residual b - K phi into the scratch buffer (and its largest magnitude into the table's header).
+    // AIR optimization report item 4: copies the cumulative recovery counters (cycles run, then solves that ran out of budget; AIR solver
+    // restructure: then cycles run beyond the steps' budgeted recovery cycles: three uints) into `destination` at `offset`; false (nothing
+    // recorded) without storage.
+    bool RecordRecoveryCounterCopy(ID3D12GraphicsCommandList* commandList, ID3D12Resource* destination, std::uint64_t offset);
     bool RecordResidual(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, UploadBuffer& upload, const AirFieldBinding& field,
         std::uint32_t apertureIndex);
 
@@ -268,6 +276,11 @@ public:
     void SetStageMarker(StageMarker marker)
     {
         m_stageMarker = std::move(marker);
+    }
+
+    bool HasStageMarker() const noexcept
+    {
+        return static_cast<bool>(m_stageMarker);
     }
 
     // R1.5b: creates every pipeline now rather than at the first projection, so a packaged game with AIR never creates them mid-game.

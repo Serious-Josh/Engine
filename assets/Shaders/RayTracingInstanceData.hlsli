@@ -17,6 +17,11 @@ struct RayTracingInstanceData
     uint triangleSlotOffset;
     uint slotMaterialBufferIndex;
     uint slotMaterialOffset;
+
+    // Silhouette parallax occlusion mapping: the mesh's per-triangle silhouette edges (SurfaceDetailSilhouette.hlsli),
+    // or 0xFFFFFFFF for none.
+    uint silhouetteEdgeBufferIndex;
+    uint3 padding;
 };
 
 uint ResolveHitMaterial(RayTracingInstanceData instance, uint primitiveIndex)

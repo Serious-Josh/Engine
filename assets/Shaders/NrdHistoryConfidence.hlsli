@@ -23,6 +23,7 @@
 //   and writes c, with c = 1 wherever no valid measurement contributed.
 
 #include "RtxdiLights.hlsli"
+#include "PrimarySurfaceLift.hlsli"
 
 #include "Rtxdi/RtxdiParameters.h"
 #include "Rtxdi/DI/ReSTIRDIParameters.h"
@@ -396,6 +397,12 @@ void CSProbe(uint3 dispatchThreadID : SV_DispatchThreadID)
         geometricNormal = -geometricNormal;
         shadingNormal = -shadingNormal;
     }
+
+    // A pixel with a stored lift scale lies under its surface as decoded (a parallax pixel's relief, most of all): the
+    // probe and its record start from the lifted point, as the path tracer's primary vertex does. 0 for every other
+    // pixel.
+    position += geometricNormal * PrimarySurfaceStoredLift(pixel, probeConstants.resolution, depth, position,
+        geometricData, probeConstants.inverseViewProjection);
 
     // 4-candidate RIS on T: probes favour lights that matter here. The chosen uv is quantized before it is sampled, so
     // the stored record reproduces the traced sample exactly.

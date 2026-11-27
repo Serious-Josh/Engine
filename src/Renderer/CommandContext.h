@@ -74,6 +74,56 @@ class CommandContext
     void AbandonLifecycleCommands();
     std::uint64_t GetLifecycleSubmissionCount() const noexcept { return m_lifecycleSubmissions; }
 
+    // AIR async compute (AIR optimization report item 3): a compute queue beside the frame queue, with one compute list recorded
+    // inside the frame recording and submitted with it by Execute. Render thread only, like the frame list.
+    //
+    // Ordering, for a frame N whose compute list is used:
+    //   - Overlapped (the default): the compute queue waits only for the frame queue's earlier submissions (up to frame N-1), so
+    //     the compute work runs beside frame N's direct work. The caller guarantees that frame N's direct list touches nothing the
+    //     compute list reads or writes.
+    //   - After the frame (RequireAsyncComputeAfterFrame): the compute queue waits for frame N's direct list, for a frame whose
+    //     direct list did write something the compute list uses (a resource activated and zero-filled there).
+    // Either way the frame queue waits for the compute work before it signals frame N's fence, so that fence (and every frame
+    // fence, slot allocator and retirement keyed to it) covers the compute work too: nothing else needs to know about the queue.
+    bool HasAsyncCompute() const noexcept
+    {
+        return m_computeQueue != nullptr;
+    }
+
+    // The compute list for this frame recording (opened on first use, reset on this slot's compute allocator; Begin has waited
+    // for the slot's previous frame fence, which covers its previous compute work). Its barriers belong to the frame recording's
+    // state transaction (R.1): AbortRecording discards them with it. nullptr without a compute queue, outside a recording, or
+    // when the list cannot be reset.
+    ID3D12GraphicsCommandList* BeginAsyncCompute(unsigned int frameIndex);
+    void RequireAsyncComputeAfterFrame() noexcept
+    {
+        m_asyncComputeAfterFrame = true;
+    }
+    ID3D12CommandQueue* GetComputeQueue() const noexcept
+    {
+        return m_computeQueue;
+    }
+    // Submissions of the compute list (diagnostics), and those ordered after their frame.
+    std::uint64_t GetAsyncComputeSubmissionCount() const noexcept { return m_asyncComputeSubmissions; }
+    std::uint64_t GetAsyncComputeAfterFrameCount() const noexcept { return m_asyncComputeAfterFrameSubmissions; }
+
+    // AIR async compute, readers in the frame: splits the frame's direct recording at the first reader of the compute work. The
+    // direct list recorded so far is closed (the first part); recording continues on a second direct list (the second part), which
+    // GetCommandList and GetRayTracingCommandList return from now on. Nothing is submitted here: Execute submits the compute list,
+    // the first part, a direct-queue wait for the compute work, then the second part, and signals the frame fence once, after
+    // the second part (so that fence, an ExecuteReserved reservation's value included, covers both parts, the slot allocator and
+    // the upload ring). AbortRecording and DiscardCommandsAfterGPUDrain close both parts unsubmitted. Both parts share the slot's
+    // allocator (one list records at a time) and the frame recording's transaction (R.1). The second list starts without state:
+    // the caller sets its descriptor heaps and fixed-function state again. Returns the second list; nullptr (the recording cannot
+    // continue: abort it) when no compute list is open in this recording, the recording is already split, or the second list
+    // cannot be reset.
+    ID3D12GraphicsCommandList* SplitForAsyncComputeReaders(unsigned int frameIndex);
+    bool IsSplitForAsyncComputeReaders() const noexcept
+    {
+        return m_splitFirstList != nullptr;
+    }
+    std::uint64_t GetSplitSubmissionCount() const noexcept { return m_splitSubmissions; }
+
     ID3D12GraphicsCommandList* GetCommandList() const;
     ID3D12CommandQueue* GetCommandQueue() const;
     ID3D12GraphicsCommandList4* GetRayTracingCommandList() const;
@@ -203,4 +253,35 @@ class CommandContext
     bool HasSubmissionReservations() const;
 
     void* m_fenceEvent = nullptr;
+
+    // AIR async compute. The queue is optional: without it every frame records AIR on the frame list as before.
+    void InitializeAsyncCompute(ID3D12Device* device);
+    void ShutdownAsyncCompute();
+    // Closes the open compute list without submitting it (abort, discard).
+    void AbandonAsyncCompute();
+    ID3D12CommandQueue* m_computeQueue = nullptr;
+    ID3D12CommandAllocator* m_computeAllocators[FrameCount]{};
+    ID3D12GraphicsCommandList* m_computeList = nullptr;
+    ID3D12Fence* m_computeFence = nullptr;
+    std::uint64_t m_computeFenceValue = 0;
+    // The frame queue's own signal of "this frame's direct list is done", for after-the-frame ordering (the frame fence's values
+    // are reserved for frame submissions: ExecuteReserved relies on Execute signalling exactly m_fenceValue).
+    ID3D12Fence* m_directListFence = nullptr;
+    std::uint64_t m_directListFenceValue = 0;
+    bool m_asyncComputeOpen = false;
+    bool m_asyncComputeAfterFrame = false;
+    std::uint64_t m_asyncComputeSubmissions = 0;
+    std::uint64_t m_asyncComputeAfterFrameSubmissions = 0;
+
+    // The split recording (SplitForAsyncComputeReaders): the second direct list (created with the compute queue, kept closed between
+    // uses) and, while a recording is split, its closed first part. m_commandList / m_rayTracingCommandList then name the second list.
+    ID3D12GraphicsCommandList* m_splitSecondList = nullptr;
+    ID3D12GraphicsCommandList4* m_splitSecondRayTracingList = nullptr;
+    ID3D12GraphicsCommandList* m_splitFirstList = nullptr;
+    ID3D12GraphicsCommandList4* m_splitFirstRayTracingList = nullptr;
+    bool m_splitSecondOpen = false;
+    bool m_splitSecondEnded = false;
+    std::uint64_t m_splitSubmissions = 0;
+    // Ends a split recording: closes the second list if `closeSecond`, and makes the first list the frame list again.
+    void EndSplit(bool closeSecond);
 };

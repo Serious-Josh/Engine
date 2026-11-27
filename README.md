@@ -9,16 +9,16 @@ A fundamental principle for Engine is 'what you see is what you get' (WYSIWYG). 
 - Deferrer Rendering
 - Bindless Texturing
 - PBR
-    - Standard Metallic/Roughness
-    - Complex n/k IOR complient materials
-        - Dielectrics
-        - Conductors
-- RayTracing and PathTracing
-- GPU-Driven Adaptive Displacement w/ DXR Support (WIP)
+    - Fully OpenPBR Compliant
+- RayTracing (Out of Date) and PathTracing (ReSTIR-PT + SHARC)
+- GPU-Driven Adaptive Displacement (WIP)
 - Box3D Physics Integration
 - AngelScript Integration
 - FMOD Audio Engine
     - SteamAudio Support
+- Local AIR System
+    - Pressure
+    - Temperature Driven Buoyancy
 
 Future goals listed here:
 

@@ -205,8 +205,10 @@ struct AirSolverConstants
     std::uint32_t piece1WriteIndex = 0;
     std::uint32_t pieceIndex = 0;
     std::uint32_t visibilityIndex = 0;
+    // AIR optimization report items 1, 2 and 4: the activity word (CSStepOpen, CSStepSplit, CSResetActivity).
+    std::uint32_t activityIndex = 0;
     // Keeps the int3 below from straddling a 16-byte register, as HLSL packing requires.
-    std::uint32_t visibilityPadding[2] = {0, 0};
+    std::uint32_t visibilityPadding = 0;
     // CSMotorVisibility and CSEmissionStatus only.
     std::int32_t visibilityBoxMinimum[3] = {0, 0, 0};
     std::uint32_t visibilityMotor = 0;
@@ -226,6 +228,12 @@ static_assert(sizeof(AirSolverConstants) == 176);
 // The two-pass step's argument buffer: the counter, then the split pass's dispatch (D3D12_DISPATCH_ARGUMENTS).
 constexpr std::size_t SplitArgumentBytes = 16;
 constexpr UINT64 SplitDispatchOffset = 4;
+// AIR optimization report items 1, 2 and 4: the activity word's bits (AirSolver.hlsl's AirActivityMoving, AirActivityWarm), the activity
+// buffer's size, and a readback's layout: the activity word, then the pressure solver's cumulative recovery cycles and failures.
+constexpr std::uint32_t ActivityMoving = 1;
+constexpr std::uint32_t ActivityWarm = 2;
+constexpr std::size_t ActivityBytes = 16;
+constexpr std::size_t ActivityReadbackBytes = 16;
 
 static_assert(sizeof(GpuAirMotor) == 128);
 
@@ -329,7 +337,6 @@ constexpr std::size_t ApertureBytesPerCell = 8;
 // AIR.4F: one premultiplied float4 per piece and cell.
 constexpr std::size_t MistBytesPerCell = 16;
 // Where consumers read the field after the frame's air work.
-constexpr D3D12_RESOURCE_STATES ReadState = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
 
 std::int32_t FloorDivide(std::int64_t value, std::int64_t divisor)
 {
@@ -586,6 +593,8 @@ bool AirField::Initialize(ID3D12Device* device, DescriptorHeap& descriptorHeap, 
         MakePipeline(device, shaderLibrary, "AirSolver.hlsl", "CSStepSplit", m_splitStepPipeline, true) &&
         MakePipeline(device, shaderLibrary, "AirSolver.hlsl", "CSPrepareSplit", m_prepareSplitPipeline) &&
         MakePipeline(device, shaderLibrary, "AirSolver.hlsl", "CSResetSplit", m_resetSplitPipeline) &&
+        MakePipeline(device, shaderLibrary, "AirSolver.hlsl", "CSResetActivity", m_resetActivityPipeline) &&
+        MakePipeline(device, shaderLibrary, "AirSolver.hlsl", "CSZeroVelocity", m_zeroVelocityPipeline) &&
         MakePipeline(device, shaderLibrary, "AirSolver.hlsl", "CSMotorVisibility", m_visibilityPipeline, true) &&
         MakePipeline(device, shaderLibrary, "AirSolver.hlsl", "CSEmissionStatus", m_statusPipeline, true) &&
         MakePipeline(device, shaderLibrary, "AirSolver.hlsl", "CSEmissionSamples", m_samplesPipeline, true) &&
@@ -658,6 +667,20 @@ bool AirField::Initialize(ID3D12Device* device, DescriptorHeap& descriptorHeap, 
         MemoryRegistry::TrackResource(slot.readback);
     }
 
+    // AIR optimization report items 1, 2 and 4: the activity readbacks, the same way.
+    description.Width = ActivityReadbackBytes;
+
+    for(ActivitySlot& slot : m_activitySlots)
+    {
+        if(FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&slot.readback))))
+        {
+            return false;
+        }
+
+        MemoryRegistry::TrackResource(slot.readback);
+    }
+
     m_initialized = true;
     return true;
 }
@@ -696,6 +719,11 @@ void AirField::Shutdown()
     }
 
     for(StatusSlot& slot : m_mistStatusSlots)
+    {
+        slot = {};
+    }
+
+    for(ActivitySlot& slot : m_activitySlots)
     {
         slot = {};
     }
@@ -742,6 +770,8 @@ void AirField::Shutdown()
     m_splitStepPipeline.Shutdown();
     m_prepareSplitPipeline.Shutdown();
     m_resetSplitPipeline.Shutdown();
+    m_resetActivityPipeline.Shutdown();
+    m_zeroVelocityPipeline.Shutdown();
     m_splitSignature.Reset();
     m_visibilityPipeline.Shutdown();
     m_statusPipeline.Shutdown();
@@ -774,7 +804,8 @@ bool AirField::Allocate(const AirFieldSettings& settings)
         create(m_emissionStatus, MaximumMotors * StatusBytesPerMotor) &&
         create(m_emissionSamples, std::size_t{m_visibilityCapacity} * SampleBytesPerMotor) &&
         create(m_splitList, (cells + 1) * sizeof(std::uint32_t)) && create(m_splitArguments, SplitArgumentBytes) &&
-        create(m_mistStatus, MaximumMistEmitters * MistStatusBytesPerEmitter) && create(m_apertures, cells * ApertureBytesPerCell);
+        create(m_mistStatus, MaximumMistEmitters * MistStatusBytesPerEmitter) && create(m_apertures, cells * ApertureBytesPerCell) &&
+        create(m_activity, ActivityBytes);
 
     if(!created)
     {
@@ -792,6 +823,13 @@ bool AirField::Allocate(const AirFieldSettings& settings)
     // New storage holds no visibility, and its split counter must be zeroed before the first step.
     m_visibilityEntries = {};
     m_splitResetPending = true;
+    // New storage starts from rest and ambient ΔT 0 (a reset follows): nothing is warm, nothing is known about its activity yet.
+    m_warmAirPossible = false;
+    m_dormant = false;
+    m_dormancyZeroPending = false;
+    m_dormantQuietFrames = 0;
+    m_recoveryQuietFrames = 0;
+    ++m_activityEpoch;
     return true;
 }
 
@@ -962,6 +1000,74 @@ void AirField::RetireStorage(std::uint64_t fence)
     m_binding.valid = 0;
 }
 
+void AirField::SetComputeQueueRecording(bool compute)
+{
+    m_readState = compute ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+
+    if(!compute)
+    {
+        return;
+    }
+
+    // Nothing in this frame's recording has used the field's buffers yet (AIR records before any pass), so on the GPU they are in
+    // COMMON: the earlier submissions that left them in a graphics read state have completed before the compute list starts.
+    const auto normalize = [](Buffer* buffer)
+    {
+        if(buffer->GetResource() != nullptr && (buffer->GetResourceState() & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) != 0)
+        {
+            buffer->AssumeDecayedToCommon();
+        }
+    };
+
+    for(Buffer* buffer : StorageBuffers())
+    {
+        normalize(buffer);
+    }
+
+    for(Buffer* buffer : MistBuffers())
+    {
+        normalize(buffer);
+    }
+
+    for(Buffer* buffer : m_pressure.StorageBuffers())
+    {
+        normalize(buffer);
+    }
+}
+
+void AirField::PrepareForFrameReaders(ID3D12GraphicsCommandList* commandList)
+{
+    const auto decayed = [](Buffer* buffer)
+    {
+        if(buffer->GetResource() != nullptr)
+        {
+            buffer->AssumeDecayedToCommon();
+        }
+    };
+
+    for(Buffer* buffer : StorageBuffers())
+    {
+        decayed(buffer);
+    }
+
+    for(Buffer* buffer : MistBuffers())
+    {
+        decayed(buffer);
+    }
+
+    for(Buffer* buffer : m_pressure.StorageBuffers())
+    {
+        decayed(buffer);
+    }
+
+    m_readState = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+
+    if(m_allocated)
+    {
+        TransitionStorage(commandList, m_readState);
+    }
+}
+
 void AirField::Mark(ID3D12GraphicsCommandList* commandList, const char* stage) const
 {
     if(m_stageMarker)
@@ -1021,7 +1127,7 @@ bool AirField::RecordProjection(ID3D12GraphicsCommandList* commandList, UploadBu
     const Vector3& ambient = request.settings.ambientVelocity;
     const AirPressureRequest& pressure = request.pressure;
     m_projectionStorage = true;
-    TransitionStorage(commandList, ReadState);
+    TransitionStorage(commandList, m_readState);
 
     // Components and hierarchy follow the face connections: rebuilt (phi zeroed) whenever maintenance rebuilt those.
     // AIR.4E.5b: after nothing but recentres, phi is kept in the cells the previous build's window shares with this one.
@@ -1031,6 +1137,8 @@ bool AirField::RecordProjection(ID3D12GraphicsCommandList* commandList, UploadBu
     // locally over their cells; it relabels on the GPU when its topology check cannot rule out a change, and always after several
     // updates (the check's record holds the latest only) or for a box past the check's capacity.
     bool local = false;
+    // Whether that local update was told to relabel whatever the topology check finds.
+    bool localForced = false;
 
     const bool warmPressure = request.movingSolids.enabled && !request.movingSolids.coldRebuildForDiagnostics;
 
@@ -1049,6 +1157,7 @@ bool AirField::RecordProjection(ID3D12GraphicsCommandList* commandList, UploadBu
         }
 
         update.forceRelabel = m_pressurePendingUpdates > 1 || cells > PressureTopologyCellLimit;
+        localForced = update.forceRelabel;
         m_movingSolidStatistics.forcedRelabelsPending += m_pressurePendingUpdates > 1 ? 1 : 0;
         m_movingSolidStatistics.forcedRelabelsSize += cells > PressureTopologyCellLimit ? 1 : 0;
         m_movingSolidStatistics.lastLocalBoxCells = cells;
@@ -1072,7 +1181,15 @@ bool AirField::RecordProjection(ID3D12GraphicsCommandList* commandList, UploadBu
     }
 
     // AIR.4F.1b: buoyancy enters the solve's right-hand side and the correction as one force per vertical face; both get the same values.
-    const AirPressureBuoyancy buoyancy = PressureBuoyancy(request);
+    // AIR optimization report item 1: while no piece can hold a non-zero ΔT, every face force is exactly 0 and the step is a non-buoyant
+    // one: it takes the non-buoyant budgets, bit-identical to buoyancy off.
+    AirPressureBuoyancy buoyancy = PressureBuoyancy(request);
+
+    if(!m_warmAirPossible && !pressure.assumeWarmAirForDiagnostics)
+    {
+        buoyancy.impulse = 0.0f;
+    }
+
     const bool buoyant = buoyancy.impulse > 0.0f;
 
     // AIR.4E.5b: a cold start (just rebuilt, phi zeroed) gets the cold cycle budget. AIR.4F.1b: while buoyancy acts, warm steps get the
@@ -1129,9 +1246,35 @@ bool AirField::RecordProjection(ID3D12GraphicsCommandList* commandList, UploadBu
 
     if(pressure.adaptiveMinimumCycles > 0 && !coldStart && !buoyant && solve.cycles > pressure.adaptiveMinimumCycles)
     {
-        solve.recoveryCycles += solve.cycles - pressure.adaptiveMinimumCycles;
+        solve.budgetedRecoveryCycles = solve.cycles - pressure.adaptiveMinimumCycles;
+        solve.recoveryCycles += solve.budgetedRecoveryCycles;
         solve.cycles = pressure.adaptiveMinimumCycles;
         solve.smoothingSweeps = pressure.adaptiveSmoothingSweeps;
+    }
+
+    // AIR optimization report item 4: a steady step (no rebuild, no local update) after RecoveryQuietFrames readbacks without a single
+    // recovery cycle beyond the budget records only its budgeted gated cycles (at least one) instead of the whole budget: zero-group cycles
+    // still cost the GPU's front end (about 0.24 ms per step). One that is used, or a solve that runs out, shows in a later readback and
+    // restores the full budget.
+    // AIR solver restructure (scope §2.6, option A): a local moving-solid update keeps the quiet count (every walking step is one) and,
+    // while quiet, records its budgeted cycles plus LocalRecoveryCycles. A forced relabel (several pending updates, or a box past the
+    // topology check's capacity) and every full rebuild (cold start, recentre, rebake) reset the count and take the full budget.
+    const bool forcedRelabel = local && localForced;
+
+    if((rebuilt && !(local && pressure.localRecoveryTier)) || forcedRelabel)
+    {
+        m_recoveryQuietFrames = 0;
+    }
+    else if(pressure.adaptiveRecovery && m_recoveryQuietFrames >= RecoveryQuietFrames)
+    {
+        std::uint32_t quietCycles = (std::max)(solve.budgetedRecoveryCycles, 1u);
+
+        if(local)
+        {
+            quietCycles = pressure.localRecoveryTier ? solve.budgetedRecoveryCycles + LocalRecoveryCycles : solve.recoveryCycles;
+        }
+
+        solve.recoveryCycles = (std::min)(solve.recoveryCycles, quietCycles);
     }
     // AIR.4F.3 F2b.2: with moving solids, the moving-wall source (D, sub-cell volumes per step) enters the right-hand side as a rate,
     // D (cell / 4)^3 / (cell^2 dt) = D cell / (64 dt) in the divergence's units; the closed components' sums are zeroed first.
@@ -1276,7 +1419,7 @@ bool AirField::RecordMistFlux(ID3D12GraphicsCommandList* commandList, UploadBuff
     // CSCorrect expects the field's other storage in its shader-read state.
     for(Buffer* buffer : MistBuffers())
     {
-        buffer->Transition(commandList, ReadState);
+        buffer->Transition(commandList, m_readState);
     }
 
     ++m_conservativeMistSteps;
@@ -2642,6 +2785,181 @@ bool AirField::RecordMotorWork(ID3D12GraphicsCommandList* commandList, UploadBuf
     return true;
 }
 
+bool AirField::AnyMotorReachesWindow(const std::array<std::int32_t, 3>& minimum, const AirFrameRequest& request) const
+{
+    const double cellSize = std::ldexp(1.0, m_settings.cellExponent);
+    double low[3];
+    double high[3];
+
+    for(std::size_t axis = 0; axis < 3; ++axis)
+    {
+        low[axis] = static_cast<double>(minimum[axis]) * cellSize;
+        high[axis] = static_cast<double>(minimum[axis] + static_cast<std::int32_t>(m_settings.dimensions[axis])) * cellSize;
+    }
+
+    for(const AirMotorInstance& motor : request.motors)
+    {
+        const double position[3] = {motor.position.x, motor.position.y, motor.position.z};
+        const double radius = BoundingRadius(motor);
+        double distanceSquared = 0.0;
+
+        // As UploadMotors, except that a motor whose bounds are not finite counts as reaching it (it keeps the air awake).
+        if(!std::isfinite(radius))
+        {
+            return true;
+        }
+
+        for(std::size_t axis = 0; axis < 3; ++axis)
+        {
+            const double outside = (std::max)({low[axis] - position[axis], 0.0, position[axis] - high[axis]});
+            distanceSquared += outside * outside;
+        }
+
+        if(!(distanceSquared > radius * radius))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool AirField::RecordActivityReset(ID3D12GraphicsCommandList* commandList, UploadBuffer& upload, const AirFieldBinding& next)
+{
+    AirSolverConstants constants;
+    constants.field = next;
+    constants.activityIndex = m_activity.GetUAVDescriptorIndex();
+    const D3D12_GPU_VIRTUAL_ADDRESS address = upload.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(address == 0)
+    {
+        return false;
+    }
+
+    m_resetActivityPipeline.Bind(commandList);
+    commandList->SetComputeRootConstantBufferView(0, address);
+    commandList->Dispatch(1, 1, 1);
+    UnorderedAccessBarrier(commandList);
+    return true;
+}
+
+bool AirField::RecordZeroVelocity(ID3D12GraphicsCommandList* commandList, UploadBuffer& upload, const AirFieldBinding& next)
+{
+    AirSolverConstants constants;
+    constants.field = next;
+    constants.velocityWriteIndex = m_velocity[m_current].GetUAVDescriptorIndex();
+    constants.piece1WriteIndex = m_piece1Velocity[m_current].GetUAVDescriptorIndex();
+    const D3D12_GPU_VIRTUAL_ADDRESS address = upload.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(address == 0)
+    {
+        return false;
+    }
+
+    m_zeroVelocityPipeline.Bind(commandList);
+    commandList->SetComputeRootConstantBufferView(0, address);
+    DispatchCells(commandList, m_settings);
+    UnorderedAccessBarrier(commandList);
+    return true;
+}
+
+void AirField::RecordActivityCopy(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex, std::uint64_t heatEpoch)
+{
+    ActivitySlot& slot = m_activitySlots[frameIndex % m_activitySlots.size()];
+
+    // The slot's previous copy must have been read first.
+    if(slot.fence != 0 || !slot.readback)
+    {
+        return;
+    }
+
+    m_activity.Transition(commandList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commandList->CopyBufferRegion(slot.readback.Get(), 0, m_activity.GetResource(), 0, sizeof(std::uint32_t));
+    m_activity.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    slot.counters = m_projectionStorage && m_pressure.RecordRecoveryCounterCopy(commandList, slot.readback.Get(), 4);
+    slot.epoch = m_activityEpoch;
+    slot.heatEpoch = heatEpoch;
+    slot.recorded = true;
+}
+
+void AirField::PollActivity(std::uint64_t completedFence)
+{
+    // Oldest first, so the recovery counters' differences follow the frames' order.
+    std::array<ActivitySlot*, std::tuple_size_v<decltype(m_activitySlots)>> ready{};
+    std::size_t count = 0;
+
+    for(ActivitySlot& slot : m_activitySlots)
+    {
+        if(slot.fence != 0 && slot.fence <= completedFence && slot.readback)
+        {
+            ready[count++] = &slot;
+        }
+    }
+
+    std::sort(ready.begin(), ready.begin() + count, [](const ActivitySlot* a, const ActivitySlot* b) { return a->fence < b->fence; });
+
+    for(std::size_t index = 0; index < count; ++index)
+    {
+        ActivitySlot& slot = *ready[index];
+        // The activity word, then the recovery counters (RecordRecoveryCounterCopy): cycles, failures, cycles beyond the budget.
+        std::uint32_t words[4]{};
+        static_assert(sizeof(words) <= ActivityReadbackBytes);
+        void* data = nullptr;
+        const D3D12_RANGE range{0, sizeof(words)};
+
+        if(SUCCEEDED(slot.readback->Map(0, &range, &data)))
+        {
+            std::memcpy(words, data, sizeof(words));
+            const D3D12_RANGE written{0, 0};
+            slot.readback->Unmap(0, &written);
+            const std::uint32_t activity = words[0];
+
+            // Item 1: every piece's ΔT was exactly 0 after that frame's steps, and no heating emitter has run since (its own frame's
+            // mist steps heat after its steps, so that frame's epoch is taken before its upload): ΔT is still 0 everywhere.
+            if((activity & ActivityWarm) == 0 && slot.heatEpoch == m_heatEpoch)
+            {
+                m_warmAirPossible = false;
+            }
+
+            // Item 2: quiet frames since the latest stir.
+            if(slot.epoch == m_activityEpoch)
+            {
+                m_dormantQuietFrames = activity == 0 ? m_dormantQuietFrames + 1 : 0;
+            }
+
+            // Item 4: any recovery cycle used beyond the steps' budgets, or any solve that ran out of budget, since the previous readback.
+            // AIR solver restructure: the adaptive warm cycles (budgeted) no longer count; with a minimum of 1 cycle the second runs often.
+            if(slot.counters)
+            {
+                const std::uint64_t cycles = words[1];
+                const std::uint64_t failures = words[2];
+                const std::uint64_t beyondBudget = words[3];
+
+                if(!m_recoveryCountersValid || cycles < m_recoveryCyclesRead || failures < m_recoveryFailuresRead ||
+                    beyondBudget < m_recoveryBeyondBudgetRead)
+                {
+                    m_recoveryQuietFrames = 0;
+                }
+                else if(beyondBudget == m_recoveryBeyondBudgetRead && failures == m_recoveryFailuresRead)
+                {
+                    ++m_recoveryQuietFrames;
+                }
+                else
+                {
+                    m_recoveryQuietFrames = 0;
+                }
+
+                m_recoveryCyclesRead = cycles;
+                m_recoveryFailuresRead = failures;
+                m_recoveryBeyondBudgetRead = beyondBudget;
+                m_recoveryCountersValid = true;
+            }
+        }
+
+        slot.fence = 0;
+    }
+}
+
 void AirField::MarkSubmitted(unsigned int frameIndex, std::uint64_t fence) noexcept
 {
     StatusSlot& slot = m_statusSlots[frameIndex % m_statusSlots.size()];
@@ -2658,6 +2976,14 @@ void AirField::MarkSubmitted(unsigned int frameIndex, std::uint64_t fence) noexc
     {
         mistSlot.fence = fence;
         mistSlot.recorded = false;
+    }
+
+    ActivitySlot& activitySlot = m_activitySlots[frameIndex % m_activitySlots.size()];
+
+    if(activitySlot.recorded)
+    {
+        activitySlot.fence = fence;
+        activitySlot.recorded = false;
     }
 }
 
@@ -2716,6 +3042,7 @@ bool AirField::RecordStep(ID3D12GraphicsCommandList* commandList, UploadBuffer& 
     constants.visibilityIndex = m_visibility.GetUAVDescriptorIndex();
     constants.splitListIndex = m_splitList.GetUAVDescriptorIndex();
     constants.splitArgumentsIndex = m_splitArguments.GetUAVDescriptorIndex();
+    constants.activityIndex = m_activity.GetUAVDescriptorIndex();
     const double dampingRate = (std::max)(0.0, static_cast<double>(request.solver.dampingRate));
     constants.dampingFactor = static_cast<float>(std::exp(-dampingRate * StepSeconds));
     // AIR.4F F4.5.1b: a relaxation time of 0 (or an invalid one) keeps ΔT unchanged.
@@ -2811,6 +3138,22 @@ std::uint32_t AirField::UploadMistEmitters(UploadBuffer& upload, const AirFieldB
     std::array<std::int64_t, 3> volumeHigh{};
     std::vector<GpuMistEmitter> emitters;
     const double cellSize = next.cellSize;
+    bool heating = false;
+    // Every exit below (none reaches a cell, the upload fails) still notes the heating emitters seen.
+    struct HeatNote
+    {
+        AirField& field;
+        bool& heating;
+
+        ~HeatNote()
+        {
+            if(heating)
+            {
+                field.m_warmAirPossible = true;
+                ++field.m_heatEpoch;
+            }
+        }
+    } heatNote{*this, heating};
 
     for(const MistEmitterInstance& emitter : request.mistEmitters)
     {
@@ -2881,6 +3224,13 @@ std::uint32_t AirField::UploadMistEmitters(UploadBuffer& upload, const AirFieldB
             MistEmitterComponent::MinimumTemperatureResponseRate, MistEmitterComponent::MaximumTemperatureResponseRate) : 1.0f;
         // AIR.4F F4.5.1b: within the field's ΔT range; a non-finite value heats nothing.
         gpu.temperature = std::isfinite(emitter.temperature) ? std::clamp(emitter.temperature, -200.0f, 1000.0f) : 0.0f;
+
+        // AIR optimization report item 1: an emitter that heats (or cools) may make ΔT non-zero from this frame's steps on. Counted
+        // for every emitter that reaches the window, before its upload, so the flag is never late.
+        if(gpu.temperature != 0.0f)
+        {
+            heating = true;
+        }
         // Legacy: density per step. Point: density x m^3 per step. AIR.4F.2c, Volume: the target density itself.
         gpu.densityPerStep = volume ? rate : static_cast<float>(static_cast<double>(rate) * StepSeconds);
 
@@ -3215,7 +3565,10 @@ void AirField::Record(ID3D12GraphicsCommandList* commandList, DescriptorHeap& de
     CollectRetired(completedFence);
     PollEmissionStatus(completedFence);
     PollMistEmitterStatus(completedFence);
+    PollActivity(completedFence);
     m_lastStepCount = 0;
+    // AIR optimization report item 1: heating emitters uploaded from here on make ΔT possibly non-zero again.
+    const std::uint64_t heatEpoch = m_heatEpoch;
     m_frameSubmissionFence = lastSubmissionFence;
     m_boundaryRecordsUsed = false;
 
@@ -3277,14 +3630,27 @@ void AirField::Record(ID3D12GraphicsCommandList* commandList, DescriptorHeap& de
     std::array<std::int32_t, 3> minimum = m_minimum;
     bool teleport = false;
 
+    // AIR optimization report item 5b: once any axis must move, every axis more than half a step off centre moves with it, so a diagonal
+    // walk pays one recentre (one pressure rebuild) where it paid one per axis.
+    std::array<std::int64_t, 3> offCentre{};
+    bool recentring = m_resetPending;
+
     for(std::size_t axis = 0; axis < 3; ++axis)
     {
         const std::int32_t size = static_cast<std::int32_t>(m_settings.dimensions[axis]);
         const auto cameraCell = static_cast<std::int64_t>(std::floor(camera[axis] / cellSize));
         const std::int64_t centre = std::int64_t{m_minimum[axis]} + size / 2;
+        offCentre[axis] = std::llabs(cameraCell - centre);
+        recentring = recentring || offCentre[axis] > RecentreStep;
+    }
+
+    for(std::size_t axis = 0; axis < 3; ++axis)
+    {
+        const std::int32_t size = static_cast<std::int32_t>(m_settings.dimensions[axis]);
+        const auto cameraCell = static_cast<std::int64_t>(std::floor(camera[axis] / cellSize));
         const std::int32_t target = FloorDivide(cameraCell - size / 2, RecentreStep) * RecentreStep;
 
-        if(m_resetPending || std::llabs(cameraCell - centre) > RecentreStep)
+        if(m_resetPending || offCentre[axis] > RecentreStep || (recentring && offCentre[axis] > RecentreStep / 2))
         {
             minimum[axis] = target;
         }
@@ -3309,7 +3675,7 @@ void AirField::Record(ID3D12GraphicsCommandList* commandList, DescriptorHeap& de
         m_accumulator = 0.0;
     }
 
-    const std::uint32_t steps = TakeSteps(request);
+    std::uint32_t steps = TakeSteps(request);
     const bool mistClear = m_mistAllocated && m_mistClearPending;
 
     // AIR.4F.3 F1a: the solids this frame moves to (the first MaximumMovingSolids by object ID), and whether the overlay has work: a solid
@@ -3327,6 +3693,47 @@ void AirField::Record(ID3D12GraphicsCommandList* commandList, DescriptorHeap& de
         {
             movingSolidTargets.erase(std::next(movingSolidTargets.begin(), MaximumMovingSolids), movingSolidTargets.end());
             ++m_movingSolidStatistics.truncatedFrames;
+        }
+    }
+
+    // AIR optimization report item 2: dormant air. Whatever can stir the air this frame keeps it awake (and wakes it): a reset, warm air, an
+    // ambient wind, mist stepping (its own transport reads the velocity), a moving-solid change or wall source, or a motor reaching the
+    // window (Point emitters' jets are motors). Otherwise, after DormantQuietFrames stepped frames whose GPU check found the air at rest
+    // and ΔT 0, the velocity is zeroed once and steps are taken but not recorded. Stirring frames start a new epoch, so only quiet frames
+    // after the latest stir count.
+    {
+        bool movingSolidsChange = movingSolidTargets.size() != m_appliedMovingSolids.size();
+
+        for(const auto& [objectID, solid] : movingSolidTargets)
+        {
+            const auto applied = m_appliedMovingSolids.find(objectID);
+            movingSolidsChange = movingSolidsChange || applied == m_appliedMovingSolids.end() || !SameMovingSolidGeometry(applied->second, solid);
+        }
+
+        const Vector3& wind = request.settings.ambientVelocity;
+        const bool stirring = !request.solver.dormancy || full || m_warmAirPossible || wind.x != 0.0f || wind.y != 0.0f || wind.z != 0.0f ||
+            (m_mistAllocated && !request.mist.paused) || movingSolidsChange || m_wallSourceWritten || m_tangentialPending ||
+            request.movingSolids.applyWithoutStepsForDiagnostics || request.movingSolids.continuousWithoutStepsForDiagnostics ||
+            AnyMotorReachesWindow(minimum, request);
+
+        if(stirring)
+        {
+            m_dormant = false;
+            m_dormancyZeroPending = false;
+            m_dormantQuietFrames = 0;
+            ++m_activityEpoch;
+        }
+        else if(!m_dormant && m_dormantQuietFrames >= DormantQuietFrames)
+        {
+            m_dormant = true;
+            m_dormancyZeroPending = true;
+            ++m_dormantEntries;
+        }
+
+        if(m_dormant)
+        {
+            m_dormantSteps += steps;
+            steps = 0;
         }
     }
 
@@ -3366,7 +3773,7 @@ void AirField::Record(ID3D12GraphicsCommandList* commandList, DescriptorHeap& de
         next.dimensions[axis] = m_settings.dimensions[axis];
     }
 
-    if(maintenance || steps > 0 || mistClear || movingSolidWork)
+    if(maintenance || steps > 0 || mistClear || movingSolidWork || m_dormancyZeroPending)
     {
         ID3D12DescriptorHeap* heaps[]{descriptorHeap.GetHeap()};
         commandList->SetDescriptorHeaps(1, heaps);
@@ -3389,7 +3796,7 @@ void AirField::Record(ID3D12GraphicsCommandList* commandList, DescriptorHeap& de
         if(!cleared || (maintenance && !RecordMaintenance(commandList, upload, next, full, shifted, voxelsChanged, voxels)))
         {
             // No room for constants this frame: the previous binding stays (invalid if never initialized); retried next frame.
-            TransitionStorage(commandList, ReadState);
+            TransitionStorage(commandList, m_readState);
             m_binding.valid = m_resetPending ? 0u : m_binding.valid;
             m_mistBinding.valid = 0;
             return;
@@ -3397,6 +3804,32 @@ void AirField::Record(ID3D12GraphicsCommandList* commandList, DescriptorHeap& de
 
         m_mistClearPending = m_mistClearPending && !mistClear;
         Mark(commandList, "transitions, mist clear and maintenance");
+
+        // AIR optimization report item 1: a reset re-initializes every cell (ΔT 0), so no air is warm until an emitter heats again.
+        if(full)
+        {
+            m_warmAirPossible = false;
+            m_recoveryQuietFrames = 0;
+        }
+
+        // Item 2: the air goes dormant exactly at rest.
+        if(m_dormancyZeroPending && RecordZeroVelocity(commandList, upload, next))
+        {
+            m_dormancyZeroPending = false;
+        }
+
+        // Item 4: geometry changes are disturbances the recovery budget must meet in full. AIR solver restructure (scope §2.6): with the
+        // local tier on, a moving-solid update keeps the quiet count; RecordProjection resets it if the update becomes a full rebuild or a
+        // forced relabel.
+        const bool localRecoveryTier = request.pressure.adaptiveRecovery && request.pressure.localRecoveryTier;
+
+        if(maintenance || (movingSolidWork && !localRecoveryTier))
+        {
+            m_recoveryQuietFrames = 0;
+        }
+
+        // Items 1, 2 and 4: the steps' activity check starts clear.
+        const bool activityChecked = steps > 0 && RecordActivityReset(commandList, upload, next);
 
         m_minimum = minimum;
         m_voxelGeneration = voxels.generation;
@@ -3594,8 +4027,13 @@ void AirField::Record(ID3D12GraphicsCommandList* commandList, DescriptorHeap& de
             CopyMistEmitterStatus(commandList, frameIndex);
         }
 
+        if(activityChecked && m_lastStepCount > 0)
+        {
+            RecordActivityCopy(commandList, frameIndex, heatEpoch);
+        }
+
         // Readers of this frame, and of later frames, see the latest velocity, mist and mask in a shader-read state.
-        TransitionStorage(commandList, ReadState);
+        TransitionStorage(commandList, m_readState);
         Mark(commandList, "status copy and transitions");
 
         ++next.generation;

@@ -5,8 +5,11 @@
 #include "Renderer/Vertex.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <unordered_map>
+#include <vector>
 #include <limits>
 #include <string_view>
 #include <cstdint>
@@ -90,6 +93,162 @@ namespace
 
         bounds.valid = true;
         return bounds;
+    }
+
+    // Two faces that meet at an edge at more than this angle (30 degrees) form a sharp edge.
+    constexpr float SilhouetteSharpEdgeCosine = 0.866f;
+
+    // Per triangle, bits 0, 1 and 2 for its edges (vertex 0 to 1, 1 to 2, 2 to 0) where the surface ends (no other
+    // triangle shares the edge) or turns sharply (the one other triangle there meets it at more than 30 degrees), such as
+    // the outline of a plane or the corners of a box. Edges are matched by position, so a UV seam or a normal split on a
+    // smooth or flat surface is no edge here: a floor tiled several times over one quad, a sphere's seam or the shared
+    // diagonal of a quad never clip. An edge three or more triangles share is left unmarked. Empty when no edge qualifies
+    // or the data cannot be read.
+    std::vector<std::uint32_t> CalculateSilhouetteEdges(const void* vertices, size_t vertexCount,
+        const VertexLayout& layout, const unsigned int* indices, size_t indexCount, const MeshBounds& bounds)
+    {
+        const size_t stride = layout.GetStride();
+        const VertexAttribute* positionAttribute = nullptr;
+
+        for (const VertexAttribute& attribute : layout.GetAttributes())
+        {
+            if (std::string_view(attribute.semantic ? attribute.semantic : "") == "POSITION" &&
+                attribute.semanticIndex == 0 && attribute.type == VertexAttributeType::Float3)
+            {
+                positionAttribute = &attribute;
+                break;
+            }
+        }
+
+        if (!vertices || !indices || indexCount < 3 || indexCount % 3 != 0 || stride == 0 || !positionAttribute ||
+            !bounds.valid || positionAttribute->offset > stride || sizeof(float) * 3 > stride - positionAttribute->offset)
+        {
+            return {};
+        }
+
+        const auto* vertexBytes = static_cast<const unsigned char*>(vertices);
+        const auto position = [&](unsigned int index)
+        {
+            float value[3];
+            std::memcpy(value, vertexBytes + static_cast<size_t>(index) * stride + positionAttribute->offset,
+                sizeof(value));
+            return Vector3{value[0], value[1], value[2]};
+        };
+
+        // Positions closer than a millionth of the mesh's size are one point (split vertices of a box corner).
+        const Vector3 extent = bounds.max - bounds.min;
+        const float cell = (std::max)((std::max)(extent.x, extent.y), (std::max)(extent.z, 1.0e-6f)) * 1.0e-6f;
+        std::unordered_map<std::uint64_t, std::uint32_t> pointIds;
+        std::vector<std::uint32_t> pointOfVertex(vertexCount, UINT32_MAX);
+
+        const auto pointId = [&](unsigned int index) -> std::uint32_t
+        {
+            if (pointOfVertex[index] != UINT32_MAX)
+            {
+                return pointOfVertex[index];
+            }
+
+            const Vector3 p = position(index);
+            const auto quantize = [&](float value)
+            {
+                return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::llround(value / cell)) & 0x1FFFFF);
+            };
+            const std::uint64_t key = quantize(p.x) | (quantize(p.y) << 21) | (quantize(p.z) << 42);
+            const auto inserted = pointIds.emplace(key, static_cast<std::uint32_t>(pointIds.size()));
+            pointOfVertex[index] = inserted.first->second;
+            return inserted.first->second;
+        };
+
+        const size_t triangleCount = indexCount / 3;
+        std::vector<Vector3> faceNormals(triangleCount);
+        std::vector<std::array<std::uint32_t, 3>> trianglePoints(triangleCount);
+
+        // Each edge, by its two points: how many triangles use it and the first two of them (triangle * 3 + edge).
+        struct EdgeUse
+        {
+            std::uint32_t count = 0;
+            std::uint32_t first = UINT32_MAX;
+            std::uint32_t second = UINT32_MAX;
+        };
+
+        std::unordered_map<std::uint64_t, EdgeUse> edges;
+        edges.reserve(indexCount);
+
+        for (size_t triangle = 0; triangle < triangleCount; ++triangle)
+        {
+            const unsigned int* corner = indices + triangle * 3;
+
+            if (corner[0] >= vertexCount || corner[1] >= vertexCount || corner[2] >= vertexCount)
+            {
+                return {};
+            }
+
+            const Vector3 a = position(corner[0]);
+            const Vector3 b = position(corner[1]);
+            const Vector3 c = position(corner[2]);
+            faceNormals[triangle] = Vector3::Cross(b - a, c - a).Normalized();
+
+            for (size_t edge = 0; edge < 3; ++edge)
+            {
+                trianglePoints[triangle][edge] = pointId(corner[edge]);
+            }
+
+            for (std::uint32_t edge = 0; edge < 3; ++edge)
+            {
+                const std::uint32_t from = trianglePoints[triangle][edge];
+                const std::uint32_t to = trianglePoints[triangle][(edge + 1) % 3];
+
+                if (from == to)
+                {
+                    continue;
+                }
+
+                const std::uint64_t key = (static_cast<std::uint64_t>((std::min)(from, to)) << 32) | (std::max)(from, to);
+                EdgeUse& use = edges[key];
+                const std::uint32_t reference = static_cast<std::uint32_t>(triangle * 3 + edge);
+                if (use.count == 0)
+                {
+                    use.first = reference;
+                }
+                else if (use.count == 1)
+                {
+                    use.second = reference;
+                }
+
+                ++use.count;
+            }
+        }
+
+        std::vector<std::uint32_t> flags(triangleCount, 0u);
+        bool any = false;
+
+        for (const auto& [key, use] : edges)
+        {
+            bool sharp = use.count == 1;
+
+            if (use.count == 2)
+            {
+                const Vector3& first = faceNormals[use.first / 3];
+                const Vector3& second = faceNormals[use.second / 3];
+                sharp = Vector3::Dot(first, second) < SilhouetteSharpEdgeCosine;
+            }
+
+            if (!sharp)
+            {
+                continue;
+            }
+
+            flags[use.first / 3] |= 1u << (use.first % 3);
+
+            if (use.count == 2)
+            {
+                flags[use.second / 3] |= 1u << (use.second % 3);
+            }
+
+            any = true;
+        }
+
+        return any ? flags : std::vector<std::uint32_t>{};
     }
 }
 
@@ -179,6 +338,19 @@ bool Mesh::Initialize(
     m_indexBufferView.SizeInBytes = static_cast<UINT>(indexCount * sizeof(unsigned int));
 
     m_indexBufferView.Format = DXGI_FORMAT_R32_UINT;
+
+    // Without its silhouette edges the mesh still renders; parallax materials then keep its straight outline.
+    const std::vector<std::uint32_t> silhouetteEdges = CalculateSilhouetteEdges(vertices, vertexCount, layout, indices,
+        indexCount, m_bounds);
+
+    if (!silhouetteEdges.empty() &&
+        (!m_silhouetteEdges.Initialize(device, uploader, silhouetteEdges.data(),
+            silhouetteEdges.size() * sizeof(std::uint32_t), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) ||
+         !m_silhouetteEdges.CreateRawSRV(device, descriptorHeap)))
+    {
+        m_silhouetteEdges.Shutdown();
+    }
 
     return true;
 }
@@ -490,8 +662,6 @@ bool Mesh::ReplaceGeometry(
 {
     const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
 
-    (void)descriptorHeap;
-
     const size_t stride = m_layout.GetStride();
 
     if (m_gpuWritable ||
@@ -584,6 +754,40 @@ bool Mesh::ReplaceGeometry(
 
     m_indexBufferView.Format = DXGI_FORMAT_R32_UINT;
 
+    // The new geometry's silhouette edges in place of the old ones (the caller has drained GPU work, as above). Instance
+    // records keep the descriptor they were built with, so an existing table is replaced in place and a new one waits
+    // for the next record build. A table that cannot be prepared is cleared, which only drops the clipping.
+    std::vector<std::uint32_t> silhouetteEdges = CalculateSilhouetteEdges(vertices, vertexCount, m_layout, indices,
+        indexCount, m_bounds);
+
+    if (m_silhouetteEdges.GetDescriptorIndex() != UINT_MAX)
+    {
+        if (silhouetteEdges.empty())
+        {
+            silhouetteEdges.assign(indexCount / 3, 0u);
+        }
+
+        Buffer preparedEdges;
+        const bool edgesReplaced = m_silhouetteEdges.PrepareReplacement(device, uploader, silhouetteEdges.data(),
+            silhouetteEdges.size() * sizeof(std::uint32_t), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, preparedEdges) &&
+            m_silhouetteEdges.CommitReplacement(device, preparedEdges);
+        preparedEdges.Shutdown();
+
+        if (!edgesReplaced)
+        {
+            m_silhouetteEdges.Shutdown();
+        }
+    }
+    else if (!silhouetteEdges.empty() &&
+        (!m_silhouetteEdges.Initialize(device, uploader, silhouetteEdges.data(),
+            silhouetteEdges.size() * sizeof(std::uint32_t), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) ||
+         !m_silhouetteEdges.CreateRawSRV(device, descriptorHeap)))
+    {
+        m_silhouetteEdges.Shutdown();
+    }
+
     return true;
 }
 
@@ -591,6 +795,7 @@ void Mesh::Shutdown()
 {
     m_vertexBuffer.Shutdown();
     m_indexBuffer.Shutdown();
+    m_silhouetteEdges.Shutdown();
     m_vertexCount = 0;
     m_indexCount = 0;
     ResetMetadata();
@@ -677,6 +882,11 @@ unsigned int Mesh::GetVertexBufferDescriptorIndex() const
 unsigned int Mesh::GetIndexBufferDescriptorIndex() const
 {
     return m_indexBuffer.GetDescriptorIndex();
+}
+
+unsigned int Mesh::GetSilhouetteEdgeDescriptorIndex() const
+{
+    return m_silhouetteEdges.GetDescriptorIndex();
 }
 
 const VertexLayout& Mesh::GetVertexLayout() const

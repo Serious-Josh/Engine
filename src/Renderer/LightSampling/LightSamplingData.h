@@ -64,6 +64,38 @@ struct LightSamplingSettings
     // them (moved lights, lights that start contributing): this fraction of the binned lights, at least the minimum.
     double dynamicReserveFraction = 1.0 / 16.0;
     std::uint32_t minimumDynamicReserve = 64;
+    // World-level noise fix (2026-11-27): the global distribution (ReSTIR PT's light tiles, and the out-of-grid source of
+    // the ReGIR slots and sampled NEE) weights each light by its power times 1 if it can light what the camera sees, else
+    // cameraFarFactor. A light can when its range sphere, widened by cameraReachRadius, contains the camera or intersects
+    // the view frustum (to the far plane), or when it has no finite range (range attenuation off). A few bright lights
+    // elsewhere in a World (behind the camera or beside the view) otherwise take nearly every light-tile candidate from the
+    // dim lights near the camera. Proposal only: every consumer divides by the realized probability, and the defensive
+    // share keeps every light's probability above zero. The classification is re-evaluated when the camera enters another
+    // cell of cameraCellSize metres or turns by more than cameraTurnDegrees (or its field of view changes); the
+    // distribution is rewritten (in place) only when some light's classification changed.
+    // ENGINE_LIGHT_SAMPLING_CAMERA_WEIGHT=0 restores pure power weighting.
+    bool cameraWeighting = true;
+    // Measured 2026-11-27: a 4 m sphere around the camera alone (16 m and 1/64 left New World 8.6x noisier than Demo Scene)
+    // doubled ReSTIR_Benchmark_64's noise (mid-depth 4.4x), whose visible hall is lit by lights that never come near the
+    // camera; the frustum test keeps those. Off-view lights still light visible points through bounces only, at higher
+    // variance, never bias. ENGINE_LIGHT_SAMPLING_CAMERA_REACH / _FAR / _FRUSTUM=0 override these.
+    float cameraReachRadius = 4.0f;
+    double cameraFarFactor = 1.0 / 1024.0;
+    float cameraCellSize = 8.0f;
+    bool cameraFrustum = true;
+    float cameraTurnDegrees = 5.0f;
+};
+
+// World-level noise fix: the view the global distribution is weighted for (RenderView's basis, +Z forward).
+struct LightSamplingCameraView
+{
+    float position[3]{};
+    float forward[3]{0.0f, 0.0f, 1.0f};
+    float right[3]{1.0f, 0.0f, 0.0f};
+    float up[3]{0.0f, 1.0f, 0.0f};
+    float verticalFov = 0.0f;
+    float aspectRatio = 0.0f;
+    float farPlane = 0.0f;
 };
 
 // M4.1.1: a light's category in a built structure (as the builder classified it, or as an incremental update moved it).
@@ -172,7 +204,43 @@ struct LightSamplingData
     std::vector<std::uint32_t> words;
     LightSamplingStatistics statistics;
     LightSamplingIncrementalState incremental;
+
+    // World-level noise fix: the camera weighting the global distribution holds (LightSamplingSettings::cameraWeighting).
+    // A full build writes pure power weights (applied false); incremental updates keep the applied classification.
+    struct CameraWeighting
+    {
+        bool applied = false;
+        // The camera cell (cameraCellSize), forward direction and field of view the classification was last evaluated for.
+        bool cellValid = false;
+        std::int64_t cell[3]{};
+        float forward[3]{};
+        float verticalFov = 0.0f;
+        float aspectRatio = 0.0f;
+        // Per table light: 1 when it can light what the camera sees (weight 1), 0 when far (cameraFarFactor).
+        std::vector<std::uint8_t> reach;
+    } cameraWeighting;
 };
+
+// World-level noise fix: what UpdateLightSamplingCameraWeighting did.
+struct LightSamplingCameraUpdate
+{
+    // The global distribution was rewritten (its words are in `dirty`).
+    bool rewritten = false;
+    // Lights whose reach classification changed against the previously applied one (all far lights on a first application).
+    std::uint32_t changedLights = 0;
+    std::uint32_t farLights = 0;
+    double milliseconds = 0.0;
+};
+
+// World-level noise fix: applies the camera weighting (LightSamplingSettings::cameraWeighting) to `data`'s global
+// distribution for `view`, in place. Nothing happens while the camera stays in the cell, direction (within
+// cameraTurnDegrees) and field of view it was last evaluated for; otherwise the lights are reclassified and the
+// distribution is rewritten only when a classification differs from the applied one (or none is applied yet and some
+// light is far). With weighting off, a weighted distribution is restored to pure power. `dirty` receives the changed
+// words (sorted, merged).
+LightSamplingCameraUpdate UpdateLightSamplingCameraWeighting(const SceneLightTable& table,
+    const LightSamplingSettings& settings, const LightSamplingCameraView& view, LightSamplingData& data,
+    std::vector<LightSamplingDirtyRange>& dirty);
 
 // Builds the sampling structures for `table`. Deterministic: the same table and settings give the same words. Fails
 // (data untouched) only when the table is inconsistent or the structures would exceed 32-bit addressing.

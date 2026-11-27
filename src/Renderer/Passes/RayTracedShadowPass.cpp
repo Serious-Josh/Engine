@@ -99,6 +99,8 @@ bool RayTracedShadowPass::Initialize(
                                            DescriptorRangeType::UnorderedAccess, 1},
                                           {RootParameterType::ConstantBuffer, 0}};
 
+    // A parallax pixel's self-shadowing samples its height map as the G-buffer pass did (static sampler s2).
+    pipelineDescription.rasterMaterialSampler = true;
     pipelineDescription.maxPayloadSize = sizeof(unsigned int);
     pipelineDescription.maxAttributeSize = sizeof(float) * 2;
     pipelineDescription.maxRecursionDepth = 1;

@@ -84,7 +84,8 @@ namespace
             sameFloat(a.thinFilmThickness, b.thinFilmThickness) && sameFloat(a.thinFilmIor, b.thinFilmIor);
         const bool occlusion = sameFloat(a.aoDiffuse, b.aoDiffuse) && sameFloat(a.aoSpecularWeight, b.aoSpecularWeight);
         const bool detail = a.surfaceDetailMode == b.surfaceDetailMode && sameFloat(a.heightScale, b.heightScale) &&
-            sameFloat(a.heightBias, b.heightBias) && a.preferARM == b.preferARM;
+            sameFloat(a.heightBias, b.heightBias) && a.parallaxSilhouette == b.parallaxSilhouette &&
+            a.preferARM == b.preferARM;
 
         const bool textures = a.baseColorTexture == b.baseColorTexture && a.normalTexture == b.normalTexture &&
             a.roughnessTexture == b.roughnessTexture && a.metallicTexture == b.metallicTexture;
@@ -1406,9 +1407,33 @@ void InspectorPanel::DrawMaterial(
         }
     }
 
+    if(material.surfaceDetailMode == SurfaceDetailMode::GeometryWithParallaxFallback)
+    {
+        ImGui::TextDisabled("Displaced geometry is not available yet: renders as ParallaxOcclusion.");
+    }
+
     constexpr InspectorDragSpec heightDrag{0.001f};
     InspectorDragFloats("Height scale", &material.heightScale, 1, heightDrag);
     InspectorDragFloats("Height bias", &material.heightBias, 1, heightDrag);
+
+    // The relief spans heightBias to heightBias + heightScale, 0 being the mesh surface. Only the part below the surface
+    // gets a depth offset (SurfaceDetail.hlsli SurfaceDetailWorldOffset).
+    const float reliefTop = (std::max)(material.heightBias, material.heightBias + material.heightScale);
+
+    if(material.surfaceDetailMode != SurfaceDetailMode::NormalOnly && reliefTop > 0.0f)
+    {
+        ImGui::TextDisabled("Relief above the mesh surface gets no depth offset (contact, shadows and fog see the "
+            "flat surface there).");
+        ImGui::TextDisabled("Height bias = -Height scale puts the whole relief below the surface.");
+    }
+
+    if(material.surfaceDetailMode != SurfaceDetailMode::NormalOnly)
+    {
+        ImGui::Checkbox("Clip silhouettes", &material.parallaxSilhouette);
+        ImGui::SetItemTooltip("The relief cuts the mesh's outline where the surface ends or turns sharply (box edges, "
+            "the border of a plane). Turn off for meshes laid side by side, whose shared borders would show gaps.");
+    }
+
     ImGui::Checkbox("Prefer ARM", &material.preferARM);
 
     ImGui::SeparatorText("Texture references");

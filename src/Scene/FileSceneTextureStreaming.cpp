@@ -44,6 +44,12 @@ void FileSceneAssetCatalog::QueueMaterialTextures(const MaterialCacheKey& key, c
 {
     const auto references = TextureReferences(data);
 
+    // Layered prep (F5): whether the definition names a height texture (the last slot), before it is resident.
+    if(const auto material = m_projectMaterials.find(key); material != m_projectMaterials.end())
+    {
+        material->second.heightTextureAssigned = references.back().has_value();
+    }
+
     for(size_t slot = 0; slot < references.size(); ++slot)
     {
         if(!references[slot])

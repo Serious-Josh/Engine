@@ -267,6 +267,192 @@ bool RestirPtPrimaryTangentFromIdentity(uint2 pixel, float3 position, uint mater
     return true;
 }
 
+#if defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+// POM B2 (the relief tiers, ShaderVariantTable.inl): a parallax occlusion mapping pixel's depth is the point where the
+// view ray meets the relief, below the mesh, and its decoded vertex is lifted back onto the mesh
+// (PrimarySurfaceLift.hlsli), so no ray from it sees the relief around it. The mesh point straight above the relief point
+// along the normal has the relief point's UV, and the distance between them is its height (SurfaceDetail.hlsli). Both
+// come from the triangle the identity target names, so no ray is traced. Zero (no relief) for a pixel of another
+// material, at the top of its relief, on a degenerate triangle, or while a previous frame is decoded (the identity target
+// describes this frame).
+PathTracePrimaryRelief RestirPtLoadPrimaryRelief(uint2 pixel, int state, float3 geometricNormal)
+{
+    PathTracePrimaryRelief relief = (PathTracePrimaryRelief)0;
+
+    if(state <= 0 || g_pathTracePrimaryPreviousFrame || restirPtIdentityIndex == 0xFFFFFFFFu ||
+       any(pixel >= resolution))
+    {
+        return relief;
+    }
+
+    // The pixel's material, as the G-buffer stores it.
+    Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[gBufferSurfaceIndex];
+    StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
+    uint materialCount;
+    uint materialStride;
+    materials.GetDimensions(materialCount, materialStride);
+    const float storedMaterial = surfaceTexture.Load(int3(pixel, 0)).a;
+
+    if(!(storedMaterial >= 0.0f) || !(storedMaterial < float(materialCount)))
+    {
+        return relief;
+    }
+
+    const uint materialIndex = uint(storedMaterial);
+    const GPUMaterial material = materials[materialIndex];
+
+    if(!SurfaceDetailUsesParallax(material))
+    {
+        return relief;
+    }
+
+    // The mesh triangle under the pixel.
+    Texture2D<uint2> identityTexture = ResourceDescriptorHeap[restirPtIdentityIndex];
+    const uint2 identity = identityTexture.Load(int3(pixel, 0));
+    const uint identityInstance = PsrIdentityInstance(identity.x);
+
+    if(identityInstance == 0u || identityInstance == PSR_IDENTITY_UNMAPPED)
+    {
+        return relief;
+    }
+
+    const uint instanceID = identityInstance - 1u;
+    StructuredBuffer<RayTracingInstanceData> instances = ResourceDescriptorHeap[instanceDataIndex];
+    const RayTracingInstanceData instance = instances[instanceID];
+
+    if(ResolveHitMaterial(instance, identity.y) != materialIndex)
+    {
+        return relief;
+    }
+
+    const RestirPtInstanceTransform transform = restirPtTransforms[instanceID];
+    ByteAddressBuffer vertexBuffer = ResourceDescriptorHeap[NonUniformResourceIndex(instance.vertexBufferIndex)];
+    const uint3 indices = PathTraceTriangleIndices(instance, identity.y);
+    const float3 position0 = mul(transform.objectToWorld,
+        float4(PathTraceLoadPosition(vertexBuffer, indices.x, instance.vertexStride), 1.0f));
+    const float3 edge1 = mul(transform.objectToWorld,
+        float4(PathTraceLoadPosition(vertexBuffer, indices.y, instance.vertexStride), 1.0f)) - position0;
+    const float3 edge2 = mul(transform.objectToWorld,
+        float4(PathTraceLoadPosition(vertexBuffer, indices.z, instance.vertexStride), 1.0f)) - position0;
+    const float2 uv0 = PathTraceLoadUV(vertexBuffer, indices.x, instance);
+    const float2 uvEdge1 = PathTraceLoadUV(vertexBuffer, indices.y, instance) - uv0;
+    const float2 uvEdge2 = PathTraceLoadUV(vertexBuffer, indices.z, instance) - uv0;
+
+    // The relief point (the pixel's depth) and how far it lies below the triangle's plane along the normal.
+    PathTracePrimaryCamera camera;
+    camera.inverseCameraRelativeViewProjection = inverseCameraRelativeViewProjection;
+    camera.cameraPosition = cameraPosition;
+    camera.resolution = resolution;
+    Texture2D<float> depthTexture = ResourceDescriptorHeap[gBufferDepthIndex];
+    const float depth = depthTexture.Load(int3(pixel, 0));
+    const float3 cameraRelativePoint = PathTraceUnprojectCameraRelative(pixel, depth, camera);
+    const float3 reliefPoint = cameraPosition + cameraRelativePoint;
+    const float3 planeNormal = cross(edge1, edge2);
+    const float planeClimb = dot(planeNormal, geometricNormal);
+
+    // A plane nearly at right angles to the normal gives no usable height.
+    if(!(abs(planeClimb) > 0.25f * length(planeNormal)))
+    {
+        return relief;
+    }
+
+    const float distanceToPlane = dot(planeNormal, position0 - reliefPoint) / planeClimb;
+
+    // Also rejects a non-finite point. The top of the relief has nothing above it.
+    if(!(distanceToPlane > 1.0e-5f) || !isfinite(distanceToPlane))
+    {
+        return relief;
+    }
+
+    // Barycentrics of the mesh point above it.
+    const float3 offset = reliefPoint + geometricNormal * distanceToPlane - position0;
+    const float d11 = dot(edge1, edge1);
+    const float d12 = dot(edge1, edge2);
+    const float d22 = dot(edge2, edge2);
+    const float denominator = d11 * d22 - d12 * d12;
+
+    if(!(abs(denominator) > 1.0e-30f) || !isfinite(denominator))
+    {
+        return relief;
+    }
+
+    const float offset1 = dot(offset, edge1);
+    const float offset2 = dot(offset, edge2);
+    float2 barycentrics;
+    barycentrics.x = saturate((d22 * offset1 - d12 * offset2) / denominator);
+    barycentrics.y = saturate((d11 * offset2 - d12 * offset1) / denominator);
+
+    // Without vertex tangents SurfaceDetailUVPerTravel solves the mapping from the edges alone.
+    float4 tangent = float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+    if(instance.tangentOffset != 0xFFFFFFFFu)
+    {
+        const float4 tangent0 = PathTraceLoadTangent(vertexBuffer, indices.x, instance);
+        const float4 objectTangent = tangent0 +
+            (PathTraceLoadTangent(vertexBuffer, indices.y, instance) - tangent0) * barycentrics.x +
+            (PathTraceLoadTangent(vertexBuffer, indices.z, instance) - tangent0) * barycentrics.y;
+        tangent = float4(mul((float3x3)transform.objectToWorld, objectTangent.xyz), objectTangent.w);
+    }
+
+    float3 axisU;
+    float3 axisV;
+
+    if(!SurfaceDetailUVAxes(geometricNormal, tangent, edge1, edge2, uvEdge1, uvEdge2, axisU, axisV))
+    {
+        return relief;
+    }
+
+    // The pixel's size in UV: its width in the world over the triangle's world length per UV.
+    const float3 neighbourPoint = PathTraceUnprojectCameraRelative(uint2(pixel.x + 1u, pixel.y), depth, camera);
+    const float pixelSize = length(neighbourPoint - cameraRelativePoint);
+    const float worldAreaPerUVArea = length(planeNormal) /
+        max(abs(uvEdge1.x * uvEdge2.y - uvEdge1.y * uvEdge2.x), 1.0e-20f);
+
+    relief.field = SurfaceDetailHeightFieldOf(material);
+    relief.uv = uv0 + uvEdge1 * barycentrics.x + uvEdge2 * barycentrics.y;
+    relief.height = -distanceToPlane;
+    relief.uvFootprint = pixelSize * rsqrt(max(worldAreaPerUVArea, 1.0e-20f));
+    relief.axisU = axisU;
+    relief.axisV = axisV;
+    return relief;
+}
+
+// Whether the relief hides `direction` (a unit direction leaving the raster primary) from the vertex's relief point: a
+// hard test on the relief's horizon, the same for capture and every shift, so the light's own sampling (the sun's disc,
+// an area light) gives the penumbra. Directions below the mesh surface are left to the BSDF.
+bool RestirPtPrimaryReliefBlocks(PathTraceRasterFirstVertex vertex, float3 direction)
+{
+    if(!(abs(vertex.relief.field.scale) > 0.0f))
+    {
+        return false;
+    }
+
+    const float3 normal = vertex.surface.geometricNormal;
+    const float lightCosine = dot(direction, normal);
+
+    if(!(lightCosine > 0.0f))
+    {
+        return false;
+    }
+
+    // Close to the mesh surface's horizon the light reaches only the top of the relief, and the point is below it.
+    if(!(lightCosine > SurfaceDetailGrazingFadeStart))
+    {
+        return true;
+    }
+
+    const float3 travel = direction / lightCosine - normal;
+    const float2 uvPerHeight = float2(dot(vertex.relief.axisU, travel), dot(vertex.relief.axisV, travel));
+    return SurfaceDetailShellClearance(vertex.relief.field, materialSampler, vertex.relief.uv, vertex.relief.height,
+        vertex.relief.uvFootprint, uvPerHeight, lightCosine) < 0.0f;
+}
+#else
+bool RestirPtPrimaryReliefBlocks(PathTraceRasterFirstVertex vertex, float3 direction)
+{
+    return false;
+}
+#endif
+
 RestirPtInstanceTransform RestirPtLoadInstanceTransform(uint instanceID)
 {
     RestirPtInstanceTransform transform = restirPtTransforms[instanceID];
@@ -1066,6 +1252,18 @@ RestirPtNeeParts RestirPtNoNeeParts()
     RestirPtNeeParts parts = (RestirPtNeeParts)0;
     parts.mis = 1.0f;
     return parts;
+}
+
+// POM B2: an NEE candidate at x1 whose light the relief hides contributes nothing, as if its shadow ray were occluded
+// (RestirPtPrimaryReliefBlocks; a shift tests the same direction).
+void RestirPtApplyPrimaryRelief(bool primary, PathTraceRasterFirstVertex firstVertex, RestirPtNeeParts parts,
+    inout float3 contribution, inout float3 diffuse)
+{
+    if(primary && any(contribution != 0.0f) && RestirPtPrimaryReliefBlocks(firstVertex, parts.direction))
+    {
+        contribution = float3(0.0f, 0.0f, 0.0f);
+        diffuse = float3(0.0f, 0.0f, 0.0f);
+    }
 }
 
 // f_all cos for a direction, and its diffuse part.
@@ -2472,9 +2670,19 @@ struct RestirPtHitIdentity
 
 // PathTraceTraceRadianceInline (PathTraceReference.hlsl) with the committed hit's TLAS InstanceID, primitive and
 // barycentrics (B's own copy: the production function is unchanged).
+// POM D2a: how many times a ray continues past a hit where silhouette parallax occlusion mapping lets it through (the ray
+// left that mesh before meeting its relief). After the last, the hit is kept as it is.
+static const uint RESTIR_PT_SILHOUETTE_PASSES = 2u;
+
 void RestirPtTraceInline(RayDesc ray, inout PathTracePayload payload, out RestirPtHitIdentity identity)
 {
     identity = (RestirPtHitIdentity)0;
+    // The relief tiers trace in a loop (the body below is not indented for it, so the other tiers compile it unchanged).
+#if defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+    [loop]
+    for(uint pass = 0u; pass <= RESTIR_PT_SILHOUETTE_PASSES; ++pass)
+    {
+#endif
     RayQuery<RAY_FLAG_NONE> query;
     RESTIR_PT_TRACE_INLINE(query, RAY_FLAG_NONE, ray);
 
@@ -2506,11 +2714,24 @@ void RestirPtTraceInline(RayDesc ray, inout PathTracePayload payload, out Restir
 #undef PATH_TRACE_HIT_OBJECT_TO_WORLD
 #undef PATH_TRACE_HIT_WORLD_RAY_DIRECTION
 #undef PATH_TRACE_HIT_T
+#if defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+        // Through the clipped silhouette: on along the same ray, just past this hit.
+        if(reliefClipped && pass < RESTIR_PT_SILHOUETTE_PASSES)
+        {
+            ray.TMin = query.CommittedRayT() * (1.0f + 1.0e-4f) + 1.0e-4f;
+            continue;
+        }
+#endif
     }
     else
     {
         payload.hitDistance = -1.0f;
+        identity = (RestirPtHitIdentity)0;
     }
+#if defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+    break;
+    }
+#endif
 }
 
 // The reconnection's vertex-to-vertex direction omega' and distance d from y_(k-1) to x_k. Capture and every shift call this
@@ -2587,6 +2808,13 @@ bool RestirPtRebuildVertex(uint instanceID, uint primitive, float2 storedBarycen
 #undef PATH_TRACE_HIT_OBJECT_TO_WORLD
 #undef PATH_TRACE_HIT_WORLD_RAY_DIRECTION
 #undef PATH_TRACE_HIT_T
+#if defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+        // POM D2a: from this direction the ray passes the mesh's clipped silhouette, so it would not hit the vertex.
+        if(reliefClipped)
+        {
+            return false;
+        }
+#endif
     }
 
     return true;
@@ -3160,6 +3388,8 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
                 RestirPtNeeSamplingVertex(vertex, prefix.lobes), RestirPtTileBase(pixel, sampleIndex, vertex),
                 result.shadowRays, diffuse, lightIndex, parts, sourceWeight);
 
+            RestirPtApplyPrimaryRelief(primary, firstVertex, parts, contribution, diffuse);
+
             if(primary && (restirPtFlags & RESTIR_PT_FLAG_INJECT_CANDIDATE_NAN) != 0u && RestirPtInjectedPixel(pixel))
             {
                 contribution = asfloat(0x7FC00000u).xxx;
@@ -3212,6 +3442,7 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
                     SceneLightLoad(sceneLightBufferIndex, directionalLight), position);
                 contribution = RestirPtSingleLightNee(surface, position, lightSample, result.shadowRays, diffuse, parts);
                 RestirPtZeroSingleNee(0u);
+                RestirPtApplyPrimaryRelief(primary, firstVertex, parts, contribution, diffuse);
                 // P3: a directional table light is rebuilt from its index too (fixed direction; p_1 = 1).
                 parts.incident = lightSample.radiance;
                 parts.inverseSourcePdf = 1.0f;
@@ -3233,6 +3464,7 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
                 contribution = RestirPtSingleLightNee(surface, position, PathTraceSampleSun(sun, sunRandom),
                     result.shadowRays, diffuse, parts, SkyFrameCloudShadow(skyFrameInfoIndex, position));
                 RestirPtZeroSingleNee(1u);
+                RestirPtApplyPrimaryRelief(primary, firstVertex, parts, contribution, diffuse);
                 RestirPtStreamCandidate(result.stream, RestirPtWithReconnection(RestirPtMakeCandidate(
                     throughput * contribution, primary ? diffuse : throughput * contribution * diffuseShare, survival,
                     vertex + 1u, RESTIR_PT_END_SUN, 0u), RestirPtNeeReconnection(prefix, vertex, parts,
@@ -3252,6 +3484,7 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
                     environmentRandom), result.shadowRays, diffuse, parts);
                 g_restirPtSkipVisibility = false;
                 RestirPtZeroSingleNee(2u);
+                RestirPtApplyPrimaryRelief(primary, firstVertex, parts, contribution, diffuse);
                 RestirPtStreamCandidate(result.stream, RestirPtWithReconnection(RestirPtMakeCandidate(
                     throughput * contribution, primary ? diffuse : throughput * contribution * diffuseShare, survival,
                     vertex + 1u, RESTIR_PT_END_ENVIRONMENT, 0u), RestirPtNeeReconnection(prefix, vertex, parts,
@@ -3358,6 +3591,12 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
             survival *= continueProbability;
         }
 
+        // POM B2 (direct light only, decision 8): a continuation into the relief around the raster primary would meet
+        // the relief, which the acceleration structure does not hold. Its escape to the sun or sky is direct light and
+        // is blocked like the NEE it shares MIS weights with; a bounce goes on, standing in for the light the relief's
+        // own walls would reflect (inter-reflection inside the relief is not traced).
+        const bool reliefBlocked = primary && RestirPtPrimaryReliefBlocks(firstVertex, lobeSample.direction);
+
         RayDesc ray;
         ray.Origin = PathTraceOffsetRayOrigin(position, surface.geometricNormal);
         ray.Direction = lobeSample.direction;
@@ -3381,6 +3620,11 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
 
         if(payload.hitDistance < 0.0f)
         {
+            if(reliefBlocked)
+            {
+                break;
+            }
+
             // BSDF-sampled escape: k = vertex + 1, technique BSDF.
             // M5.3 close-out (user-approved 2026-11-22): where a shift re-evaluates this escape from the stored rcWi (an
             // environment endpoint left by this vertex, or x_k = this vertex continuing straight to it; see
@@ -4462,6 +4706,8 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
 
     // y_(k-1): the lobe it samples (the source's lambda_(k-1)).
     const uint lastVertex = replayEnd;
+    // POM B2: whether y_(k-1) is x1, the destination's raster primary.
+    const bool lastAtPrimary = lastVertex <= 1u;
     // M5.4 C2: the replayed lobe sample is used only by a replay-only escape and by reconnections whose lambda_(k-1) is
     // not stored (lastVertex > 2); every other shift (light endpoints, the common case) discarded it.
     RestirPtLobeSample previousLobe = (RestirPtLobeSample)0;
@@ -4525,6 +4771,13 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         if(pendingPair && RestirPtInverseFootprintPasses(surface, previousLobe.direction, pendingCosine, pendingDistance,
             footprintThreshold))
         {
+            return shifted;
+        }
+
+        // POM B2: y_(k-1) is the destination's raster primary, whose relief may hide this direction.
+        if(lastAtPrimary && RestirPtPrimaryReliefBlocks(destination, previousLobe.direction))
+        {
+            shifted.reason = RESTIR_PT_SHIFT_REASON_VISIBILITY;
             return shifted;
         }
 
@@ -4619,6 +4872,13 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
             return shifted;
         }
 
+        // POM B2: y_(k-1) is the destination's raster primary, whose relief may hide this direction.
+        if(lastAtPrimary && RestirPtPrimaryReliefBlocks(destination, direction))
+        {
+            shifted.reason = RESTIR_PT_SHIFT_REASON_VISIBILITY;
+            return shifted;
+        }
+
         uint rays = 0u;
         RESTIR_PT_SHIFT_COUNT(RestirPtCountShiftWork(3u, 1u));
         RESTIR_PT_SHIFT_COUNT(RestirPtCount(RESTIR_PT_COUNTER_SHARC + 11u, 1u));
@@ -4656,6 +4916,13 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         if(pendingPair && RestirPtInverseFootprintPasses(surface, rc.wi, pendingCosine, pendingDistance, footprintThreshold))
         {
             shifted.reason = RESTIR_PT_SHIFT_REASON_REPLAY;
+            return shifted;
+        }
+
+        // POM B2: y_(k-1) is the destination's raster primary, whose relief may hide this direction.
+        if(lastAtPrimary && RestirPtPrimaryReliefBlocks(destination, rc.wi))
+        {
+            shifted.reason = RESTIR_PT_SHIFT_REASON_VISIBILITY;
             return shifted;
         }
 
@@ -5000,6 +5267,10 @@ RestirPtTemporalResult RestirPtTemporalResample(uint2 pixel, PathTraceRasterFirs
     previousVertex.state = 1;
     previousVertex.position = neighbor.previous.position;
     previousVertex.surface = neighbor.previous.surface;
+#if defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+    // POM B2: the previous frame's relief at that pixel is not known (the identity target describes this frame).
+    previousVertex.relief = (PathTracePrimaryRelief)0;
+#endif
 
     // M5.4 C5: with replay compaction, a pixel whose forward or reverse shift traces a replay leaves this dispatch; the
     // replay dispatch recomputes it from the same inputs (exact).

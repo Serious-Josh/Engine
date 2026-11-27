@@ -1,3 +1,5 @@
+#include "PrimarySurfaceLift.hlsli"
+
 struct AOPayload
 {
     uint visible;
@@ -10,7 +12,7 @@ cbuffer AOConstants : register(b0)
     uint depthIndex;
     uint surfaceIndex;
     uint frameIndex;
-    uint padding0;
+    uint geometricNormalIndex;
 
     float maxDistance;
     float originBias;
@@ -122,8 +124,21 @@ void AORayGeneration()
 
     const float3 normal = normalize(surfaceNormal);
 
+    // A parallax pixel's depth is the relief's, under the mesh: its stored lift takes the origin back to the mesh
+    // surface along the geometric normal, or the mesh's own triangle would occlude every ray. 0 for every other pixel.
+    Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[geometricNormalIndex];
+    const float3 storedGeometricNormal = geometricNormalTexture.Load(int3(fullPixel, 0)).rgb;
+    const float surfaceLift = PrimarySurfaceStoredLift(fullPixel, fullResolution, depth, worldPosition.xyz,
+        storedGeometricNormal, inverseViewProjection);
+    float3 liftedPosition = worldPosition.xyz;
+
+    if(surfaceLift > 0.0f)
+    {
+        liftedPosition += normalize(storedGeometricNormal) * surfaceLift;
+    }
+
     RayDesc ray;
-    ray.Origin = worldPosition.xyz + normal * originBias;
+    ray.Origin = liftedPosition + normal * originBias;
     ray.Direction = SampleAOCosineHemisphere(normal, aoPixel, frameIndex);
     ray.TMin = rayTMin;
     ray.TMax = maxDistance;

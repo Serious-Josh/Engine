@@ -107,7 +107,7 @@ namespace
             {"material", request.materialIdentity}, {"path", material.resolvedPath.generic_string()},
             {"content", validation.Digest(material.resolvedPath)},
             // Bump whenever preview shaders, BRDFs, tone mapping, geometry or studio setup change.
-            {"renderVersion", "v2-full-normal-unit-sphere32x64-camera2.6,1.7,-3.2-fov.65-yaw0-pitch0-studio3-POM-AgX"},
+            {"renderVersion", "v4-full-normal-unit-sphere32x64-camera2.6,1.7,-3.2-fov.65-yaw0-pitch0-studio3-POM3-AgX-refexposure"},
             {"extent", 256}, {"format", "R8G8B8A8_UNORM-display-encoded"}, {"textures", nlohmann::json::array()}
         };
 
@@ -655,7 +655,10 @@ bool MaterialPreviewRenderer::RecordGeometryJob(const RecordingContext& context,
     commandList->DrawInstanced(3, 1, 0, 0);
 
     displayColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    m_toneMap.Execute(commandList, m_hdrColor, displayColor.GetRTV());
+    // The studio is lit at the reference exposure: no camera exposure state. The default exposureStateIndex (0) read
+    // descriptor 0 as the exposure state, which scaled every preview and thumbnail to black.
+    m_toneMap.Execute(commandList, m_hdrColor, displayColor.GetRTV(), nullptr, ToneMapDebugView::None, 0.0f, nullptr,
+        nullptr, Vector3{1.0f, 0.604f, 0.0f}, 2, 0, ToneMapOperator::Existing, ToneMapPass::NoCameraExposure);
     displayColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     return true;
 }

@@ -4,6 +4,7 @@
 #include "Scene/SceneEnvironmentResolution.h"
 #include "assets/AssetID.h"
 
+#include <atomic>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -119,7 +120,8 @@ namespace ProjectSceneMembership
         EffectiveSceneEnvironment environment;
     };
 
+    // Startup work (4.3): cancel, when given and set, stops the read before the next scene (a reader on another thread).
     bool ReadScenes(const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::vector<SceneInfo>& scenes,
-        std::vector<std::string>& problems);
+        std::vector<std::string>& problems, const std::atomic<bool>* cancel = nullptr);
     std::vector<std::string> ValidateProject(const std::vector<SceneInfo>& scenes);
 }

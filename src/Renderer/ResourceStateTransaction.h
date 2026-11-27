@@ -21,6 +21,12 @@ namespace ResourceStateTransaction
     // CommandContext: a recording of `commandList` (and its ray-tracing interface, the same object) begins, is submitted,
     // or is discarded unsubmitted. Begin discards a still-open earlier recording (its list is being reset).
     void BeginRecording(const void* commandList, const void* rayTracingCommandList);
+    // AIR async compute: a compute-queue list recorded beside the open frame recording and submitted with it (CommandContext::
+    // Execute), so its barriers commit or discard with the frame recording. Cleared by commit and discard.
+    void AttachRecordingList(const void* commandList);
+    // AIR async compute, readers in the frame (CommandContext::SplitForAsyncComputeReaders): the open recording continues on a second
+    // direct list. The first list stays part of the recording (its barriers commit or discard with it).
+    void SwitchRecordingList(const void* commandList, const void* rayTracingCommandList);
     void CommitRecording();
     void DiscardRecording();
 

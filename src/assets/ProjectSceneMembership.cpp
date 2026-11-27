@@ -632,12 +632,18 @@ bool SaveLocalAsNew(const ProjectPaths& paths, ProjectAssetRegistry& registry, c
 }
 
 bool ReadScenes(const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::vector<SceneInfo>& scenes,
-    std::vector<std::string>& problems)
+    std::vector<std::string>& problems, const std::atomic<bool>* cancel)
 {
     scenes.clear();
 
     for(const auto& record : registry.GetAssets(AssetType::Scene))
     {
+        if(cancel && cancel->load())
+        {
+            problems.push_back("The scene read was cancelled.");
+            break;
+        }
+
         try
         {
             const Read read = ReadScene(paths, registry, record.id);

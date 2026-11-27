@@ -45,7 +45,9 @@ struct AirPressure::Constants
     std::uint32_t predicateIndex = 0;
     // AIR P1/C1: each piece's gross right-hand-side magnitude (CSPrepare writes it, CSResidual reads it).
     std::uint32_t rhsGrossIndex = 0;
-    std::uint32_t constantsPadding[3] = {0, 0, 0};
+    // AIR solver restructure: the recovery gate's budgeted recovery cycles (AirPressureSolveSettings::budgetedRecoveryCycles).
+    std::uint32_t budgetedRecoveryCycles = 0;
+    std::uint32_t constantsPadding[2] = {0, 0};
 };
 
 namespace
@@ -869,23 +871,31 @@ bool AirPressure::RecordSolve(ID3D12GraphicsCommandList* commandList, Descriptor
         recorded = run("CSResidual", GroupShape::FineSlots);
         Constants gate = constants;
         gate.sweeps = settings.recoveryCycles;
+        gate.budgetedRecoveryCycles = settings.budgetedRecoveryCycles;
 
+        // AIR solver restructure (scope §2.6, option B): the gate arguments' transitions ride in the gate's and the slot's last UAV barrier
+        // (as T2c did for the label arguments) instead of separate ResourceBarrier calls.
         for(std::uint32_t step = 0; recorded && step <= settings.recoveryCycles; ++step)
         {
             gate.recoveryStep = step;
-            recorded = Dispatch(commandList, upload, m_pipelines.at("CSRecoveryGate"), gate, GroupShape::Single);
+            const bool last = step == settings.recoveryCycles;
+            recorded = Dispatch(commandList, upload, m_pipelines.at("CSRecoveryGate"), gate, GroupShape::Single, nullptr,
+                last ? nullptr : &m_gateArguments, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
 
-            if(!recorded || step == settings.recoveryCycles)
+            if(!recorded || last)
             {
                 break;
             }
 
-            m_gateArguments.Transition(commandList, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
             m_recoveryGated = true;
-            recorded = RecordCycle(commandList, upload, constants, settings) && run("CSResidual", GroupShape::FineSlots);
+            recorded = RecordCycle(commandList, upload, constants, settings) &&
+                Dispatch(commandList, upload, m_pipelines.at("CSResidual"), constants, GroupShape::FineSlots, nullptr, &m_gateArguments,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             m_recoveryGated = false;
-            m_gateArguments.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
+
+        // A recording that failed inside a slot leaves the arguments writable again for the next gate.
+        m_gateArguments.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         Mark(commandList, "recovery");
     }
@@ -897,6 +907,26 @@ bool AirPressure::RecordSolve(ID3D12GraphicsCommandList* commandList, Descriptor
     Mark(commandList, "closed gauge");
     m_lastSolve = m_recording;
     return recorded;
+}
+
+bool AirPressure::RecordRecoveryCounterCopy(ID3D12GraphicsCommandList* commandList, ID3D12Resource* destination, std::uint64_t offset)
+{
+    // TopologyRecoveryCycles and TopologyRecoveryFailures (AirPressure.hlsl), adjacent words; then TopologyRecoveryBeyondBudget.
+    constexpr std::uint64_t RecoveryCountersOffset = 28;
+    constexpr std::uint64_t RecoveryBeyondBudgetOffset = 180;
+
+    if(!m_allocated || m_topology.GetResource() == nullptr || destination == nullptr)
+    {
+        return false;
+    }
+
+    const D3D12_RESOURCE_STATES state = m_topology.GetResourceState();
+    m_topology.Transition(commandList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commandList->CopyBufferRegion(destination, offset, m_topology.GetResource(), RecoveryCountersOffset, 2 * sizeof(std::uint32_t));
+    commandList->CopyBufferRegion(destination, offset + 2 * sizeof(std::uint32_t), m_topology.GetResource(), RecoveryBeyondBudgetOffset,
+        sizeof(std::uint32_t));
+    m_topology.Transition(commandList, state == D3D12_RESOURCE_STATE_COPY_SOURCE ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : state);
+    return true;
 }
 
 bool AirPressure::RecordResidual(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, UploadBuffer& upload,

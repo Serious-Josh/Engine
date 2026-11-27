@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -169,10 +170,26 @@ struct EditorMistConstants
     std::uint32_t froxelMediumLateral = 0;
     // Raymarch dither experiment (diagnostic, temporary): PixelOffset's pattern (EditorMist.hlsl).
     std::uint32_t ditherMode = 0;
-    std::uint32_t padding[3] = {0, 0, 0};
+    // Fog step 1: the render volume's textures (UAVs for CSBuildRenderVolume, SRVs for the *Volume marches), its filter
+    // (EditorMist.hlsl's RenderVolumeManual, RenderVolumeHardware or RenderVolumeHybrid), the hybrid's near distance and the counting
+    // marches' counters.
+    std::uint32_t renderVolumeMistIndex = UINT32_MAX;
+    std::uint32_t renderVolumeVelocityIndex = UINT32_MAX;
+    std::uint32_t renderVolumeFlagsIndex = UINT32_MAX;
+    std::uint32_t renderVolumeFilter = 0;
+    float renderVolumeNearDistance = 0.0f;
+    std::uint32_t renderVolumeCounterIndex = UINT32_MAX;
+    // Step 1b: nonzero also takes labelled footprints (blocked voxels, no split cell) on the fast path (EditorMist.hlsl).
+    std::uint32_t renderVolumeExtended = 0;
+    // Fog step 2: the hybrid lights' near-Light mask volume and the camera distance the froxels reach (EditorMist.hlsl).
+    std::uint32_t froxelLightMaskIndex = UINT32_MAX;
+    float froxelLightFar = 0.0f;
+    // Fog step 2b: CSCountFogLights' output buffer (UAV).
+    std::uint32_t fogLightCountIndex = UINT32_MAX;
+    std::uint32_t fogLightPadding = 0;
 };
 
-static_assert(sizeof(EditorMistConstants) == 768);
+static_assert(sizeof(EditorMistConstants) == 800);
 static_assert(offsetof(EditorMistConstants, previousWorldToClip) == 512);
 
 // EditorMist.hlsl's froxelJitter values.
@@ -228,6 +245,62 @@ void UnorderedAccessBarrier(ID3D12GraphicsCommandList* commandList)
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = nullptr;
     commandList->ResourceBarrier(1, &barrier);
+}
+
+// Fog step 1: the harness's render volume overrides (ENGINE_MIST_RENDER_VOLUME 0 or 1, ENGINE_MIST_RENDER_VOLUME_FILTER 0 manual, 1
+// hardware or 2 hybrid, ENGINE_MIST_RENDER_VOLUME_NEAR metres; step 1b: ENGINE_MIST_RENDER_VOLUME_EXTENDED 0 or 1), read once; -1 (or a
+// negative distance) leaves the request's.
+struct RenderVolumeOverrides
+{
+    int enabled = -1;
+    int filter = -1;
+    float nearDistance = -1.0f;
+    int extended = -1;
+    // Fog step 2: ENGINE_MIST_FROXEL_LIGHTS (0 off or 1 on; unset: the request's, automatic by default) and ENGINE_MIST_FROXEL_LIGHTS_NEAR
+    // (metres).
+    int froxelLights = -1;
+    float froxelLightNear = -1.0f;
+};
+
+const RenderVolumeOverrides& EnvironmentRenderVolumeOverrides()
+{
+    static const RenderVolumeOverrides overrides = []
+    {
+        RenderVolumeOverrides result;
+
+        if(const char* value = std::getenv("ENGINE_MIST_RENDER_VOLUME"); value != nullptr && *value != '\0')
+        {
+            result.enabled = std::atoi(value) != 0 ? 1 : 0;
+        }
+
+        if(const char* value = std::getenv("ENGINE_MIST_RENDER_VOLUME_FILTER"); value != nullptr && *value != '\0')
+        {
+            result.filter = std::clamp(std::atoi(value), 0, 2);
+        }
+
+        if(const char* value = std::getenv("ENGINE_MIST_RENDER_VOLUME_NEAR"); value != nullptr && *value != '\0')
+        {
+            result.nearDistance = static_cast<float>(std::atof(value));
+        }
+
+        if(const char* value = std::getenv("ENGINE_MIST_RENDER_VOLUME_EXTENDED"); value != nullptr && *value != '\0')
+        {
+            result.extended = std::atoi(value) != 0 ? 1 : 0;
+        }
+
+        if(const char* value = std::getenv("ENGINE_MIST_FROXEL_LIGHTS"); value != nullptr && *value != '\0')
+        {
+            result.froxelLights = std::atoi(value) != 0 ? 1 : 0;
+        }
+
+        if(const char* value = std::getenv("ENGINE_MIST_FROXEL_LIGHTS_NEAR"); value != nullptr && *value != '\0')
+        {
+            result.froxelLightNear = static_cast<float>(std::atof(value));
+        }
+
+        return result;
+    }();
+    return overrides;
 }
 
 // What a compute pipeline binds besides its constants (b0).
@@ -825,6 +898,28 @@ void EditorMistPass::Shutdown()
     m_froxelIndirectBytes = 0;
     m_froxelHistory = FroxelHistory{};
 
+    for(FroxelTexture& texture : m_renderVolume)
+    {
+        ReleaseFroxelTexture(texture);
+    }
+
+    m_renderVolumeSize = {0, 0, 0};
+    m_renderVolumeBytes = 0;
+    m_renderVolumeCounters.Shutdown();
+
+    for(FroxelTexture& texture : m_hybridLights)
+    {
+        ReleaseFroxelTexture(texture);
+    }
+
+    m_hybridLightSize = {0, 0, 0};
+    m_hybridLightBytes = 0;
+    m_fogLightCountBuffer.Shutdown();
+    m_fogLightCountReadback.Reset();
+    m_fogLightCountSlots = {};
+    m_fogLightCount = -1;
+    m_automaticFroxelLights = false;
+
     m_width = 0;
     m_height = 0;
     m_bricks = 0;
@@ -858,6 +953,18 @@ void EditorMistPass::Shutdown()
     m_raymarchFilteredPipeline.Shutdown();
     m_atmosphereFilteredPipeline.Shutdown();
     m_boundedAtmosphereFilteredPipeline.Shutdown();
+    m_renderVolumeBuildPipeline.Shutdown();
+    m_raymarchVolumePipeline.Shutdown();
+    m_atmosphereVolumePipeline.Shutdown();
+    m_boundedAtmosphereVolumePipeline.Shutdown();
+    m_raymarchVolumeCountPipeline.Shutdown();
+    m_atmosphereVolumeCountPipeline.Shutdown();
+    m_boundedAtmosphereVolumeCountPipeline.Shutdown();
+    m_froxelHybridLightsPipeline.Shutdown();
+    m_raymarchVolumeLightsPipeline.Shutdown();
+    m_atmosphereVolumeLightsPipeline.Shutdown();
+    m_boundedAtmosphereVolumeLightsPipeline.Shutdown();
+    m_fogLightCountPipeline.Shutdown();
 }
 
 void EditorMistPass::RetireStorage(std::uint64_t fence)
@@ -892,9 +999,272 @@ void EditorMistPass::RetireStorage(std::uint64_t fence)
     }
 
     RetireFroxelTextures(fence);
+    RetireRenderVolume(fence);
+    RetireHybridLights(fence);
     m_width = 0;
     m_height = 0;
     m_bricks = 0;
+}
+
+// As the froxel textures: frames still in flight may read the render volume, so it waits for `fence`.
+void EditorMistPass::RetireRenderVolume(std::uint64_t fence)
+{
+    for(FroxelTexture& texture : m_renderVolume)
+    {
+        if(texture.resource != nullptr)
+        {
+            RetiredTexture retired;
+            retired.texture = std::move(texture);
+            retired.fence = fence;
+            m_retiredTextures.push_back(std::move(retired));
+        }
+
+        texture = FroxelTexture{};
+    }
+
+    m_renderVolumeSize = {0, 0, 0};
+    m_renderVolumeBytes = 0;
+}
+
+bool EditorMistPass::EnsureRenderVolumeTextures(const std::array<std::uint32_t, 3>& size, std::uint64_t lastSubmissionFence)
+{
+    if(m_renderVolume[0].resource != nullptr && size == m_renderVolumeSize)
+    {
+        return true;
+    }
+
+    RetireRenderVolume(lastSubmissionFence);
+    // Mist, velocity and sun visibility, flag and indirect fill (EditorMist.hlsl, CSBuildRenderVolume). fp32, so the manual filter
+    // reads exactly the field's values and its images are bit-identical to the march without the volume (fp16 halves the memory, costs
+    // about the same, and differs by its rounding: build/fog/RESULTS.md).
+    const DXGI_FORMAT formats[3] = {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+    std::uint64_t bytes = 0;
+
+    for(std::size_t index = 0; index < m_renderVolume.size(); ++index)
+    {
+        if(!CreateFroxelTexture(size, formats[index], m_renderVolume[index]))
+        {
+            // Never recorded into: released at once.
+            for(FroxelTexture& created : m_renderVolume)
+            {
+                ReleaseFroxelTexture(created);
+            }
+
+            return false;
+        }
+
+        D3D12_RESOURCE_DESC description = m_renderVolume[index].resource->GetDesc();
+        bytes += m_device->GetResourceAllocationInfo(0, 1, &description).SizeInBytes;
+    }
+
+    m_renderVolumeSize = size;
+    m_renderVolumeBytes = bytes;
+    return true;
+}
+
+// As the render volume: frames still in flight may read the hybrid light volumes, so they wait for `fence`.
+void EditorMistPass::RetireHybridLights(std::uint64_t fence)
+{
+    for(FroxelTexture& texture : m_hybridLights)
+    {
+        if(texture.resource != nullptr)
+        {
+            RetiredTexture retired;
+            retired.texture = std::move(texture);
+            retired.fence = fence;
+            m_retiredTextures.push_back(std::move(retired));
+        }
+
+        texture = FroxelTexture{};
+    }
+
+    m_hybridLightSize = {0, 0, 0};
+    m_hybridLightBytes = 0;
+}
+
+bool EditorMistPass::EnsureHybridLightTextures(const std::array<std::uint32_t, 3>& size)
+{
+    if(m_hybridLights[0].resource != nullptr && size == m_hybridLightSize)
+    {
+        return true;
+    }
+
+    // A new size: the old pair waits for the frames that may read it (the caller's frame records after this).
+    RetireHybridLights(m_lastSubmissionFenceForHybrid);
+    const DXGI_FORMAT formats[2] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32_UINT};
+    std::uint64_t bytes = 0;
+
+    for(std::size_t index = 0; index < m_hybridLights.size(); ++index)
+    {
+        if(!CreateFroxelTexture(size, formats[index], m_hybridLights[index]))
+        {
+            for(FroxelTexture& created : m_hybridLights)
+            {
+                ReleaseFroxelTexture(created);
+            }
+
+            return false;
+        }
+
+        D3D12_RESOURCE_DESC description = m_hybridLights[index].resource->GetDesc();
+        bytes += m_device->GetResourceAllocationInfo(0, 1, &description).SizeInBytes;
+    }
+
+    m_hybridLightSize = size;
+    m_hybridLightBytes = bytes;
+    return true;
+}
+
+bool EditorMistPass::EnsureFogLightCount()
+{
+    if(m_fogLightCountPipeline.GetRootSignature() != nullptr)
+    {
+        return true;
+    }
+
+    // As the other pipelines: a failure is not retried; the automatic choice then stays on the exact path.
+    if(m_fogLightCountFailed || m_shaderLibrary == nullptr)
+    {
+        return false;
+    }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::AirVolumetrics);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC description{};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = FogLightCountSlots * 256;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.SampleDesc.Count = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    m_fogLightCountFailed = !(m_fogLightCountBuffer.InitializeGPUWritable(m_device, 16) &&
+        m_fogLightCountBuffer.CreateRawUAV(m_device, *m_descriptorHeap) &&
+        SUCCEEDED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&m_fogLightCountReadback))) &&
+        MakeComputePipeline(m_device, *m_shaderLibrary, "CSCountFogLights", m_fogLightCountPipeline, {false, true, false, false}));
+
+    if(m_fogLightCountFailed)
+    {
+        Log::Warning("Mist froxel lights: the automatic choice's Light count could not be created; the exact per-Light path stays on.");
+    }
+
+    return !m_fogLightCountFailed;
+}
+
+// The counts whose frames the GPU has completed, oldest first; each updates the automatic choice with its hysteresis.
+void EditorMistPass::CollectFogLightCounts(std::uint64_t completedFence)
+{
+    while(m_fogLightCountRead != m_fogLightCountNext)
+    {
+        FogLightCountSlot& slot = m_fogLightCountSlots[m_fogLightCountRead % FogLightCountSlots];
+
+        if(!slot.pending || slot.fence > completedFence)
+        {
+            break;
+        }
+
+        const std::size_t offset = (m_fogLightCountRead % FogLightCountSlots) * 256;
+        const D3D12_RANGE range{offset, offset + 4};
+        void* mapped = nullptr;
+
+        if(SUCCEEDED(m_fogLightCountReadback->Map(0, &range, &mapped)))
+        {
+            std::uint32_t count = 0;
+            std::memcpy(&count, static_cast<const std::byte*>(mapped) + offset, 4);
+            const D3D12_RANGE unwritten{0, 0};
+            m_fogLightCountReadback->Unmap(0, &unwritten);
+            m_fogLightCount = count;
+
+            if(m_fogLightCount >= FroxelLightsOnCount)
+            {
+                m_automaticFroxelLights = true;
+            }
+            else if(m_fogLightCount <= FroxelLightsOffCount)
+            {
+                m_automaticFroxelLights = false;
+            }
+        }
+
+        slot.pending = false;
+        ++m_fogLightCountRead;
+    }
+}
+
+bool EditorMistPass::EnsureHybridLightPipelines()
+{
+    if(m_froxelHybridLightsPipeline.GetRootSignature() != nullptr)
+    {
+        return true;
+    }
+
+    if(m_hybridLightPipelinesFailed || m_shaderLibrary == nullptr)
+    {
+        return false;
+    }
+
+    // The marches bind CSRaymarch's set and the froxel sampler (s1); the light pass the Light table (b1). The light pass is created last,
+    // so its root signature means all four exist.
+    const ComputeBindings marchBindings{true, true, false, true};
+    m_hybridLightPipelinesFailed =
+        !MakeComputePipeline(m_device, *m_shaderLibrary, "CSRaymarchVolumeLights", m_raymarchVolumeLightsPipeline, marchBindings) ||
+        !MakeComputePipeline(m_device, *m_shaderLibrary, "CSRaymarchAtmosphereVolumeLights", m_atmosphereVolumeLightsPipeline, marchBindings) ||
+        !MakeComputePipeline(m_device, *m_shaderLibrary, "CSRaymarchAtmosphereBoundedVolumeLights", m_boundedAtmosphereVolumeLightsPipeline,
+            marchBindings) ||
+        !MakeComputePipeline(m_device, *m_shaderLibrary, "CSFroxelHybridLights", m_froxelHybridLightsPipeline, {false, true, false, false});
+
+    if(m_hybridLightPipelinesFailed)
+    {
+        Log::Warning("Mist froxel lights: their pipelines could not be created; the raymarch lights every sample as before.");
+    }
+
+    return !m_hybridLightPipelinesFailed;
+}
+
+bool EditorMistPass::EnsureRenderVolumePipelines(bool counting)
+{
+    if(m_renderVolumeBuildPipeline.GetRootSignature() == nullptr)
+    {
+        if(m_renderVolumePipelinesFailed || m_shaderLibrary == nullptr)
+        {
+            return false;
+        }
+
+        // The marches bind what CSRaymarch binds; the build reads only the constants. The build is created last, so its root signature
+        // means all four exist.
+        m_renderVolumePipelinesFailed =
+            !MakeComputePipeline(m_device, *m_shaderLibrary, "CSRaymarchVolume", m_raymarchVolumePipeline, {true, true, false}) ||
+            !MakeComputePipeline(m_device, *m_shaderLibrary, "CSRaymarchAtmosphereVolume", m_atmosphereVolumePipeline, {true, true, false}) ||
+            !MakeComputePipeline(m_device, *m_shaderLibrary, "CSRaymarchAtmosphereBoundedVolume", m_boundedAtmosphereVolumePipeline,
+                {true, true, false}) ||
+            !MakeComputePipeline(m_device, *m_shaderLibrary, "CSBuildRenderVolume", m_renderVolumeBuildPipeline);
+
+        if(m_renderVolumePipelinesFailed)
+        {
+            Log::Warning("Mist render volume: its pipelines could not be created; the raymarch reads the mist field directly.");
+            return false;
+        }
+    }
+
+    if(!counting || m_boundedAtmosphereVolumeCountPipeline.GetRootSignature() != nullptr)
+    {
+        return true;
+    }
+
+    if(m_renderVolumeCountPipelinesFailed)
+    {
+        return false;
+    }
+
+    m_renderVolumeCountPipelinesFailed =
+        !MakeComputePipeline(m_device, *m_shaderLibrary, "CSRaymarchVolumeCount", m_raymarchVolumeCountPipeline, {true, true, false}) ||
+        !MakeComputePipeline(m_device, *m_shaderLibrary, "CSRaymarchAtmosphereVolumeCount", m_atmosphereVolumeCountPipeline, {true, true, false}) ||
+        !MakeComputePipeline(m_device, *m_shaderLibrary, "CSRaymarchAtmosphereBoundedVolumeCount", m_boundedAtmosphereVolumeCountPipeline,
+            {true, true, false}) ||
+        !(m_renderVolumeCounters.GetResource() != nullptr || (m_renderVolumeCounters.InitializeGPUWritable(m_device, 32) &&
+            m_renderVolumeCounters.CreateRawSRV(m_device, *m_descriptorHeap) && m_renderVolumeCounters.CreateRawUAV(m_device, *m_descriptorHeap)));
+    return !m_renderVolumeCountPipelinesFailed;
 }
 
 void EditorMistPass::CollectRetired(std::uint64_t completedFence)
@@ -1820,6 +2190,106 @@ bool EditorMistPass::Execute(ID3D12GraphicsCommandList* commandList, DescriptorH
         }
     }
 
+    // Fog step 1: the render volume, for the marched mist on the Original Raymarch (the froxel paths have no *Volume kernels). The
+    // profiler's override, then the environment's, then the request.
+    const RenderVolumeOverrides& environmentOverrides = EnvironmentRenderVolumeOverrides();
+    const int volumeOverride = m_diagnosticRenderVolume >= 0 ? m_diagnosticRenderVolume : environmentOverrides.enabled;
+    const int filterOverride = m_diagnosticRenderVolumeFilter >= 0 ? m_diagnosticRenderVolumeFilter : environmentOverrides.filter;
+    const float nearOverride = m_diagnosticRenderVolumeNear >= 0.0f ? m_diagnosticRenderVolumeNear : environmentOverrides.nearDistance;
+    const bool volumeRequested = volumeOverride >= 0 ? volumeOverride != 0 : request.renderVolume;
+    const bool volumeCounting = m_diagnosticRenderVolumeCount;
+    const bool renderVolume = volumeRequested && mistActive && !froxels && EnsureRenderVolumePipelines(volumeCounting) &&
+        EnsureRenderVolumeTextures({field.dimensions[0], field.dimensions[1], field.dimensions[2]}, lastSubmissionFence);
+    m_renderVolumeUsed = renderVolume;
+
+    // A frame without it releases the textures (once the frames that may read them complete).
+    if(!renderVolume && m_renderVolume[0].resource != nullptr)
+    {
+        RetireRenderVolume(lastSubmissionFence);
+    }
+
+    if(renderVolume)
+    {
+        const std::uint32_t filter = filterOverride >= 0 ? static_cast<std::uint32_t>(filterOverride) :
+            static_cast<std::uint32_t>(request.renderVolumeFilter);
+        const float nearDistance = nearOverride >= 0.0f ? nearOverride : request.renderVolumeNearDistance;
+        constants.renderVolumeFilter = (std::min)(filter, 2u);
+        constants.renderVolumeNearDistance = std::isfinite(nearDistance) ? (std::max)(nearDistance, 0.0f) : 0.0f;
+        constants.renderVolumeCounterIndex = volumeCounting ? m_renderVolumeCounters.GetUAVDescriptorIndex() : UINT32_MAX;
+        const int extendedOverride = m_diagnosticRenderVolumeExtended >= 0 ? m_diagnosticRenderVolumeExtended : environmentOverrides.extended;
+        constants.renderVolumeExtended = (extendedOverride >= 0 ? extendedOverride != 0 : request.renderVolumeExtended) ? 1u : 0u;
+    }
+
+    // Fog step 2: the hybrid froxel lights, for a lit render-volume march (not the counting marches). The profiler's override (0 off, 1
+    // on, 2 automatic), then the environment's (0 off, 1 on), then the request. Step 2b: automatic follows the Light count read back from
+    // earlier frames (CollectFogLightCounts) and counts again this frame.
+    const int lightsOverride = m_diagnosticFroxelLights >= 0 ? m_diagnosticFroxelLights : environmentOverrides.froxelLights;
+    const AirMistFroxelLights lightsMode = lightsOverride == 0 ? AirMistFroxelLights::Off : (lightsOverride == 1 ? AirMistFroxelLights::On :
+        (lightsOverride == 2 ? AirMistFroxelLights::Automatic : request.froxelLights));
+    const bool lightsEligible = renderVolume && lit && !volumeCounting;
+    const bool countLights = lightsEligible && lightsMode == AirMistFroxelLights::Automatic && EnsureFogLightCount() &&
+        !m_fogLightCountSlots[m_fogLightCountNext % FogLightCountSlots].pending;
+    CollectFogLightCounts(completedFence);
+    const bool lightsRequested = lightsMode == AirMistFroxelLights::On || (lightsMode == AirMistFroxelLights::Automatic && m_automaticFroxelLights);
+    bool hybridLights = lightsRequested && lightsEligible && EnsureHybridLightPipelines();
+
+    if(hybridLights || countLights)
+    {
+        const std::uint32_t divisor = std::clamp(request.froxelLightDivisor, 1u, 64u);
+        const std::uint32_t slices = std::clamp(request.froxelLightSlices, 1u, 256u);
+        const std::array<std::uint32_t, 3> size{(width + divisor - 1) / divisor, (height + divisor - 1) / divisor, slices};
+
+        // Slices from the near distance to the window's farthest corner (the farthest mist sample) or, with haze, at least 256 m: the haze
+        // reaches beyond the window. Samples beyond the far distance light every Light per sample.
+        const double camera[3] = {cameraPosition.x, cameraPosition.y, cameraPosition.z};
+        double farthest = 0.0;
+
+        for(std::uint32_t corner = 0; corner < 8; ++corner)
+        {
+            double squared = 0.0;
+
+            for(std::size_t axis = 0; axis < 3; ++axis)
+            {
+                const std::int64_t cell = static_cast<std::int64_t>(field.minimum[axis]) + ((corner >> axis) & 1u ? field.dimensions[axis] : 0);
+                const double offset = static_cast<double>(cell) * field.cellSize - camera[axis];
+                squared += offset * offset;
+            }
+
+            farthest = (std::max)(farthest, std::sqrt(squared));
+        }
+
+        constexpr double NearDistance = 0.5;
+        const double farDistance = (std::max)(hazeActive ? (std::max)(farthest, 256.0) : farthest, NearDistance * 1.01);
+        const double logRange = std::log(farDistance / NearDistance);
+        m_lastSubmissionFenceForHybrid = lastSubmissionFence;
+        hybridLights = hybridLights && EnsureHybridLightTextures(size);
+        // Step 2b: the count's haze reach (CSCountFogLights) is the froxels' far distance, whether or not the hybrid runs this frame.
+        constants.froxelLightFar = static_cast<float>(farDistance);
+        constants.fogLightCountIndex = countLights ? m_fogLightCountBuffer.GetUAVDescriptorIndex() : UINT32_MAX;
+
+        if(hybridLights)
+        {
+            const float nearOverride = m_diagnosticFroxelLightNear >= 0.0f ? m_diagnosticFroxelLightNear : environmentOverrides.froxelLightNear;
+            const float nearRadius = nearOverride >= 0.0f ? nearOverride : request.froxelLightNearRadius;
+            constants.froxelSize[0] = size[0];
+            constants.froxelSize[1] = size[1];
+            constants.froxelSize[2] = size[2];
+            constants.froxelNear = static_cast<float>(NearDistance);
+            constants.froxelSlicesPerLog = static_cast<float>(static_cast<double>(slices) / logRange);
+            constants.froxelLogPerSlice = static_cast<float>(logRange / static_cast<double>(slices));
+            constants.froxelNearLightRadius = std::isfinite(nearRadius) ? (std::max)(nearRadius, 0.0f) : 0.0f;
+            constants.froxelLightFar = static_cast<float>(farDistance);
+        }
+    }
+
+    m_froxelLightsUsed = hybridLights;
+
+    // A frame without them releases the volumes (once the frames that may read them complete).
+    if(!hybridLights && m_hybridLights[0].resource != nullptr)
+    {
+        RetireHybridLights(lastSubmissionFence);
+    }
+
     if(froxelTexture)
     {
         froxelPrevious = &m_froxelTextures[m_froxelLatest];
@@ -1949,6 +2419,42 @@ bool EditorMistPass::Execute(ID3D12GraphicsCommandList* commandList, DescriptorH
         constants.froxelLocalLightIndex = m_froxelLocalLights.srv;
 
         if(localLightAddress == 0)
+        {
+            return false;
+        }
+    }
+
+    // Fog step 1: CSBuildRenderVolume reads the visibility (SRV, set above) and writes the textures' UAVs; the march reads their SRVs.
+    D3D12_GPU_VIRTUAL_ADDRESS renderVolumeAddress = 0;
+
+    if(renderVolume)
+    {
+        constants.renderVolumeMistIndex = m_renderVolume[0].uav;
+        constants.renderVolumeVelocityIndex = m_renderVolume[1].uav;
+        constants.renderVolumeFlagsIndex = m_renderVolume[2].uav;
+        renderVolumeAddress = upload.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        constants.renderVolumeMistIndex = m_renderVolume[0].srv;
+        constants.renderVolumeVelocityIndex = m_renderVolume[1].srv;
+        constants.renderVolumeFlagsIndex = m_renderVolume[2].srv;
+
+        if(renderVolumeAddress == 0)
+        {
+            return false;
+        }
+    }
+
+    // Fog step 2: CSFroxelHybridLights writes the far-light and mask volumes' UAVs; the march reads their SRVs.
+    D3D12_GPU_VIRTUAL_ADDRESS hybridLightAddress = 0;
+
+    if(hybridLights)
+    {
+        constants.froxelLocalLightIndex = m_hybridLights[0].uav;
+        constants.froxelLightMaskIndex = m_hybridLights[1].uav;
+        hybridLightAddress = upload.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        constants.froxelLocalLightIndex = m_hybridLights[0].srv;
+        constants.froxelLightMaskIndex = m_hybridLights[1].srv;
+
+        if(hybridLightAddress == 0)
         {
             return false;
         }
@@ -2140,6 +2646,83 @@ bool EditorMistPass::Execute(ID3D12GraphicsCommandList* commandList, DescriptorH
         TransitionFroxelTexture(commandList, m_froxelLocalLights, ShaderReadState);
     }
 
+    // Fog step 1: 1f. The render volume, one group per brick (those a sample can reach), after the visibility and the fill it copies.
+    // Inside the 4-to-1 interval; a profiler's own stamp (SetDiagnosticRenderVolumeTimestamp) marks its start.
+    if(renderVolume)
+    {
+        if(m_renderVolumeTimestamps != nullptr)
+        {
+            commandList->EndQuery(m_renderVolumeTimestamps, D3D12_QUERY_TYPE_TIMESTAMP, m_renderVolumeQuery);
+        }
+
+        for(FroxelTexture& texture : m_renderVolume)
+        {
+            TransitionFroxelTexture(commandList, texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+
+        if(volumeCounting)
+        {
+            m_renderVolumeCounters.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+
+        m_renderVolumeBuildPipeline.Bind(commandList);
+        commandList->SetComputeRootConstantBufferView(0, renderVolumeAddress);
+        commandList->Dispatch(brickCounts[0], brickCounts[1], brickCounts[2]);
+
+        for(FroxelTexture& texture : m_renderVolume)
+        {
+            TransitionFroxelTexture(commandList, texture, ShaderReadState);
+        }
+
+        // The counters' clear before the counting march's adds.
+        if(volumeCounting)
+        {
+            UnorderedAccessBarrier(commandList);
+        }
+    }
+
+    // Fog step 2b: 1g'. The Light count for the automatic choice, one group, copied into this frame's readback slot (read once the GPU passes
+    // the fence after the last submission, CollectFogLightCounts).
+    if(countLights)
+    {
+        m_fogLightCountBuffer.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_fogLightCountPipeline.Bind(commandList);
+        commandList->SetComputeRootConstantBufferView(0, writeAddress);
+        commandList->SetComputeRootConstantBufferView(1, lighting->lightTable);
+        commandList->Dispatch(1, 1, 1);
+        m_fogLightCountBuffer.Transition(commandList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        const std::size_t slotIndex = m_fogLightCountNext % FogLightCountSlots;
+        commandList->CopyBufferRegion(m_fogLightCountReadback.Get(), slotIndex * 256, m_fogLightCountBuffer.GetResource(), 0, 4);
+        m_fogLightCountSlots[slotIndex].fence = lastSubmissionFence + 1;
+        m_fogLightCountSlots[slotIndex].pending = true;
+        ++m_fogLightCountNext;
+    }
+
+    // Fog step 2: 1g. The hybrid lights, one thread per froxel (the Light table only), published to the march by their transitions.
+    // Inside the 4-to-1 interval; a profiler's render-volume stamp + 1 marks its start.
+    if(hybridLights)
+    {
+        if(m_renderVolumeTimestamps != nullptr)
+        {
+            commandList->EndQuery(m_renderVolumeTimestamps, D3D12_QUERY_TYPE_TIMESTAMP, m_renderVolumeQuery + 1);
+        }
+
+        for(FroxelTexture& texture : m_hybridLights)
+        {
+            TransitionFroxelTexture(commandList, texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+
+        m_froxelHybridLightsPipeline.Bind(commandList);
+        commandList->SetComputeRootConstantBufferView(0, hybridLightAddress);
+        commandList->SetComputeRootConstantBufferView(1, lighting->lightTable);
+        commandList->Dispatch((m_hybridLightSize[0] + 3) / 4, (m_hybridLightSize[1] + 3) / 4, (m_hybridLightSize[2] + 3) / 4);
+
+        for(FroxelTexture& texture : m_hybridLights)
+        {
+            TransitionFroxelTexture(commandList, texture, ShaderReadState);
+        }
+    }
+
     stamp(1);
 
     // 2. The raymarch, one thread per reduced pixel.
@@ -2154,6 +2737,26 @@ bool EditorMistPass::Execute(ID3D12GraphicsCommandList* commandList, DescriptorH
     if(atmosphere)
     {
         raymarch = constants.heightEnabled != 0 ? &m_boundedAtmospherePipeline : &m_atmospherePipeline;
+    }
+
+    // Fog step 1: the same march reading open footprints from the render volume (never with froxels).
+    if(renderVolume)
+    {
+        if(volumeCounting)
+        {
+            raymarch = !atmosphere ? &m_raymarchVolumeCountPipeline :
+                (constants.heightEnabled != 0 ? &m_boundedAtmosphereVolumeCountPipeline : &m_atmosphereVolumeCountPipeline);
+        }
+        else if(hybridLights)
+        {
+            raymarch = !atmosphere ? &m_raymarchVolumeLightsPipeline :
+                (constants.heightEnabled != 0 ? &m_boundedAtmosphereVolumeLightsPipeline : &m_atmosphereVolumeLightsPipeline);
+        }
+        else
+        {
+            raymarch = !atmosphere ? &m_raymarchVolumePipeline :
+                (constants.heightEnabled != 0 ? &m_boundedAtmosphereVolumePipeline : &m_atmosphereVolumePipeline);
+        }
     }
 
     // V1a diagnostics: the same march reading the froxel volume's sun visibility.

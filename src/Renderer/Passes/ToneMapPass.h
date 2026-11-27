@@ -65,6 +65,10 @@ enum class ToneMapOperator : unsigned int
 class ToneMapPass
 {
     public:
+    // exposureStateIndex for an image without a camera (the Editor's material and mesh previews): no exposure state is
+    // read and the image stays at the reference exposure. Descriptor 0 is not an exposure state.
+    static constexpr unsigned int NoCameraExposure = 0xFFFFFFFFu;
+
     bool Initialize(
       ID3D12Device* device,
       ShaderLibrary& shaderLibrary);

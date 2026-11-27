@@ -1003,6 +1003,7 @@ bool RayTracingSceneResources::BuildInstanceRecord(const RenderObject& renderObj
     record.uvOffset = uvOffset;
     record.tangentOffset = tangentOffset;
     record.indexed = renderObject.mesh->IsIndexed() ? 1u : 0u;
+    record.silhouetteEdgeBufferIndex = renderObject.mesh->GetSilhouetteEdgeDescriptorIndex();
     return true;
 }
 

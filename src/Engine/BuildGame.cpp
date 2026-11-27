@@ -874,11 +874,11 @@ void CompilePackagedShaders(const Request& request, BuildAssets& build, const Bu
     ShaderBootstrapStatistics statistics;
     auto shaderPayload = ShaderLibrary::CookBootstrap(request.shaderRoot, shaders, GetPackagedLibraryInventory(), &statistics);
     Log::Info(std::string("Packaged shaders (AIR ") + (air ? "included" : "not requested") + "): " + std::to_string(statistics.shaders) +
-        " graphics/compute and " +
+        " graphics/compute (" + std::to_string(statistics.shaderCacheHits) + " from the DXIL cache) and " +
         std::to_string(statistics.libraries) + " DXR libraries (" + std::to_string(statistics.optionalLibraries) +
         " optional RayQuery variants; " + std::to_string(statistics.libraryCacheHits) + " from the DXIL cache), " +
         std::to_string(statistics.bytes) + " bytes, largest record " + std::to_string(statistics.largestRecordBytes) +
-        " bytes, cooked in " + std::to_string(statistics.seconds) + " s.");
+        " bytes, cooked in " + std::to_string(statistics.seconds) + " s on " + std::to_string(statistics.threads) + " threads.");
     build.Append({PackagedBootstrap::ShaderID(), EngineAssetPak::Type::Shader, 1, std::move(shaderPayload)});
 
     // R1.5b (decision D5): with AIR, the mist's three noise volumes, unchanged, under their fixed IDs. A missing file refuses the build:

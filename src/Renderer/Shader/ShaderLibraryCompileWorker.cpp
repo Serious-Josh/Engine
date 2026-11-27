@@ -200,6 +200,9 @@ bool ShaderLibraryCompileWorker::IsCurrent(const ShaderLibraryCompileOutcome& ou
 
 void ShaderLibraryCompileWorker::Run()
 {
+    // Startup work (4.8): below normal priority, so a cold batch on several threads never takes CPU from the render thread.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
     // Created, used and released on this thread only; the owner's compilers are never shared with it.
     ShaderCompiler compiler;
     std::string compilerDiagnostics;

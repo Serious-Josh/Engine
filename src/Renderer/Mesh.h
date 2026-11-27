@@ -98,6 +98,11 @@ class Mesh
     unsigned int GetVertexBufferDescriptorIndex() const;
     unsigned int GetIndexBufferDescriptorIndex() const;
 
+    // Silhouette parallax occlusion mapping: a raw buffer of one uint per triangle whose bits 0, 1 and 2 mark the edges
+    // (vertex 0 to 1, 1 to 2, 2 to 0) at which the surface ends or turns sharply, so the relief may cut the outline
+    // there (SurfaceDetailSilhouette.hlsli). UINT_MAX for a mesh with no such edge, without indices or GPU-written.
+    unsigned int GetSilhouetteEdgeDescriptorIndex() const;
+
     unsigned int GetVertexBufferUAVDescriptorIndex() const;
     unsigned int GetIndexBufferUAVDescriptorIndex() const;
 
@@ -142,6 +147,7 @@ class Mesh
 
     Buffer m_vertexBuffer;
     Buffer m_indexBuffer;
+    Buffer m_silhouetteEdges;
 
     VertexLayout m_layout;
 

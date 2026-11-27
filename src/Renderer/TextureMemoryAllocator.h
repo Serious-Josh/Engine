@@ -184,6 +184,13 @@ namespace TextureMemoryAllocator
     // activation was in a discarded recording.
     void BeginFrameRecording(ID3D12GraphicsCommandList* commandList);
     void EndFrameRecording();
+    // AIR async compute (CommandContext::SplitForAsyncComputeReaders): the open frame recording continues on a second list; activations
+    // from now on are recorded there. Nothing pending is activated again.
+    void SwitchFrameRecordingList(ID3D12GraphicsCommandList* commandList);
+    // AIR async compute: how many activations the allocator has recorded on frame recordings so far (any thread). A change across
+    // a span of the frame recording means a resource created in that span was activated (and, for a buffer, zero-filled) on the
+    // frame list there, so work on another queue that uses it must not start before the frame list.
+    std::uint64_t GetFrameRecordingActivationCount();
 
     // While one is alive on the creating thread, its owner records RecordActivation before first use, so more of what that
     // thread creates is placed: render-target, depth and unordered-access textures (they need DiscardResource), textures

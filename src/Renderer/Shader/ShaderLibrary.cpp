@@ -3,8 +3,14 @@
 #include "Debug/TransitionTiming.h"
 #include "Core/Log.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <mutex>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
+#include <windows.h>
 #include <cstring>
 #include <array>
 #include <optional>
@@ -195,6 +201,12 @@ namespace
     void Put(std::vector<std::byte>& out, std::uint32_t value) { for(int i=0;i<4;++i) out.push_back(std::byte(value>>(8*i))); }
 }
 
+// Startup work (4.4): the cook compiles its inventory on a thread pool, each thread with its own DXC and its own
+// production-arguments scope (thread-local), and every entry (graphics and compute shaders too, not only the DXR libraries)
+// through the persistent DXIL cache, whose key holds the exact arguments, so an unchanged shader is a cache read. The
+// bootstrap is assembled afterwards in key order, as before, so its bytes do not depend on the thread count.
+// ENGINE_COOK_THREADS (1-32) overrides the count: half the hardware threads, at most 16, at most one per 1 GiB of free
+// physical memory.
 std::vector<std::byte> ShaderLibrary::CookBootstrap(
     const std::filesystem::path& root,
     std::span<const PackagedShaderEntry> shaders,
@@ -202,14 +214,8 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(
     ShaderBootstrapStatistics* statistics)
 {
     const auto started = std::chrono::steady_clock::now();
-    ShaderCompiler compiler;
-    if(!compiler.Initialize()) throw std::runtime_error("Cannot initialize offline DXC.");
-    struct Cleanup { ShaderCompiler& c; ~Cleanup(){c.Shutdown();} } cleanup{compiler};
     std::map<std::string,std::vector<char>> entries;
     ShaderBootstrapStatistics cooked;
-    // Cooked-game port: the production arguments, whatever development switches the cooking process was started with
-    // (the ReSTIRPT/ tree's ENGINE_RESTIR_PT_* compile switches), so a game's DXIL is the same on every machine.
-    const ShaderCompiler::ProductionArgumentsScope productionArguments;
 
     // NVIDIA SHARC compiles only with its headers deployed beside the shaders (ENGINE_SHARC_ROOT). Without them its
     // entries are left out (SHARC itself and ReSTIR PT's SHARC twins), and a packaged game reports SHARC unavailable
@@ -221,9 +227,21 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(
         Log::Info("NVIDIA SHARC headers are not deployed; SHARC is left out of the packaged shader bootstrap.");
     }
 
-    // The arguments Load uses at runtime: the source under the shader root, its own directory as the include path.
-    for(const PackagedShaderEntry& shader : shaders)
+    // One work item per entry the cook keeps: a shader (index into shaders) or a library (index into libraries).
+    struct CookItem
     {
+        bool library = false;
+        std::size_t index = 0;
+        std::string key;
+        std::vector<char> bytecode;
+        bool cacheHit = false;
+    };
+
+    std::vector<CookItem> items;
+
+    for(std::size_t index = 0; index < shaders.size(); ++index)
+    {
+        const PackagedShaderEntry& shader = shaders[index];
         const bool sharcEntry = shader.feature == PackagedShaderFeature::Sharc ||
             shader.feature == PackagedShaderFeature::ReSTIRPTSharc;
 
@@ -232,71 +250,180 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(
             continue;
         }
 
-        const auto path = (root / shader.path).wstring();
-        const auto entryPoint = std::filesystem::path(shader.entryPoint).wstring();
-        // The shader root, so a ShaderVariantTable entry (no file; e.g. PsrInPlaceReplaceK2.hlsl) resolves to its generated
-        // text as at runtime. Uncached, as before.
-        const auto shaderRoot = root.wstring();
-        ShaderCompileResult result;
-
-        if(!compiler.Compile({path.c_str(), entryPoint.c_str(), shader.stage, shaderRoot.c_str(), false}, result))
-        {
-            throw std::runtime_error(std::string("Offline shader compilation failed: ") + shader.path + ":" +
-                shader.entryPoint + " (" + PackagedShaderFeatureName(shader.feature) + ")");
-        }
-
-        const std::string key = std::string(shader.path) + ":" + shader.entryPoint + ":" +
-            std::to_string(static_cast<int>(shader.stage));
-
-        if(!entries.emplace(key, std::move(result.bytecode)).second)
-        {
-            throw std::runtime_error("Duplicate packaged shader inventory entry: " + key);
-        }
-
-        ++cooked.shaders;
+        items.push_back({false, index, std::string(shader.path) + ":" + shader.entryPoint + ":" +
+            std::to_string(static_cast<int>(shader.stage)), {}, false});
     }
 
-    // The arguments CompileLibrary uses at runtime: the shader root as the second include directory (variant
-    // subdirectories resolve the RTXDI SDK's angled includes through it) and the persistent DXIL cache.
-    for(const PackagedLibraryEntry& library : libraries)
+    for(std::size_t index = 0; index < libraries.size(); ++index)
     {
+        const PackagedLibraryEntry& library = libraries[index];
+
         if(!sharcHeaders && ShaderCompiler::UsesNative16BitTypes(library.path))
         {
             continue;
         }
 
-        const auto path = (root / library.path).wstring();
-        const auto includeDirectory = root.wstring();
-        ShaderLibraryCompileDescription description{};
-        description.path = path.c_str();
-        description.profile = ShaderCompiler::GetLibraryProfile(library.path);
-        description.includeDirectory = includeDirectory.c_str();
-        description.usePersistentCache = true;
-        ShaderLibraryCompileResult result;
-
         // Packaged games use SM 6.6: DXR libraries, and (RayQuery 2M E3) the cs_6_6 direct-lighting compute shaders.
-        if(description.profile == ShaderLibraryProfile::Library69)
+        if(ShaderCompiler::GetLibraryProfile(library.path) == ShaderLibraryProfile::Library69)
         {
             throw std::runtime_error("Packaged games use SM 6.6 DXR libraries only: " + library.path.generic_string());
         }
 
-        if(!compiler.CompileLibrary(description, result))
-        {
-            throw std::runtime_error("Offline DXR compilation failed: " + library.path.generic_string() + " (" +
-                PackagedShaderFeatureName(library.feature) + ")");
-        }
-
-        const std::string key = library.path.generic_string() + ":library";
-        cooked.libraryCacheHits += result.cacheStatus == ShaderLibraryCompileResult::CacheStatus::Hit ? 1u : 0u;
-
-        if(!entries.emplace(key, std::move(result.bytecode)).second)
-        {
-            throw std::runtime_error("Duplicate packaged library inventory entry: " + key);
-        }
-
-        ++cooked.libraries;
-        cooked.optionalLibraries += library.optional ? 1u : 0u;
+        items.push_back({true, index, library.path.generic_string() + ":library", {}, false});
     }
+
+    // The libraries are the long compiles (tens of seconds each when cold); started first so the pool ends sooner.
+    std::stable_partition(items.begin(), items.end(), [](const CookItem& item) { return item.library; });
+
+    unsigned int threadCount = std::clamp((std::max)(std::thread::hardware_concurrency(), 1u) / 2u, 1u, 16u);
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+
+    if(GlobalMemoryStatusEx(&memory))
+    {
+        threadCount = static_cast<unsigned int>(std::clamp<std::uint64_t>(memory.ullAvailPhys >> 30, 1u, threadCount));
+    }
+
+    if(const char* value = std::getenv("ENGINE_COOK_THREADS"))
+    {
+        const int requested = std::atoi(value);
+
+        if(requested >= 1 && requested <= 32)
+        {
+            threadCount = static_cast<unsigned int>(requested);
+        }
+    }
+
+    threadCount = (std::min)(threadCount, static_cast<unsigned int>((std::max)(items.size(), std::size_t{1})));
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::mutex failureMutex;
+    std::string failure;
+    const std::wstring shaderRoot = root.wstring();
+
+    const auto cook = [&]()
+    {
+        try
+        {
+            ShaderCompiler compiler;
+
+            if(!compiler.Initialize())
+            {
+                throw std::runtime_error("Cannot initialize offline DXC.");
+            }
+
+            struct Cleanup { ShaderCompiler& c; ~Cleanup(){c.Shutdown();} } cleanup{compiler};
+            // Cooked-game port: the production arguments, whatever development switches the cooking process was started
+            // with (the ReSTIRPT/ tree's ENGINE_RESTIR_PT_* compile switches), so a game's DXIL is the same on every machine.
+            const ShaderCompiler::ProductionArgumentsScope productionArguments;
+
+            for(std::size_t slot = next++; slot < items.size() && !failed; slot = next++)
+            {
+                CookItem& item = items[slot];
+
+                if(!item.library)
+                {
+                    // The arguments Load uses at runtime: the source under the shader root, its own directory as the include
+                    // path; the shader root, so a ShaderVariantTable entry (no file; e.g. PsrInPlaceReplaceK2.hlsl) resolves
+                    // to its generated text as at runtime.
+                    const PackagedShaderEntry& shader = shaders[item.index];
+                    const auto path = (root / shader.path).wstring();
+                    const auto entryPoint = std::filesystem::path(shader.entryPoint).wstring();
+                    ShaderCompileResult result;
+
+                    if(!compiler.Compile({path.c_str(), entryPoint.c_str(), shader.stage, shaderRoot.c_str(), true}, result))
+                    {
+                        throw std::runtime_error(std::string("Offline shader compilation failed: ") + shader.path + ":" +
+                            shader.entryPoint + " (" + PackagedShaderFeatureName(shader.feature) + ")");
+                    }
+
+                    item.bytecode = std::move(result.bytecode);
+                    item.cacheHit = result.cacheHit;
+                    continue;
+                }
+
+                // The arguments CompileLibrary uses at runtime: the shader root as the second include directory (variant
+                // subdirectories resolve the RTXDI SDK's angled includes through it) and the persistent DXIL cache.
+                const PackagedLibraryEntry& library = libraries[item.index];
+                const auto path = (root / library.path).wstring();
+                ShaderLibraryCompileDescription description{};
+                description.path = path.c_str();
+                description.profile = ShaderCompiler::GetLibraryProfile(library.path);
+                description.includeDirectory = shaderRoot.c_str();
+                description.usePersistentCache = true;
+                ShaderLibraryCompileResult result;
+
+                if(!compiler.CompileLibrary(description, result))
+                {
+                    throw std::runtime_error("Offline DXR compilation failed: " + library.path.generic_string() + " (" +
+                        PackagedShaderFeatureName(library.feature) + ")");
+                }
+
+                item.bytecode = std::move(result.bytecode);
+                item.cacheHit = result.cacheStatus == ShaderLibraryCompileResult::CacheStatus::Hit;
+            }
+        }
+        catch(const std::exception& exception)
+        {
+            const std::lock_guard lock(failureMutex);
+
+            if(failure.empty())
+            {
+                failure = exception.what();
+            }
+
+            failed = true;
+        }
+    };
+
+    std::vector<std::thread> threads;
+
+    for(unsigned int thread = 1; thread < threadCount; ++thread)
+    {
+        try
+        {
+            threads.emplace_back(cook);
+        }
+        catch(const std::system_error&)
+        {
+            break;
+        }
+    }
+
+    cook();
+
+    for(std::thread& thread : threads)
+    {
+        thread.join();
+    }
+
+    if(failed)
+    {
+        throw std::runtime_error(failure);
+    }
+
+    for(CookItem& item : items)
+    {
+        if(!entries.emplace(item.key, std::move(item.bytecode)).second)
+        {
+            throw std::runtime_error(std::string("Duplicate packaged ") + (item.library ? "library" : "shader") +
+                " inventory entry: " + item.key);
+        }
+
+        if(item.library)
+        {
+            ++cooked.libraries;
+            cooked.libraryCacheHits += item.cacheHit ? 1u : 0u;
+            cooked.optionalLibraries += libraries[item.index].optional ? 1u : 0u;
+        }
+        else
+        {
+            ++cooked.shaders;
+            cooked.shaderCacheHits += item.cacheHit ? 1u : 0u;
+        }
+    }
+
+    cooked.threads = threadCount;
 
     // The limits InitializePackaged admits; a cook that exceeds them fails instead of omitting anything.
     if(entries.size() > MaximumBootstrapRecords)

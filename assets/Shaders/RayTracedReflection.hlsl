@@ -1,4 +1,5 @@
 #include "MaterialLighting.hlsli"
+#include "PrimarySurfaceLift.hlsli"
 
 // Raw metadata for the actual MIS-selected stochastic ray, not a reconstructed
 // or in-lobe specular tracking distance. Geometry hits store RayTCurrent() > 0.
@@ -1465,9 +1466,14 @@ void RayGeneration()
     float3 geometricNormal = normalize(geometricNormalData.rgb);
     primaryMaterial.metallic = saturate(geometricNormalData.a);
 
+    // A parallax pixel's depth is the relief's, under the mesh: its stored lift takes the origin back to the mesh
+    // surface, or the reflection would be the mesh's own triangle. 0 for every other pixel.
+    float surfaceLift = PrimarySurfaceStoredLift(pixelIndex, dimensions, depth, worldPosition.xyz,
+        geometricNormalData.rgb, reflectionConstants.inverseViewProjection);
+
     ray.Origin =
         worldPosition.xyz +
-        geometricNormal * 0.001f;
+        geometricNormal * (0.001f + surfaceLift);
 
     ray.Direction =
         reflectionDirection;

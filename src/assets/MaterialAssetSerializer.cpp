@@ -387,6 +387,12 @@ namespace
         staged.aoDiffuse = ReadFiniteFloat(document, "pathTracedAODiffuse");
         staged.aoSpecularWeight = ReadFiniteFloat(document, "pathTracedAOSpecularWeight");
 
+        // Added after schema 2 shipped: a material saved before it keeps the default (on).
+        if(document.contains("parallaxSilhouette"))
+        {
+            staged.parallaxSilhouette = document.at("parallaxSilhouette").get<bool>();
+        }
+
         ReadSharedFields(document, staged);
     }
 }
@@ -435,6 +441,7 @@ nlohmann::json MaterialAssetSerializer::Serialize(
         { "surfaceDetailMode", DetailModeName(material.surfaceDetailMode) },
         { "heightScale", material.heightScale },
         { "heightBias", material.heightBias },
+        { "parallaxSilhouette", material.parallaxSilhouette },
         { "preferARM", material.preferARM },
         { "textures", {
             { "baseColor", material.baseColorTexture },

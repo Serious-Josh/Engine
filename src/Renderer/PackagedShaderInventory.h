@@ -30,8 +30,9 @@ enum class PackagedShaderFeature
     // Cooked-game port: DLSS Ray Reconstruction's Engine-side input preparation (its guide buffers). Its NGX feature is
     // the nvngx_dlssd runtime library Build Game deploys.
     RayReconstruction,
-    // Cooked-game port: ReSTIR PT Enhanced's production kernels, base and OpenPBR layered tiers. Its test-only kernels
-    // (diagnostics, the visibility bench) and off-by-default ones (temporal reuse, the duplication map) are never cooked.
+    // Cooked-game port: ReSTIR PT Enhanced's production kernels: the base, OpenPBR layered and (POM B2) parallax tiers.
+    // Its test-only kernels (diagnostics, the visibility bench) and off-by-default ones (temporal reuse, the duplication
+    // map) are never cooked.
     ReSTIRPT,
     // The SHARC twins of those kernels (the SHARC radiance cache at x3). Left out with SHARC when its headers are not
     // deployed; ReSTIR PT then runs without the cache.

@@ -1,5 +1,6 @@
 #include "ComputePipeline.h"
 #include "Debug/TransitionTiming.h"
+#include "Renderer/PipelineStateCache.h"
 
 bool ComputePipeline::Initialize(
     ID3D12Device* device,
@@ -99,8 +100,6 @@ bool ComputePipeline::Initialize(
     result = device->CreateRootSignature(0, rootSignatureBlob->GetBufferPointer(), rootSignatureBlob->GetBufferSize(),
                                          IID_PPV_ARGS(&m_rootSignature));
 
-    rootSignatureBlob->Release();
-
     if (rootSignatureError)
     {
         rootSignatureError->Release();
@@ -108,6 +107,7 @@ bool ComputePipeline::Initialize(
 
     if (FAILED(result))
     {
+        rootSignatureBlob->Release();
         return false;
     }
 
@@ -118,8 +118,25 @@ bool ComputePipeline::Initialize(
     pipelineDescription.CS.pShaderBytecode = description.computeShader->GetByteCode();
     pipelineDescription.CS.BytecodeLength = description.computeShader->GetBytecodeSize();
 
-    TransitionTiming::Scope er1Scope("CreateComputePipelineState", 0.1, TransitionTiming::TransitionsAndStartup);
-    result = device->CreateComputePipelineState(&pipelineDescription, IID_PPV_ARGS(&m_pipelineState));
+    {
+        TransitionTiming::Scope er1Scope("CreateComputePipelineState", 0.1, TransitionTiming::TransitionsAndStartup);
+        m_createdFromCache = false;
+
+        // Layered prep (F3): the serialized root signature is part of the persistent cache's key.
+        if (description.persistentCache)
+        {
+            PipelineStateCache::Outcome outcome{};
+            result = PipelineStateCache::CreateComputePipelineState(device, pipelineDescription,
+                rootSignatureBlob->GetBufferPointer(), rootSignatureBlob->GetBufferSize(), &m_pipelineState, &outcome);
+            m_createdFromCache = outcome.hit;
+        }
+        else
+        {
+            result = device->CreateComputePipelineState(&pipelineDescription, IID_PPV_ARGS(&m_pipelineState));
+        }
+    }
+
+    rootSignatureBlob->Release();
 
     if (FAILED(result))
     {

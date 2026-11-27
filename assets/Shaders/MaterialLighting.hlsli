@@ -32,6 +32,9 @@ static const uint GPU_MATERIAL_COAT_FOLLOWS_BASE_NORMAL = 16u;
 // aoDiffuse or aoSpecularWeight is non-zero: the path tracer applies the material AO (Engine extension, see the
 // OpenPBR report §9.2).
 static const uint GPU_MATERIAL_PATH_TRACED_AO = 32u;
+// Silhouette parallax occlusion mapping: the relief may cut the mesh's outline at its silhouette edges
+// (SurfaceDetailSilhouette.hlsli).
+static const uint GPU_MATERIAL_PARALLAX_SILHOUETTE = 64u;
 
 // One material's OpenPBR Surface parameters (Renderer/ShaderData.h has the C++ twin; 192 bytes in 16-byte rows). The
 // authored parameters keep their OpenPBR meaning; dielectricF0, coatF0, coatInternalReflection and lobeFlags are

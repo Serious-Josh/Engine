@@ -26,6 +26,13 @@ uint PathTracePrimaryTangent(uint2 pixel, float3 origin, float3 position, uint m
 static bool g_pathTracePrimaryPreviousFrame = false;
 #include "PathTracePrimarySurface.hlsli"
 #include "RayTracingInstanceData.hlsli"
+#if defined(PATH_TRACE_RESTIR_PT_LIBRARY) && defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+// POM B2: the relief's own shadow on rays that leave a parallax occlusion mapping pixel's raster primary (the shell
+// march).
+#include "SurfaceDetail.hlsli"
+// POM D2a: the same silhouette test at path-tracer hits (PathTraceClosestHitBody.hlsli).
+#include "SurfaceDetailSilhouette.hlsli"
+#endif
 // PT.2B: who estimates the HDRI at the ReSTIR DI vertex; read by the ReSTIR DI direct pass and by every split indirect pass.
 #include "RtxdiEnvironmentConfig.hlsli"
 
@@ -1579,12 +1586,37 @@ struct PathTracePsrHit
 };
 #endif
 
+#if defined(PATH_TRACE_RESTIR_PT_LIBRARY) && defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+// POM B2: a parallax occlusion mapping pixel's point on its relief, which lies below the mesh that is in the
+// acceleration structure, so no traced ray sees the relief around it. Rays leaving the raster primary consult it first
+// (RestirPtPrimaryReliefBlocks). Zero (a zero height scale) where the pixel has no relief to check.
+struct PathTracePrimaryRelief
+{
+    SurfaceDetailHeightField field;
+    float2 uv;
+    // At or below 0, the mesh surface, along the geometric normal.
+    float height;
+    // The pixel's size in UV, for the height mip.
+    float uvFootprint;
+    // The UV crossed per unit of height gained for a sideways travel W: (dot(axisU, W), dot(axisV, W)).
+    float3 axisU;
+    float3 axisV;
+};
+
+// Loads the relief of a decoded pixel (RestirPtInitialBody.hlsli) from the triangle the identity target names for this
+// frame.
+PathTracePrimaryRelief RestirPtLoadPrimaryRelief(uint2 pixel, int state, float3 geometricNormal);
+#endif
+
 struct PathTraceRasterFirstVertex
 {
     int state;
     float3 position;
     PathTraceSurface surface;
     float3 backgroundDirection;
+#if defined(PATH_TRACE_RESTIR_PT_LIBRARY) && defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+    PathTracePrimaryRelief relief;
+#endif
 #ifdef PATH_TRACE_PSR_LIBRARY
     // PSR.1a: PATH_TRACE_PSR_* of this pixel's record. PSR.1a-P: the replaced hit itself is read at vertex 1
     // (PathTracePsrLoadHit), so only this word stays live through the sample loop.
@@ -1652,6 +1684,9 @@ PathTraceRasterFirstVertex PathTraceDecodeRasterFirstVertex(uint2 pixel)
     PathTraceRasterFirstVertex firstVertex;
     firstVertex.state = PathTraceLoadRasterPrimaryVertex(pixel, firstVertex.position, firstVertex.surface,
         firstVertex.backgroundDirection);
+#if defined(PATH_TRACE_RESTIR_PT_LIBRARY) && defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+    firstVertex.relief = RestirPtLoadPrimaryRelief(pixel, firstVertex.state, firstVertex.surface.geometricNormal);
+#endif
 #ifdef PATH_TRACE_PSR_LIBRARY
     firstVertex.psrState = 0u;
     firstVertex.psrPixel = pixel;
@@ -1819,6 +1854,10 @@ void PathTraceResolveEffectivePrimary(uint2 pixel, inout PathTraceRasterFirstVer
     firstVertex.state = 1;
     firstVertex.position = mirror.vertex.position;
     firstVertex.surface = mirror.vertex.surface;
+#if defined(PATH_TRACE_RESTIR_PT_LIBRARY) && defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+    // The replacement is the mirror's reflection, not the pixel's own surface.
+    firstVertex.relief = (PathTracePrimaryRelief)0;
+#endif
     firstVertex.psrState = PATH_TRACE_PSR_SURFACE;
     firstVertex.psrPlanePoint = mirror.mirrorPoint;
 #if PATH_TRACE_PSR_CHAIN >= 2

@@ -512,6 +512,12 @@ namespace
     {
         const std::string name = path.filename().string();
 
+        // A twin has no twin of its own (startup work 4.6: a RayQuery-only slot is built from it).
+        if(RayQueryTwinOf(path))
+        {
+            return std::nullopt;
+        }
+
         // RayQuery 2M E3: the compute direct pass already traces inline RayQuery; it has no twin.
         if(!path.empty() && *path.begin() == "DirectLighting")
         {
@@ -622,6 +628,202 @@ namespace
     }
 }
 
+void PathTraceReferencePass::SelectRayQueryOnly(const ShaderLibrary& shaderLibrary)
+{
+    const std::filesystem::path reference = ReferenceLibraryPath(m_libraryVariant);
+    m_rayQueryOnly = shaderLibrary.IsPackaged() && shaderLibrary.HasPackagedLibrary(std::filesystem::path("GI6") / reference) &&
+        !shaderLibrary.HasPackagedLibrary(reference);
+}
+
+void PathTraceReferencePass::SetRayQueryFirst(bool enabled, const ShaderLibrary& shaderLibrary)
+{
+    if(!shaderLibrary.IsPackaged())
+    {
+        m_rayQueryOnly = enabled;
+    }
+}
+
+bool PathTraceReferencePass::AbandonRayQueryFirst()
+{
+    if(!m_rayQueryOnly)
+    {
+        return false;
+    }
+
+    m_rayQueryOnly = false;
+    return true;
+}
+
+bool PathTraceReferencePass::IsRayQueryTwinLibrary(const std::filesystem::path& path)
+{
+    return RayQueryTwinOf(path);
+}
+
+void PathTraceReferencePass::ForgetRayQuerySlot(RayTracingPipeline& slot)
+{
+    if(const auto fallback = m_traceRayPipelines.find(&slot); fallback != m_traceRayPipelines.end())
+    {
+        if(fallback->second)
+        {
+            fallback->second->Shutdown();
+        }
+
+        m_traceRayPipelines.erase(fallback);
+    }
+
+    m_rayQuerySlots.erase(&slot);
+}
+
+ShaderLibraryPreparation PathTraceReferencePass::PrepareTraceRayFallbacks(GraphicsDevice& device,
+    ShaderLibrary& shaderLibrary, ShaderLibraryCompileWorker* worker, RayTracingPipelineWorker* pipelineWorker)
+{
+    ShaderLibraryPreparation combined{};
+    combined.state = ShaderLibraryPreparationState::Ready;
+
+    if(m_traceRayFallbacksReady || m_traceRayFallbacksFailed || shaderLibrary.IsPackaged() || !worker)
+    {
+        combined.state = m_traceRayFallbacksFailed || shaderLibrary.IsPackaged() || !worker ?
+            ShaderLibraryPreparationState::Failed : ShaderLibraryPreparationState::Ready;
+        return combined;
+    }
+
+    const auto pending = [&](ShaderLibraryPreparationState state)
+    {
+        if(combined.state == ShaderLibraryPreparationState::Ready)
+        {
+            combined.state = state;
+        }
+    };
+    const auto fail = [&](const std::string& why)
+    {
+        m_traceRayFallbacksFailed = true;
+        combined.state = ShaderLibraryPreparationState::Failed;
+        combined.diagnostic = why;
+        Log::Error("TraceRay visibility fallback unavailable; RayQuery keeps rendering: " + why);
+    };
+    ID3D12Device5* const rayTracingDevice = device.GetRayTracingDevice();
+
+    for(const auto& [slot, description] : m_rayQuerySlots)
+    {
+        if(m_traceRayPipelines[slot])
+        {
+            continue;
+        }
+
+        const ShaderLibraryPreparation library = PrepareLibrary(shaderLibrary, *worker, description.shaderPath);
+
+        if(library.state == ShaderLibraryPreparationState::Failed)
+        {
+            fail("the " + description.shaderPath.generic_string() + " DXR library failed to compile.");
+            return combined;
+        }
+
+        if(library.state != ShaderLibraryPreparationState::Ready)
+        {
+            pending(library.state);
+            continue;
+        }
+
+        CompiledLibrary* compiled = nullptr;
+
+        for(CompiledLibrary& entry : m_libraries)
+        {
+            if(entry.path == description.shaderPath && !entry.library.bytecode.empty())
+            {
+                compiled = &entry;
+            }
+        }
+
+        if(!compiled)
+        {
+            fail("the " + description.shaderPath.generic_string() + " DXR library is unavailable.");
+            return combined;
+        }
+
+        const std::string identity = "TraceRay fallback " + PipelineDescriptionKey(description) + "#" +
+            std::to_string(compiled->revision);
+        auto pipeline = std::make_unique<RayTracingPipeline>();
+
+        if(!pipelineWorker)
+        {
+            if(!pipeline->Initialize(rayTracingDevice, compiled->library.bytecode, description))
+            {
+                fail("the " + description.shaderPath.generic_string() + " TraceRay pipeline could not be created.");
+                return combined;
+            }
+
+            pipeline->SetIdentity(identity);
+            m_traceRayPipelines[slot] = std::move(pipeline);
+            continue;
+        }
+
+        switch(pipelineWorker->GetState(identity))
+        {
+        case RayTracingPipelineJobState::Queued:
+        case RayTracingPipelineJobState::Creating:
+            pending(ShaderLibraryPreparationState::PreparingPipelines);
+            continue;
+        case RayTracingPipelineJobState::Completed:
+        {
+            std::optional<RayTracingPipelineOutcome> outcome = pipelineWorker->TakeCompleted(identity);
+
+            if(!outcome || !outcome->succeeded || outcome->device != rayTracingDevice || !outcome->pipeline)
+            {
+                fail("the " + description.shaderPath.generic_string() + " TraceRay pipeline could not be created.");
+                return combined;
+            }
+
+            outcome->pipeline->SetIdentity(identity);
+            m_traceRayPipelines[slot] = std::move(outcome->pipeline);
+            continue;
+        }
+        case RayTracingPipelineJobState::None:
+            break;
+        }
+
+        if(!compiled->snapshot)
+        {
+            compiled->snapshot = std::make_shared<const std::vector<char>>(compiled->library.bytecode);
+        }
+
+        RayTracingPipelineRequest request{};
+        request.key = identity;
+        request.device = rayTracingDevice;
+        request.library = compiled->snapshot;
+        request.description = description;
+
+        if(!pipelineWorker->Submit(std::move(request)))
+        {
+            fail("the " + description.shaderPath.generic_string() + " TraceRay pipeline could not be queued.");
+            return combined;
+        }
+
+        pending(ShaderLibraryPreparationState::PreparingPipelines);
+    }
+
+    if(combined.state == ShaderLibraryPreparationState::Ready && !m_rayQuerySlots.empty())
+    {
+        m_traceRayFallbacksReady = true;
+        Log::Info("TraceRay visibility fallback ready for " + std::to_string(m_rayQuerySlots.size()) +
+            " RayQuery pipelines; TraceRay secondary shadows render from now on.");
+    }
+
+    return combined;
+}
+
+std::filesystem::path PathTraceReferencePass::SlotLibraryPath(const std::filesystem::path& path) const
+{
+    if(m_rayQueryOnly)
+    {
+        if(const std::optional<std::filesystem::path> twin = RayQueryTwinLibraryPath(path))
+        {
+            return *twin;
+        }
+    }
+
+    return path;
+}
+
 bool PathTraceReferencePass::LibrarySelectionFixed() const
 {
     // Libraries and pipelines are keyed by primary, not by variant, so the choice is fixed once anything has
@@ -661,7 +863,7 @@ std::string PathTraceReferencePass::TroubleshootingHint() const
 
 bool PathTraceReferencePass::Initialize(
     GraphicsDevice& graphicsDevice,
-    ShaderLibrary& shaderLibrary,
+    [[maybe_unused]] ShaderLibrary& shaderLibrary,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
     unsigned int height,
@@ -681,25 +883,9 @@ bool PathTraceReferencePass::Initialize(
         return false;
     }
 
-    // Compiled libraries survive, including those accepted from the async worker, so a later Initialize
-    // never recompiles an unchanged library. A missing shader (for example a historical cooked bundle
-    // without this library) fails here.
-    auto& referencePipeline = m_pipelines[static_cast<size_t>(PathTracePrimary::Camera)];
-    const RayTracingPipelineDescription description =
-        BuildPathTracePipelineDescription(PathTracePrimary::Camera, m_libraryVariant);
-    const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
-
-    if(!library ||
-        !InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, referencePipeline, library->bytecode, description))
-    {
-        failureReason = "The PathTraceReference DXR library is unavailable or failed to compile" +
-            TroubleshootingHint() + ".";
-        ReleaseResources();
-        return false;
-    }
-
-    m_pipelineReady[static_cast<size_t>(PathTracePrimary::Camera)] = true;
-
+    // Startup work (4.1): the targets only. Every primary's pipeline, the Camera (Reference) one included, is created by
+    // EnsurePrimaryPipeline for the mode that records it, so ReSTIR PT Enhanced (which records none of them) never builds
+    // one. Compiled libraries survive, including those accepted from the async worker.
     if(!CreateTextures(graphicsDevice.GetDevice(), descriptorHeap, width, height))
     {
         failureReason = "Path tracing accumulation resources or descriptors could not be allocated.";
@@ -859,7 +1045,7 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
     // PS.5B.1: packaged games have no compiler; their cooked DXIL is the library, admitted without the worker.
     if(shaderLibrary.IsPackaged())
     {
-        return PreparePackagedLibrary(shaderLibrary, path, RayQueryTwinOf(path));
+        return PreparePackagedLibrary(shaderLibrary, path, !m_rayQueryOnly && RayQueryTwinOf(path));
     }
     const std::string libraryName = path.generic_string();
     ShaderLibraryPreparation preparation{};
@@ -1059,16 +1245,27 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetRequiredLibr
                 });
         };
 
-        if(!listed(path))
-        {
-            libraries.push_back(PathTraceLibraryRequirement{path, false});
-        }
-
         const std::optional<std::filesystem::path> twinPath = RayQueryTwinLibraryPath(path);
 
-        if(twinPath && !listed(*twinPath))
+        // Startup work (4.6): RayQuery-only, the twin is the library (required) and the original is not prepared.
+        if(m_rayQueryOnly && twinPath)
         {
-            libraries.push_back(PathTraceLibraryRequirement{*twinPath, true});
+            if(!listed(*twinPath))
+            {
+                libraries.push_back(PathTraceLibraryRequirement{*twinPath, false});
+            }
+        }
+        else
+        {
+            if(!listed(path))
+            {
+                libraries.push_back(PathTraceLibraryRequirement{path, false});
+            }
+
+            if(twinPath && !listed(*twinPath))
+            {
+                libraries.push_back(PathTraceLibraryRequirement{*twinPath, true});
+            }
         }
 
         // M4.2C: the separate sampled-NEE permutation (optional: without it the exhaustive one runs).
@@ -1088,8 +1285,24 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetRequiredLibr
         }
     };
 
-    // Initialize creates the Camera pipeline for every primary; Raster Primary, the ReSTIR DI indirect pass and the
-    // Raster Primary and split indirect extraction exports come from the same library.
+    // Startup work (4.1): ReSTIR PT Enhanced records only its own compute kernels and, with SHARC, the cache's training
+    // pipeline (its kernels query the cache themselves).
+    if(needs.restirPt)
+    {
+        if(needs.radianceCache)
+        {
+            if(const char* training = RadianceCacheLibraryPath(m_libraryVariant, PathTraceRadianceCacheLibrary::Training,
+                needs.radianceCacheImplementation))
+            {
+                add(training);
+            }
+        }
+
+        return libraries;
+    }
+
+    // The Camera, Raster Primary and ReSTIR DI indirect pipelines and the Raster Primary and split indirect extraction exports
+    // come from the same library.
     add(ReferenceLibraryPath(m_libraryVariant));
 
     // EnsureReSTIRDISplitPipelines creates the direct pass and, before the primary visibility selector is enabled,
@@ -1124,8 +1337,10 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetRequiredLibr
 
 std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetPackagedLibraries()
 {
-    // A pass that has created nothing selects SM66, the only variant packaged games use.
+    // A pass that has created nothing selects SM66, the only variant packaged games use. Startup work (4.6, decision 3):
+    // RayQuery-only, so a game cooks the GI.6 twins without their TraceRay originals.
     const auto pass = std::make_unique<PathTraceReferencePass>();
+    pass->m_rayQueryOnly = true;
     std::vector<PathTraceLibraryRequirement> libraries;
 
     // PS.5C: the ordinary path with every denoiser's extraction, and each PSR chain (single, two-bounce) with and
@@ -1172,14 +1387,25 @@ std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass:
     // Each pipeline, followed by the RayQuery twin InitializeVisibilityPipelines pairs with it.
     const auto add = [&](const RayTracingPipelineDescription& description)
     {
-        pipelines.push_back(PipelineRequirement{description, false});
         const std::optional<std::filesystem::path> twinPath = RayQueryTwinLibraryPath(description.shaderPath);
 
-        if(twinPath)
+        // Startup work (4.6): RayQuery-only, the slot's pipeline is the twin's (required); no TraceRay pipeline.
+        if(m_rayQueryOnly && twinPath)
         {
             RayTracingPipelineDescription twin = description;
             twin.shaderPath = *twinPath;
-            pipelines.push_back(PipelineRequirement{std::move(twin), true});
+            pipelines.push_back(PipelineRequirement{std::move(twin), false});
+        }
+        else
+        {
+            pipelines.push_back(PipelineRequirement{description, false});
+
+            if(twinPath)
+            {
+                RayTracingPipelineDescription twin = description;
+                twin.shaderPath = *twinPath;
+                pipelines.push_back(PipelineRequirement{std::move(twin), true});
+            }
         }
 
         // M4.2C: the separate sampled-NEE permutation, optional like the twin.
@@ -1252,12 +1478,23 @@ std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass:
         return pipelines;
     }
 
+    // Startup work (4.1): ReSTIR PT Enhanced, as GetRequiredLibraries.
+    if(needs.restirPt)
+    {
+        if(needs.radianceCache && RadianceCacheLibraryPath(m_libraryVariant, PathTraceRadianceCacheLibrary::Training,
+            needs.radianceCacheImplementation))
+        {
+            add(BuildRadianceCachePipelineDescription(m_libraryVariant, PathTraceRadianceCacheLibrary::Training,
+                needs.radianceCacheImplementation));
+        }
+
+        return pipelines;
+    }
+
     const bool split = needs.primary == PathTracePrimary::RasterReSTIRDI;
 
-    // Initialize: the Camera pipeline, for every primary.
-    add(BuildPathTracePipelineDescription(PathTracePrimary::Camera, m_libraryVariant));
-
-    // EnsurePrimaryPipeline: a single-pipeline primary, or the ReSTIR DI split pair and its extraction direct pass.
+    // EnsurePrimaryPipeline: a single-pipeline primary (the Camera one only for the Reference mode, startup work 4.1), or
+    // the ReSTIR DI split pair and its extraction direct pass.
     if(split)
     {
         // ReSTIR DI evaluates the Raster primary prerequisite before its own split pair.
@@ -1266,7 +1503,7 @@ std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass:
         add(BuildReSTIRDISplitPipelineDescription(false, m_libraryVariant));
         add(DirectPassDescription(true, 0u));
     }
-    else if(needs.primary != PathTracePrimary::Camera)
+    else
     {
         add(BuildPathTracePipelineDescription(needs.primary, m_libraryVariant));
     }
@@ -1478,7 +1715,7 @@ ShaderLibraryPreparationState PathTraceReferencePass::ObservePipeline(const RayT
 }
 
 ShaderLibraryPreparation PathTraceReferencePass::PreparePipelines(RayTracingPipelineWorker& worker, ID3D12Device5* device,
-    const PathTraceLibraryNeeds& needs)
+    const PathTraceLibraryNeeds& needs, const std::vector<std::filesystem::path>* acceptedLibraries, bool background)
 {
     TransitionTiming::Scope er1Scope("PreparePipelines", 0.5);
     ShaderLibraryPreparation combined{};
@@ -1503,6 +1740,12 @@ ShaderLibraryPreparation PathTraceReferencePass::PreparePipelines(RayTracingPipe
         const RayTracingPipelineDescription& description = requirement.description;
         const std::string libraryName = description.shaderPath.generic_string();
         CompiledLibrary* library = nullptr;
+
+        if(acceptedLibraries && std::find(acceptedLibraries->begin(), acceptedLibraries->end(), description.shaderPath) ==
+            acceptedLibraries->end())
+        {
+            continue;
+        }
 
         for(CompiledLibrary& compiled : m_libraries)
         {
@@ -1603,6 +1846,7 @@ ShaderLibraryPreparation PathTraceReferencePass::PreparePipelines(RayTracingPipe
         request.description = description;
         request.failForTesting = !m_pipelineFailureForTesting.empty() &&
             key.find(m_pipelineFailureForTesting) != std::string::npos;
+        request.background = background;
 
         if(!worker.Submit(std::move(request)))
         {
@@ -1618,9 +1862,12 @@ ShaderLibraryPreparation PathTraceReferencePass::PreparePipelines(RayTracingPipe
 }
 
 bool PathTraceReferencePass::CreatePipeline(GraphicsDevice& device, RayTracingPipeline& slot,
-    const std::vector<char>& bytecode, const RayTracingPipelineDescription& description)
+    const std::vector<char>& bytecode, const RayTracingPipelineDescription& requestedDescription)
 {
     const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+    // Startup work (4.6): RayQuery-only, the slot is built from the twin's library (AcquireLibrary returned its bytes).
+    RayTracingPipelineDescription description = requestedDescription;
+    description.shaderPath = SlotLibraryPath(description.shaderPath);
 
     const std::string key = PipelineDescriptionKey(description);
     const std::uint64_t revision = LibraryRevision(description.shaderPath);
@@ -1675,8 +1922,10 @@ bool PathTraceReferencePass::CreatePipeline(GraphicsDevice& device, RayTracingPi
 
 const ShaderLibraryCompileResult* PathTraceReferencePass::AcquireLibrary(
     ShaderLibrary& shaderLibrary,
-    const std::filesystem::path& path)
+    const std::filesystem::path& requestedPath)
 {
+    // Startup work (4.6): RayQuery-only, a slot's library is its twin.
+    const std::filesystem::path path = SlotLibraryPath(requestedPath);
     CompiledLibrary* entry = nullptr;
 
     for(CompiledLibrary& compiled : m_libraries)
@@ -1870,7 +2119,8 @@ bool PathTraceReferencePass::Execute(
     // PSR.1a: Raster Primary without extraction or a cache library only; otherwise the frame records as without it.
     // PSR.1a-P: with GI.6 selected the PSR pipelines need their own RayQuery twins, or PSR would render with TraceRay
     // secondary shadows where the production frame uses RayQuery; without them the frame records as without PSR.
-    const bool replacementVisibility = !m_secondaryShadowRayQuery || (m_psrRayQueryPipelines[&m_psrRecordPipeline] &&
+    const bool replacementVisibility = !m_secondaryShadowRayQuery || m_rayQueryOnly ||
+        (m_psrRayQueryPipelines[&m_psrRecordPipeline] &&
         m_psrRayQueryPipelines[&m_psrRasterPipeline]);
     const bool replacement = primarySurfaceReplacement && primary == PathTracePrimary::Raster && !extract && !learning &&
         radianceCacheConstants == 0 && m_psrPipelinesReady && replacementVisibility && m_psrRecords.GetResource() &&
@@ -2340,7 +2590,7 @@ bool PathTraceReferencePass::IsPrimarySurfaceReplacementGBufferExtractionReady(b
     RayTracingPipeline* indirect = rawDiffuseHitDistance ? &m_psrGBufferExtractIndirectRawPipeline :
         &m_psrGBufferExtractIndirectPipeline;
     return m_psrGBufferExtractReady[rawDiffuseHitDistance ? 1 : 0] &&
-        (!m_secondaryShadowRayQuery || m_psrRayQueryPipelines[indirect]);
+        (!m_secondaryShadowRayQuery || m_rayQueryOnly || m_psrRayQueryPipelines[indirect]);
 }
 
 bool PathTraceReferencePass::EnsurePsrProbePipelinesForTesting(GraphicsDevice& graphicsDevice,
@@ -2396,7 +2646,7 @@ bool PathTraceReferencePass::IsPrimarySurfaceReplacementGBufferReady()
 {
     // The twin the frame's visibility selection needs (GI.6 for the indirect pass).
     return m_psrGBufferPipelinesReady &&
-        (!m_secondaryShadowRayQuery || m_psrRayQueryPipelines[&m_psrGBufferIndirectPipeline]);
+        (!m_secondaryShadowRayQuery || m_rayQueryOnly || m_psrRayQueryPipelines[&m_psrGBufferIndirectPipeline]);
 }
 
 void PathTraceReferencePass::RetainPsrPipeline(RayTracingPipeline& pipeline)
@@ -2448,7 +2698,8 @@ bool PathTraceReferencePass::PsrSharcInfrastructureReady(bool extract, bool raw)
     const auto ready = [&](PathTraceRadianceCacheLibrary library)
     {
         auto& entry = m_radianceCache[static_cast<size_t>(library)];
-        return entry.ready && (!m_secondaryShadowRayQuery || library == PathTraceRadianceCacheLibrary::PsrTraining ||
+        return entry.ready && (!m_secondaryShadowRayQuery || m_rayQueryOnly ||
+            library == PathTraceRadianceCacheLibrary::PsrTraining ||
             m_psrRayQueryPipelines[&entry.pipeline] != nullptr);
     };
     return (extract ? IsPrimarySurfaceReplacementGBufferExtractionReady(raw) :
@@ -3021,6 +3272,11 @@ bool PathTraceReferencePass::EnsureExtractionPipelines(
     return true;
 }
 
+bool PathTraceReferencePass::EnsureSignalExtractionTargets(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    return m_initialized && CreateExtractionTextures(device, descriptorHeap);
+}
+
 bool PathTraceReferencePass::CreateExtractionTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap)
 {
     if(m_diffuseTexture.GetResource() && m_specularTexture.GetResource())
@@ -3538,6 +3794,18 @@ void PathTraceReferencePass::ReleaseResources()
     m_secondaryShadowRayQuery = false;
     m_primaryDiExtractionPipelineReady = false;
 
+    for(auto& [slot, fallback] : m_traceRayPipelines)
+    {
+        if(fallback)
+        {
+            fallback->Shutdown();
+        }
+    }
+
+    m_traceRayPipelines.clear();
+    m_rayQuerySlots.clear();
+    m_traceRayFallbacksReady = false;
+
     m_accumulationTexture.Shutdown();
     m_outputTexture.Shutdown();
     m_statisticsTexture.Shutdown();
@@ -3782,6 +4050,9 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
     const std::vector<char>& bytecode, const RayTracingPipelineDescription& description)
 {
     TransitionTiming::Scope er1Scope("InitializeVisibilityPipelines", 0.5);
+    // Startup work (4.6): a slot rebuilt here starts without the TraceRay fallback of its previous contents.
+    ForgetRayQuerySlot(original);
+
     if(!CreatePipeline(device, original, bytecode, description))
     {
         return false;
@@ -3789,6 +4060,21 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
 
     // GI.6: the RayQuery twin of an indirect, Reference or raster library (the compute direct pass has none).
     const std::optional<std::filesystem::path> twinPath = RayQueryTwinLibraryPath(description.shaderPath);
+
+    // Startup work (4.6): RayQuery-only, the slot itself holds the twin's pipeline; there is no TraceRay one to pair.
+    if(twinPath && m_rayQueryOnly)
+    {
+        AttachSampledVariant(device, shaders, original, description);
+
+        // The Editor can still turn RayQuery off: the TraceRay pipeline this slot would have had is prepared then.
+        if(!shaders.IsPackaged())
+        {
+            m_rayQuerySlots[&original] = description;
+            m_traceRayFallbacksReady = false;
+        }
+
+        return true;
+    }
 
     if(!twinPath)
     {
@@ -3936,6 +4222,12 @@ bool PathTraceReferencePass::SampledIndirectNeeLibrariesRequested()
 
 bool PathTraceReferencePass::IsSecondaryShadowRayQueryReady() const
 {
+    // Startup work (4.6): RayQuery-only, every twinned slot already traces RayQuery.
+    if(m_rayQueryOnly)
+    {
+        return m_initialized;
+    }
+
     return m_initialized && !m_rayQueryPipelines.empty() &&
         std::all_of(m_rayQueryPipelines.begin(), m_rayQueryPipelines.end(),
             [](const auto& entry)
@@ -3951,6 +4243,16 @@ void PathTraceReferencePass::SelectSecondaryShadowRayQuery(bool enabled)
 
 RayTracingPipeline& PathTraceReferencePass::VisibilityPipeline(RayTracingPipeline& original)
 {
+    // Startup work (4.6): RayQuery off in the Editor, a RayQuery slot records its TraceRay fallback once the whole set exists.
+    if(!m_secondaryShadowRayQuery && m_traceRayFallbacksReady)
+    {
+        if(const auto fallback = m_traceRayPipelines.find(&original);
+            fallback != m_traceRayPipelines.end() && fallback->second && original.IsInitialized())
+        {
+            return *fallback->second;
+        }
+    }
+
     // M4.2C: on a sampled frame, the twin's sampled permutation where one was built.
     const auto select = [&](RayTracingPipeline& twin) -> RayTracingPipeline&
     {

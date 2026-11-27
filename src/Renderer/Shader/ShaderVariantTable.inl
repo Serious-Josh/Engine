@@ -661,6 +661,43 @@
 {"ReSTIRPT/RestirPtInitialReGIRLightBounceLayered.hlsl", "PathTraceReference.hlsl",
     "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
     "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1 RESTIR_PT_LIGHT_BOUNCE=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+// POM B2 (2026-11-26): the parallax tiers, each production kernel with the relief's own shadow at parallax occlusion
+// mapping pixels compiled in (PATH_TRACE_SURFACE_DETAIL_RELIEF: the shell march for rays leaving the raster primary),
+// without and with the OpenPBR layered lobes. ReSTIRPTPass prepares a tier only once a published material needs it
+// (MaterialTablePublication::parallax), as a set of its own; the other tiers carry none of its code.
+{"ReSTIRPT/RestirPtInitialRelief.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 PATH_TRACE_SURFACE_DETAIL_RELIEF=1 OPENPBR_LAYERED_LOBES=0",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialTemporalRelief.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_TEMPORAL=1 PATH_TRACE_SURFACE_DETAIL_RELIEF=1 OPENPBR_LAYERED_LOBES=0",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialReGIRRelief.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1 PATH_TRACE_SURFACE_DETAIL_RELIEF=1 OPENPBR_LAYERED_LOBES=0",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialReGIRLightBounceRelief.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1 RESTIR_PT_LIGHT_BOUNCE=1 "
+    "PATH_TRACE_SURFACE_DETAIL_RELIEF=1 OPENPBR_LAYERED_LOBES=0",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialLayeredRelief.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 PATH_TRACE_SURFACE_DETAIL_RELIEF=1",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialTemporalLayeredRelief.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_TEMPORAL=1 PATH_TRACE_SURFACE_DETAIL_RELIEF=1",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialReGIRLayeredRelief.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1 PATH_TRACE_SURFACE_DETAIL_RELIEF=1",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialReGIRLightBounceLayeredRelief.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_REGIR=1 RESTIR_PT_LIGHT_BOUNCE=1 PATH_TRACE_SURFACE_DETAIL_RELIEF=1",
+    "ReSTIRPT/RestirPtInitialBody.hlsli"},
 // M5.2 C0: test-only variants of the same kernel, isolated so production B never compiles their state (it lowered
 // occupancy): the T-2.1 self-shift and its diagnostics (RESTIR_PT_DIAGNOSTICS), and the reconnection visibility bench
 // (RESTIR_PT_VISIBILITY_BENCH). ReSTIRPTPass selects one only when its diagnostic setting is on. Both are base tier
@@ -689,6 +726,22 @@
     "RESTIR_PT_SHARC=1", ""},
 {"ReSTIRPT/RestirPtInitialReGIRLightBounceLayeredSharc.hlsl", "ReSTIRPT/RestirPtInitialReGIRLightBounceLayered.hlsl",
     "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialReliefSharc.hlsl",
+    "ReSTIRPT/RestirPtInitialRelief.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialTemporalReliefSharc.hlsl",
+    "ReSTIRPT/RestirPtInitialTemporalRelief.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialReGIRReliefSharc.hlsl",
+    "ReSTIRPT/RestirPtInitialReGIRRelief.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialReGIRLightBounceReliefSharc.hlsl",
+    "ReSTIRPT/RestirPtInitialReGIRLightBounceRelief.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialLayeredReliefSharc.hlsl",
+    "ReSTIRPT/RestirPtInitialLayeredRelief.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialTemporalLayeredReliefSharc.hlsl",
+    "ReSTIRPT/RestirPtInitialTemporalLayeredRelief.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialReGIRLayeredReliefSharc.hlsl",
+    "ReSTIRPT/RestirPtInitialReGIRLayeredRelief.hlsl", "RESTIR_PT_SHARC=1", ""},
+{"ReSTIRPT/RestirPtInitialReGIRLightBounceLayeredReliefSharc.hlsl",
+    "ReSTIRPT/RestirPtInitialReGIRLightBounceLayeredRelief.hlsl", "RESTIR_PT_SHARC=1", ""},
 {"ReSTIRPT/RestirPtInitialDiagnosticsSharc.hlsl", "ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "RESTIR_PT_SHARC=1", ""},
 {"ReSTIRPT/RestirPtInitialVisibilityBenchSharc.hlsl", "ReSTIRPT/RestirPtInitialVisibilityBench.hlsl",
     "RESTIR_PT_SHARC=1", ""},

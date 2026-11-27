@@ -599,6 +599,21 @@ class Renderer
     ConfigurationReadiness EvaluateConfigurationReadiness(const RenderingConfiguration& configuration, unsigned int outputWidth,
         unsigned int outputHeight) const;
     RenderedConfiguration GetRenderedConfiguration() const;
+    // Layered prep diagnostics (ENGINE_STARTUP_EXIT_AT_TIERS): the ReSTIR PT material tier the published material table
+    // needs, once ReSTIR PT runs, that tier is adopted (or failed) and no tier set is preparing; nullopt otherwise.
+    std::optional<ReSTIRPTMaterialTier> GetSettledReSTIRPTMaterialTier() const;
+    // Layered prep (F5): the ReSTIR PT material tier the active scene's materials need by their definitions (coat, fuzz,
+    // thin film, anisotropy; parallax with an assigned height texture, resident or not: a parallax material publishes no
+    // height texture until it is resident, so the published table alone shows layered first). Main thread, before
+    // SelectPresentedConfiguration, computed against the material table revision GetMaterialTableRevision returns. The tier
+    // ReSTIR PT prepares and renders is the union of this and the published table's (NeededReSTIRPTMaterialTier), so a
+    // scene asks for layered relief directly. Once a caller gives hints, a tier is requested only while the hint matches
+    // the published revision (a table published after the hint waits one frame for its own hint).
+    void SetSceneMaterialTierHint(ReSTIRPTMaterialTier tier, std::uint64_t revision)
+    {
+        m_sceneMaterialTierHint = tier;
+        m_sceneMaterialTierHintRevision = revision;
+    }
 
     // M0c.4 Stage 4.1/4.2 (RendererConfigurationPreparation.cpp): the configuration to present this frame. Called once per
     // frame before the render scale is applied. While the request's identity (ConfigurationIdentity) differs from the
@@ -890,6 +905,51 @@ class Renderer
     std::uint32_t GetAirStepCount() const noexcept
     {
         return m_airField.GetLastStepCount();
+    }
+
+    // AIR async compute (AIR optimization report item 3): which queue each frame's AIR work went to, why a frame kept it on the frame
+    // queue, and the GPU time of that work on its queue (two timestamps around it, read once the frame slot's fence completes).
+    struct AirQueueStatistics
+    {
+        std::uint64_t asyncFrames = 0;
+        // Async frames ordered after their direct list: a resource created during AIR's recording was activated on the frame list.
+        std::uint64_t afterFrame = 0;
+        std::uint64_t syncFrames = 0;
+        // Why a frame kept AIR on the frame queue: switched off (ENGINE_AIR_ASYNC=0, the setter) or no compute queue; the frame
+        // reads AIR (mist shown, an AIR view open); the VX.5 residency wrote this frame; diagnostic stage markers are set.
+        std::uint64_t syncDisabled = 0;
+        std::uint64_t syncReaders = 0;
+        std::uint64_t syncVoxelUploads = 0;
+        std::uint64_t syncStageMarkers = 0;
+        // Async frames with readers of AIR: the frame's direct recording is split at the first reader, whose part waits for the
+        // compute work (CommandContext::SplitForAsyncComputeReaders). ENGINE_AIR_ASYNC_SPLIT=0 keeps such frames on the frame queue.
+        std::uint64_t asyncSplitFrames = 0;
+        bool lastAsync = false;
+        // The latest measured frame's AIR GPU time on its queue in milliseconds (-1: none yet), and whether that was the compute queue.
+        double lastMilliseconds = -1.0;
+        bool lastMeasuredAsync = false;
+        // The latest measured frame's GPU span in milliseconds (-1: none yet): from a direct-queue timestamp at AIR's record point to the
+        // later of AIR's end (on its queue) and the end of the frame's direct list, on CPU time (each queue's clock calibration).
+        double lastSpanMilliseconds = -1.0;
+        std::uint64_t measuredFrames = 0;
+        // The latest frame's CPU wait in CommandContext::Begin for its slot's frame fence, in milliseconds.
+        double lastBeginFenceWaitMilliseconds = 0.0;
+    };
+
+    const AirQueueStatistics& GetAirQueueStatistics() const noexcept
+    {
+        return m_airQueueStatistics;
+    }
+
+    // On by default (ENGINE_AIR_ASYNC=0 turns it off for the session); the A/B probe switches it between frames.
+    void SetAirAsyncCompute(bool enabled) noexcept
+    {
+        m_airAsyncCompute = enabled;
+    }
+
+    bool IsAirAsyncComputeEnabled() const noexcept
+    {
+        return m_airAsyncCompute;
     }
 
     const std::map<std::uint64_t, AirMotorEmissionStatus>& GetAirMotorEmission() const noexcept
@@ -2070,6 +2130,46 @@ class Renderer
     std::chrono::steady_clock::time_point m_airLastRequested = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point m_airVectorsLastRequested = std::chrono::steady_clock::now();
     std::uint64_t m_airStorageRetirements = 0;
+    // AIR async compute: the switch, the statistics and the timestamps around each frame's AIR work (per frame slot: a start and an
+    // end query, on the queue AIR used; the queues' frequencies may differ).
+    bool m_airAsyncCompute = true;
+    AirQueueStatistics m_airQueueStatistics;
+    struct AirQueueTiming
+    {
+        Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap;
+        Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+        const UINT64* ticks = nullptr;
+        bool attempted = false;
+        double directTicksPerMillisecond = 0.0;
+        double computeTicksPerMillisecond = 0.0;
+        // Per queue, a GPU timestamp and the CPU QPC time it matches (GetClockCalibration, once), and QPC ticks per millisecond.
+        UINT64 directCalibrationGpu = 0;
+        UINT64 directCalibrationCpu = 0;
+        UINT64 computeCalibrationGpu = 0;
+        UINT64 computeCalibrationCpu = 0;
+        double qpcTicksPerMillisecond = 0.0;
+        bool pending[CommandContext::FrameCount]{};
+        bool async[CommandContext::FrameCount]{};
+        // Per slot: the direct list holds the AIR-point stamp (query 2), and once the frame ends the frame-end stamp (query 3).
+        bool directPoint[CommandContext::FrameCount]{};
+        // The span's direct pair resolves into a readback of its own: the compute queue may resolve AIR's pair at the same time, and
+        // two queues writing one resource at once is a debug-layer error (#1047) even for disjoint ranges.
+        Microsoft::WRL::ComPtr<ID3D12Resource> spanReadback;
+        const UINT64* spanTicks = nullptr;
+        bool spanPending[CommandContext::FrameCount]{};
+    };
+    AirQueueTiming m_airQueueTiming;
+    // Records the frame's AIR work on the compute queue when nothing in the frame reads it, otherwise on `commandList` as before.
+    void RecordAirWork(ID3D12GraphicsCommandList* commandList, const RendererOptions& options, unsigned int frameIndex);
+    bool EnsureAirQueueTiming();
+    // The frame-end direct-queue stamp of the AIR span, at the end of the frame's direct list (beside the profiler's TotalFrame end).
+    void RecordAirFrameEnd(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex);
+    // Set by RecordAirWork when this frame's AIR work went to the compute queue and the frame reads it: RecordRenderFrame splits the
+    // recording before the first reader (SplitForAirReaders).
+    bool m_airSplitPending = false;
+    // Splits the frame recording at AIR's first reader and prepares the field for it on the second list, which it returns with the
+    // frame's descriptor heap bound again (nullptr: the frame cannot continue). Without a pending split, returns `commandList`.
+    ID3D12GraphicsCommandList* SplitForAirReaders(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex);
 
 public:
     std::uint64_t GetAirStorageRetirements() const noexcept
@@ -2297,6 +2397,12 @@ private:
     DescriptorHeap m_dsvDescriptorHeap;
 
     DeferredLightingPass m_deferredLightingPass;
+
+    // The G-buffer pipeline of draws whose material uses parallax occlusion mapping (Triangle.hlsl PSMainParallax, which
+    // writes the relief's depth); every other draw binds its material's own pipeline. Uninitialized when unavailable:
+    // those draws then keep the material's pipeline and a flat depth.
+    Pipeline m_parallaxGeometryPipeline;
+    bool InitializeParallaxGeometryPipeline();
 
     ToneMapPass m_toneMapPass;
     EditorColliderPass m_editorColliderPass;
@@ -2594,19 +2700,68 @@ private:
     void ReleasePreparedReSTIRPTPipelines();
     ReSTIRPTPipelinePreparation m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::NotSubmitted;
     std::shared_ptr<ReSTIRPTPreparedPipelines> m_restirPtPreparedPipelines;
-    // OpenPBR tiers: the layered kernels (coat, fuzz, thin film, anisotropy) are prepared on the same worker only once a
-    // published material needs them, and adopted when ready (UpdateReSTIRPTLayeredPipelines, every ReSTIR PT frame).
-    // Until then such materials render through the base tier without those lobes. A failed set is not retried.
-    static constexpr const char* ReSTIRPTLayeredPipelineJobKey = "ReSTIR PT layered pipelines";
-    void UpdateReSTIRPTLayeredPipelines();
-    bool SubmitReSTIRPTLayeredPipelines();
+    // Material tiers: the kernels of every tier but the base (the OpenPBR layered lobes, POM B2's relief shadow, or
+    // both; ReSTIRPTMaterialTier) are prepared on the same worker only once a published material needs that tier, and
+    // adopted when ready (UpdateReSTIRPTTierPipelines, every ReSTIR PT frame). Until then such materials render through
+    // the richest adopted tier the needed one contains. A failed set is not retried. Indexed by tier; entry 0 is unused.
+    static constexpr const char* ReSTIRPTTierPipelineJobKeys[ReSTIRPTMaterialTierCount] = {"",
+        "ReSTIR PT layered pipelines", "ReSTIR PT relief pipelines", "ReSTIR PT layered relief pipelines"};
+    struct ReSTIRPTTierPreparation
+    {
+        std::shared_ptr<ReSTIRPTPreparedPipelines> prepared;
+        bool preparing = false;
+        bool failed = false;
+        std::chrono::steady_clock::time_point requested{};
+    };
+    void UpdateReSTIRPTTierPipelines();
+    // Layered prep (F1): submits the set of the tier the published material table needs when it is neither adopted,
+    // preparing nor failed, dropping a contained smaller tier's set that has not started. Called from every ReSTIR PT
+    // recording and every frame a ReSTIR PT configuration is requested (SelectPresentedConfiguration), also before the pass
+    // exists, so the tier prepares beside the base set and the configuration's DXR pipelines; adopted once the pass exists.
+    void RequestReSTIRPTTierPipelines();
+    // Layered prep (F5): the published table's tier joined with the scene's hint (SetSceneMaterialTierHint).
+    ReSTIRPTMaterialTier NeededReSTIRPTMaterialTier() const;
+    std::optional<ReSTIRPTMaterialTier> m_sceneMaterialTierHint;
+    std::uint64_t m_sceneMaterialTierHintRevision = 0;
+    // Layered prep (F5): the configuration gate's step (PrepareConfiguration): takes and requests the needed tier's set and
+    // is Ready once it is adopted, or failed (then the request is presented without it, as before), or not needed, or once
+    // the request has waited ReSTIRPTTierGateLimit since the base set was ready (ENGINE_TIER_GATE_SECONDS overrides it, 0
+    // never waits): after a shader change the tier compiles from scratch, and the request is then presented without it
+    // (logged) and the tier is adopted when ready, as on demand.
+    ShaderLibraryPreparation PrepareReSTIRPTMaterialTier();
+    static constexpr std::chrono::seconds ReSTIRPTTierGateLimit{10};
+    // The request generation the gate's wait belongs to, when it began, and whether its limit was logged.
+    std::uint64_t m_restirPtTierGateGeneration = 0;
+    std::chrono::steady_clock::time_point m_restirPtTierGateStart{};
+    bool m_restirPtTierGateExpired = false;
+    // Layered prep (F2): whether a material tier's set or a kernel group is preparing on the ReSTIR PT worker (the
+    // speculative ReSTIR DI warm-up waits meanwhile).
+    bool IsReSTIRPTMaterialWorkPreparing() const;
+    bool SubmitReSTIRPTTierPipelines(ReSTIRPTMaterialTier tier);
+    // Takes the tier's finished preparation from the worker and adopts it.
+    void TakeReSTIRPTTierPipelines(ReSTIRPTMaterialTier tier);
     // Only while no job uses the set (it was taken, or the worker was joined).
-    void ReleasePreparedReSTIRPTLayeredPipelines();
-    std::shared_ptr<ReSTIRPTPreparedPipelines> m_restirPtPreparedLayeredPipelines;
-    bool m_restirPtLayeredPreparing = false;
-    bool m_restirPtLayeredFailed = false;
-    std::chrono::steady_clock::time_point m_restirPtLayeredRequested{};
+    void ReleasePreparedReSTIRPTTierPipelines(ReSTIRPTMaterialTier tier);
+    std::array<ReSTIRPTTierPreparation, ReSTIRPTMaterialTierCount> m_restirPtTierPreparations;
+    // Startup work (4.2): the test-only and off-by-default kernel groups (ReSTIRPTKernelGroup) the Editor prepares on first
+    // use, on the same worker, while frames render with the production kernels (ReSTIRPTPass::RestrictToAdoptedKernels):
+    // one job for the base tier's groups and one per tier for its temporal kernels. A failed group is not retried.
+    static constexpr const char* ReSTIRPTKernelGroupJobKeys[ReSTIRPTMaterialTierCount] = {"ReSTIR PT kernel groups",
+        "ReSTIR PT layered temporal kernels", "ReSTIR PT relief temporal kernels", "ReSTIR PT layered relief temporal kernels"};
+    struct ReSTIRPTKernelGroupPreparation
+    {
+        std::shared_ptr<ReSTIRPTPreparedPipelines> prepared;
+        bool preparing = false;
+        std::uint32_t failedGroups = 0;
+        std::chrono::steady_clock::time_point requested{};
+    };
+    // Takes finished group jobs and submits the groups the current settings need that are neither adopted nor failed.
+    void UpdateReSTIRPTKernelGroups();
+    bool SubmitReSTIRPTKernelGroups(ReSTIRPTMaterialTier tier, std::uint32_t groups);
+    std::array<ReSTIRPTKernelGroupPreparation, ReSTIRPTMaterialTierCount> m_restirPtKernelGroupPreparations;
     std::unique_ptr<RayTracingPipelineWorker> m_restirPtPipelineWorker;
+    // Layered prep (F1): the ReSTIR PT worker's threads (each job spreads its kernels over creation threads of its own).
+    static constexpr unsigned int ReSTIRPTPipelineWorkerThreads = 2;
     std::chrono::steady_clock::time_point m_restirPtPipelinesRequested{};
     bool m_restirPtSamplingFailureLogged = false;
     // M5.1-4 (M5.2 prerequisite): this frame's per-instance transforms (by TLAS InstanceID = render-object index) and the
@@ -3235,6 +3390,7 @@ private:
     // (rasterPrimary), which own no resources beyond the Raster Primary pipeline in the reference pass. RTXPT.3: ReSTIR DI
     // re-evaluates them, then its own pipelines and the RTXDI resources (restirDI; allocated on first request).
     PathTraceRasterPrimaryStatus m_rasterPrimaryStatus;
+    std::string RasterPrimaryPrerequisiteFailure();
     void EvaluatePathTraceRasterPrimary();
     void EvaluatePathTraceReSTIRDI();
     void EvaluatePathTraceReSTIRPT();
@@ -3278,7 +3434,17 @@ private:
         bool sharc) const;
     // Polls the worker for every library of the configuration that is not prepared yet, never blocking. Failed
     // outranks Compiling, which outranks Queued, which outranks Ready; an optional twin's failure counts as Ready.
-    ShaderLibraryPreparation PrepareDxrLibraries(const PathTraceLibraryNeeds& needs);
+    // Startup work (4.1): background marks a speculative warm-up: its pipeline jobs wait behind every ordinary one and it
+    // is not reported as frame preparation (the Editor's ReSTIR DI warm-up while ReSTIR PT is presented).
+    ShaderLibraryPreparation PrepareDxrLibraries(const PathTraceLibraryNeeds& needs, bool background = false);
+    // Startup work (4.1): in the Editor, once the first configuration is lit with ReSTIR PT Enhanced, the ReSTIR DI set
+    // (its libraries and DXR pipelines, for the presented denoiser and the requested SHARC) is prepared in the background,
+    // so a later switch to ReSTIR DI rarely waits. Polled each frame until it settles; packaged games never warm it.
+    void WarmReSTIRDISet(const RenderingConfiguration& requested);
+    bool m_restirDiWarmupSettled = false;
+    // When the first lit frame was recorded: the warm-up starts a while after it, so the driver compiles it queues never
+    // contend with the pipelines the first lit frames create on the render thread (NRD's took 4 s behind them).
+    std::chrono::steady_clock::time_point m_firstLitFrameTime{};
     // The same preparation for every lighting mode a frame may record (the requested one and, while it prepares,
     // the active one); Legacy needs none.
     ShaderLibraryPreparation PrepareDxrLibraries(RendererLightingMode requestedMode, PathTraceDenoiserMode denoiser,

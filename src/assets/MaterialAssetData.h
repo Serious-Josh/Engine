@@ -54,6 +54,9 @@ struct MaterialAssetData
 
     float heightScale = 0.0f;
     float heightBias = 0.0f;
+    // Engine extension: with parallax, the relief cuts the mesh's outline at its open and sharp edges (silhouette
+    // parallax occlusion mapping). On by default.
+    bool parallaxSilhouette = true;
 
     bool preferARM = true;
 

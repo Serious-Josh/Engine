@@ -595,6 +595,12 @@ public:
         // 2 2 x 2 rays with 1 depth sample (cost parity); and twice the froxel XY resolution.
         int volumetricLateralMode = 0;
         bool volumetricDoubleXY = false;
+        // Fog step 1 (session only, never saved): the Original Raymarch reads open footprints from the mist render volume
+        // (AirMistRenderRequest::renderVolume; this default matches the request's).
+        bool mistRenderVolume = true;
+        // Fog step 2 (session only, never saved): the render volume march's table Lights from the hybrid froxel light volume
+        // (AirMistRenderRequest::froxelLights as AirMistFroxelLights: 0 Automatic, the request's default; 1 Off; 2 On).
+        int mistFroxelLightsMode = 0;
     };
 
     const AirEditorSettings& GetAirSettings() const noexcept

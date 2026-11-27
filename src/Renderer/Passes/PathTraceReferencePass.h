@@ -88,6 +88,9 @@ struct PathTraceLibraryNeeds
     bool radianceCache = false;
     PathTraceRadianceCacheLibrary radianceCacheRender = PathTraceRadianceCacheLibrary::Render;
     PathTraceRadianceCacheImplementation radianceCacheImplementation = PathTraceRadianceCacheImplementation::Nvidia;
+    // Startup work (4.1): ReSTIR PT Enhanced dispatches none of the primary's DXR pipelines (its own compute kernels render
+    // it); with SHARC it needs only the cache's training pipeline. Its frames use the primary's targets, not its pipelines.
+    bool restirPt = false;
 };
 
 // One DXR library a configuration acquires. An optional library is a GI.6 or DI.1 RayQuery twin: its failure keeps
@@ -177,9 +180,43 @@ class PathTraceReferencePass
         return m_libraryVariant;
     }
 
-    // Creates the pipeline of a non-reference primary on first use (Initialize creates the reference
-    // pipeline). A failure, for example a cooked library from before RTXPT.2 R3 without the export, is
-    // sticky for this pass lifetime and leaves the reference mode working.
+    // Startup work (4.6, decision 3): a packaged game ships one shadow-ray flavour, RayQuery. With a bootstrap that cooked
+    // the GI.6 twins without their TraceRay originals, every pipeline that has a twin is built from the twin, in the
+    // original's slot (the libraries and pipelines prepared, acquired and created are the twins'), and no TraceRay pipeline
+    // is created. A bootstrap that still holds the originals keeps both flavours, as before. Call after
+    // SelectLibraryVariant, before anything is prepared.
+    void SelectRayQueryOnly(const ShaderLibrary& shaderLibrary);
+
+    bool IsRayQueryOnly() const
+    {
+        return m_rayQueryOnly;
+    }
+
+    // Startup work (4.6, decision 3, Editor): with the RayQuery setting on when the first configuration is requested, the
+    // Editor builds twinned slots from their twins as a packaged game does, and compiles no TraceRay original. Call before
+    // anything is prepared; ignored for a packaged game (SelectRayQueryOnly decides there).
+    void SetRayQueryFirst(bool enabled, const ShaderLibrary& shaderLibrary);
+    // A twin library failed to compile in the Editor: slots built from now on use the TraceRay originals (with their twins
+    // optional, as before); slots already built keep RayQuery. Returns false when nothing changed.
+    bool AbandonRayQueryFirst();
+    static bool IsRayQueryTwinLibrary(const std::filesystem::path& path);
+
+    // The slots built from a twin, whose TraceRay pipeline exists only once PrepareTraceRayFallbacks made it.
+    bool HasRayQuerySlots() const
+    {
+        return !m_rayQuerySlots.empty();
+    }
+
+    // Startup work (4.6): the TraceRay pipelines of every RayQuery slot, prepared on first use (the RayQuery setting turned
+    // off in the Editor): each original library on the compile worker, then its pipeline on the pipeline worker (or here,
+    // without one). Never blocks while either worker has it. Ready once every slot has its TraceRay pipeline; until then,
+    // and if any fails, the slots keep rendering RayQuery (VisibilityPipeline uses the TraceRay set only whole).
+    ShaderLibraryPreparation PrepareTraceRayFallbacks(GraphicsDevice& device, ShaderLibrary& shaderLibrary,
+        ShaderLibraryCompileWorker* worker, RayTracingPipelineWorker* pipelineWorker);
+
+    // Creates the pipeline of a primary on first use (startup work 4.1: Initialize creates the targets only, so the Camera
+    // pipeline too is created here, by the Reference mode alone). A failure, for example a cooked library from before
+    // RTXPT.2 R3 without the export, is sticky for this pass lifetime and leaves the other primaries working.
     bool EnsurePrimaryPipeline(
         GraphicsDevice& graphicsDevice,
         ShaderLibrary& shaderLibrary,
@@ -236,8 +273,13 @@ class PathTraceReferencePass
     // the current library revision; PreparingPipelines while any is queued or creating; Failed when a required one
     // failed (a failed twin counts as Ready: its pipeline keeps TraceRay). The creation paths then adopt the prepared
     // pipelines (RayTracingPipeline::Swap) instead of calling CreateStateObject on the render thread.
+    // Startup work (4.5): with acceptedLibraries, only the pipelines of those libraries are polled and queued (the others
+    // are left for a later call and do not affect the result), so a configuration's pipelines are created as each library
+    // lands rather than after its last one. background marks the jobs as a speculative warm-up
+    // (RayTracingPipelineRequest::background).
     ShaderLibraryPreparation PreparePipelines(RayTracingPipelineWorker& worker, ID3D12Device5* device,
-        const PathTraceLibraryNeeds& needs);
+        const PathTraceLibraryNeeds& needs, const std::vector<std::filesystem::path>* acceptedLibraries = nullptr,
+        bool background = false);
 
     struct PipelineStatistics
     {
@@ -611,6 +653,10 @@ class PathTraceReferencePass
         std::string& failureReason,
         bool rawDiffuseHitDistance = false);
 
+    // Startup work (4.1): the extraction outputs alone, for ReSTIR PT Enhanced, whose kernels write them (it records none of
+    // the extraction pipelines). False when the pass is not initialized or they cannot be allocated.
+    bool EnsureSignalExtractionTargets(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
     // The extraction outputs: diffuse RGB; specular RGB and the primary specular hit distance in alpha.
     Texture& GetDiffuseTexture()
     {
@@ -738,6 +784,16 @@ class PathTraceReferencePass
     // Retained alongside the originals until the caller's existing idle teardown boundary.
     std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_rayQueryPipelines;
     bool m_secondaryShadowRayQuery = false;
+    // Startup work (4.6): SelectRayQueryOnly; and the library a slot is built from (the twin's when RayQuery-only).
+    bool m_rayQueryOnly = false;
+    std::filesystem::path SlotLibraryPath(const std::filesystem::path& path) const;
+    // Startup work (4.6): each slot built from its twin, with the TraceRay description it would otherwise have used, and
+    // the TraceRay pipelines PrepareTraceRayFallbacks made for them (used only when all are ready and RayQuery is off).
+    std::map<RayTracingPipeline*, RayTracingPipelineDescription> m_rayQuerySlots;
+    std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_traceRayPipelines;
+    bool m_traceRayFallbacksReady = false;
+    bool m_traceRayFallbacksFailed = false;
+    void ForgetRayQuerySlot(RayTracingPipeline& slot);
     bool m_primaryDiExtractionPipelineReady = false;
 
     // True once any library or pipeline exists, after which the library selection cannot change.

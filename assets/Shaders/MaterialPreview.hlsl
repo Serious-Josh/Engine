@@ -1,5 +1,6 @@
 // Isolated fixed-material preview. No production shader or scene table changes.
 #include "MaterialLighting.hlsli"
+#include "SurfaceDetail.hlsli"
 
 cbuffer GeometryConstants : register(b0)
 {
@@ -114,352 +115,6 @@ struct GBufferOutput
     float4 geometricNormal : SV_Target3;
 };
 
-// Adapted from Triangle.hlsl: TryGetWorldViewDirection, TryGetPhysicalHeightUVMetric,
-// and TryIntersectPOMHeightfield. Only camera recovery differs: preview b0 supplies its position.
-bool TryGetWorldViewDirection(
-    float3 worldPosition,
-    out float3 worldViewDirection)
-{
-    worldViewDirection = float3(0.0f, 0.0f, 0.0f);
-    float3 cameraWorld = previewCameraPosition.xyz;
-
-    if(!all(isfinite(worldPosition)) || !all(isfinite(cameraWorld)))
-    {
-        return false;
-    }
-
-    float3 direction = cameraWorld - worldPosition;
-    float lengthSquared = dot(direction, direction);
-
-    if(!all(isfinite(direction)) || !isfinite(lengthSquared) || lengthSquared <= 1.0e-8f)
-    {
-        return false;
-    }
-
-    worldViewDirection = direction * rsqrt(lengthSquared);
-
-    return true;
-}
-
-bool TryGetPhysicalHeightUVMetric(
-    float3 worldPosition,
-    float2 originalUV,
-    float3 worldNormal,
-    float3 worldViewDirection,
-    float3 positionDx,
-    float3 positionDy,
-    float2 uvDx,
-    float2 uvDy,
-    out float2 uvPerWorldHeight)
-{
-    uvPerWorldHeight = float2(0.0f, 0.0f);
-
-    if(!all(isfinite(worldPosition)) || !all(isfinite(originalUV)) ||
-       !all(isfinite(worldNormal)) || !all(isfinite(worldViewDirection)))
-    {
-        return false;
-    }
-
-    if(!all(isfinite(positionDx)) || !all(isfinite(positionDy)) ||
-       !all(isfinite(uvDx)) || !all(isfinite(uvDy)))
-    {
-        return false;
-    }
-
-    // Normalize the UV Jacobian before testing its relative conditioning.
-    // Signed determinants preserve mirrored UV charts.
-    const float minimumScale = 1.0e-15f;
-    const float conditioningTolerance = 1.0e-6f;
-    float uvScale = max(max(abs(uvDx.x), abs(uvDx.y)), max(abs(uvDy.x), abs(uvDy.y)));
-
-    if(uvScale < minimumScale)
-    {
-        return false;
-    }
-
-    float2 Ux = uvDx / uvScale;
-    float2 Uy = uvDy / uvScale;
-    float D = Ux.x * Uy.y - Ux.y * Uy.x;
-    float uvMagnitudeSquared = dot(Ux, Ux) + dot(Uy, Uy);
-
-    if(abs(D) <= conditioningTolerance * uvMagnitudeSquared)
-    {
-        return false;
-    }
-
-    float3 Pu = ((positionDx * Uy.y - positionDy * Ux.y) / D) / uvScale;
-    float3 Pv = ((positionDy * Ux.x - positionDx * Uy.x) / D) / uvScale;
-
-    if(!all(isfinite(Pu)) || !all(isfinite(Pv)))
-    {
-        return false;
-    }
-
-    // Scale both axes equally so the Gram matrix cannot overflow from world units.
-    float metricScale = max(max(abs(Pu.x), abs(Pu.y)), abs(Pu.z));
-    metricScale = max(metricScale, max(max(abs(Pv.x), abs(Pv.y)), abs(Pv.z)));
-
-    if(metricScale < minimumScale)
-    {
-        return false;
-    }
-
-    float3 U = Pu / metricScale;
-    float3 V = Pv / metricScale;
-    float g00 = dot(U, U);
-    float g01 = dot(U, V);
-    float g11 = dot(V, V);
-
-    float determinant = g00 * g11 - g01 * g01;
-    float trace = g00 + g11;
-
-    if(!isfinite(determinant) || determinant <= conditioningTolerance * trace * trace)
-    {
-        return false;
-    }
-
-    float3 planeNormal = cross(U, V);
-    float normalLengthSquared = dot(planeNormal, planeNormal);
-    float referenceScale = max(max(abs(worldNormal.x), abs(worldNormal.y)), abs(worldNormal.z));
-
-    if(!isfinite(normalLengthSquared) || normalLengthSquared < minimumScale || referenceScale < minimumScale)
-    {
-        return false;
-    }
-
-    float3 N = planeNormal * rsqrt(normalLengthSquared);
-    float orientation = dot(N, worldNormal / referenceScale);
-
-    if(!isfinite(orientation) || abs(orientation) <= conditioningTolerance)
-    {
-        return false;
-    }
-
-    N *= orientation < 0.0f ? -1.0f : 1.0f;
-    float viewLengthSquared = dot(worldViewDirection, worldViewDirection);
-
-    if(!isfinite(viewLengthSquared) || viewLengthSquared < minimumScale)
-    {
-        return false;
-    }
-
-    float3 viewDirection = worldViewDirection * rsqrt(viewLengthSquared);
-    float Vn = dot(viewDirection, N);
-
-    // Reject back faces and angles within approximately 2.9 degrees of grazing.
-    if(!isfinite(Vn) || Vn <= 0.05f)
-    {
-        return false;
-    }
-
-    float3 W = viewDirection / Vn - N;
-    float2 rhs = float2(dot(U, W), dot(V, W));
-    float2 q = float2(g11 * rhs.x - g01 * rhs.y, g00 * rhs.y - g01 * rhs.x);
-    q = (q / determinant) / metricScale;
-
-    if(!all(isfinite(W)) || !all(isfinite(rhs)) || !all(isfinite(q)))
-    {
-        return false;
-    }
-
-    // q is UV travel per world-space height; future POM uses originalUV + q * height.
-    uvPerWorldHeight = q;
-
-    return true;
-}
-
-bool TryIntersectPOMHeightfield(
-    GPUMaterial material,
-    float2 originalUV,
-    float2 originalUVDx,
-    float2 originalUVDy,
-    bool metricValid,
-    float2 uvPerWorldHeight,
-    float viewNormalCosine,
-    out float2 parallaxUV)
-{
-    parallaxUV = originalUV;
-
-    // Geometry fallback requires a separate representation-selection contract.
-    if(material.surfaceDetailMode != SurfaceDetailModeParallaxOcclusion ||
-       material.heightTextureIndex == 0xFFFFFFFFu || !metricValid)
-    {
-        return false;
-    }
-
-    if(!all(isfinite(originalUV)) || !all(isfinite(originalUVDx)) ||
-       !all(isfinite(originalUVDy)) || !all(isfinite(uvPerWorldHeight)))
-    {
-        return false;
-    }
-
-    if(!isfinite(material.heightScale) || !isfinite(material.heightBias) ||
-       !isfinite(viewNormalCosine) || viewNormalCosine <= 0.05f || viewNormalCosine > 1.0f)
-    {
-        return false;
-    }
-
-    // Heights are world distances. Do not normalize away the reference-plane bias.
-    const float minimumHeightRange = 1.0e-6f;
-    float heightEnd = material.heightBias + material.heightScale;
-    float hMin = min(material.heightBias, heightEnd);
-    float hMax = max(material.heightBias, heightEnd);
-    float heightRange = hMax - hMin;
-
-    if(!isfinite(heightEnd) || !isfinite(heightRange) ||
-       abs(material.heightScale) <= minimumHeightRange || heightRange <= minimumHeightRange)
-    {
-        return false;
-    }
-
-    // Bound the entire signed interval, including bias, without clipping the ray.
-    // A one-UV-unit Euclidean radius is a conservative initial sampling limit.
-    const float maximumUVDisplacement = 1.0f;
-    float2 minOffset = uvPerWorldHeight * hMin;
-    float2 maxOffset = uvPerWorldHeight * hMax;
-
-    if(!all(isfinite(minOffset)) || !all(isfinite(maxOffset)))
-    {
-        return false;
-    }
-
-    float minTravelSquared = dot(minOffset, minOffset);
-    float maxTravelSquared = dot(maxOffset, maxOffset);
-
-    if(!isfinite(minTravelSquared) || !isfinite(maxTravelSquared) ||
-       max(minTravelSquared, maxTravelSquared) > maximumUVDisplacement * maximumUVDisplacement)
-    {
-        return false;
-    }
-
-    if(!all(isfinite(originalUV + minOffset)) || !all(isfinite(originalUV + maxOffset)))
-    {
-        return false;
-    }
-
-    float projectedTravel = length(maxOffset - minOffset);
-    float obliqueness = 1.0f - saturate(viewNormalCosine);
-    uint stepCount = 8u + (uint)ceil(24.0f * max(saturate(projectedTravel), obliqueness));
-    stepCount = min(stepCount, 32u);
-
-    Texture2D<float4> heightTexture = ResourceDescriptorHeap[
-        NonUniformResourceIndex(material.heightTextureIndex)];
-    float sampledHeight = heightTexture.SampleGrad(
-        sampler0, originalUV + maxOffset, originalUVDx, originalUVDy).r;
-
-    // The interval assumes a normalized height channel; other ranges are unsupported.
-    if(!isfinite(sampledHeight) || sampledHeight < 0.0f || sampledHeight > 1.0f)
-    {
-        return false;
-    }
-
-    float surfaceHeight = material.heightScale * sampledHeight + material.heightBias;
-
-    if(!isfinite(surfaceHeight) || surfaceHeight > hMax)
-    {
-        return false;
-    }
-
-    if(surfaceHeight == hMax)
-    {
-        parallaxUV = originalUV + maxOffset;
-        return true;
-    }
-
-    float upperHeight = hMax;
-    float lowerHeight = hMin;
-    bool bracketFound = false;
-
-    [loop]
-    for(uint step = 1u; step <= 32u; ++step)
-    {
-        if(step > stepCount)
-        {
-            break;
-        }
-
-        float rayHeight = lerp(hMax, hMin, float(step) / float(stepCount));
-        float2 rayUV = originalUV + uvPerWorldHeight * rayHeight;
-        if(!isfinite(rayHeight) || !all(isfinite(rayUV)))
-        {
-            return false;
-        }
-
-        sampledHeight = heightTexture.SampleGrad(sampler0, rayUV, originalUVDx, originalUVDy).r;
-
-        if(!isfinite(sampledHeight) || sampledHeight < 0.0f || sampledHeight > 1.0f)
-        {
-            return false;
-        }
-
-        surfaceHeight = material.heightScale * sampledHeight + material.heightBias;
-
-        if(!isfinite(surfaceHeight))
-        {
-            return false;
-        }
-
-        if(rayHeight <= surfaceHeight)
-        {
-            lowerHeight = rayHeight;
-            bracketFound = true;
-            break;
-        }
-
-        upperHeight = rayHeight;
-    }
-
-    if(!bracketFound)
-    {
-        return false;
-    }
-
-    [unroll]
-    for(uint refinement = 0u; refinement < 4u; ++refinement)
-    {
-        float rayHeight = lerp(lowerHeight, upperHeight, 0.5f);
-        float2 rayUV = originalUV + uvPerWorldHeight * rayHeight;
-        if(!isfinite(rayHeight) || !all(isfinite(rayUV)))
-        {
-            return false;
-        }
-
-        sampledHeight = heightTexture.SampleGrad(sampler0, rayUV, originalUVDx, originalUVDy).r;
-
-        if(!isfinite(sampledHeight) || sampledHeight < 0.0f || sampledHeight > 1.0f)
-        {
-            return false;
-        }
-
-        surfaceHeight = material.heightScale * sampledHeight + material.heightBias;
-
-        if(!isfinite(surfaceHeight))
-        {
-            return false;
-        }
-
-        if(rayHeight <= surfaceHeight)
-        {
-            lowerHeight = rayHeight;
-        }
-        else
-        {
-            upperHeight = rayHeight;
-        }
-    }
-
-    float2 refinedUV = originalUV + uvPerWorldHeight * lerp(lowerHeight, upperHeight, 0.5f);
-
-    if(!all(isfinite(refinedUV)))
-    {
-        return false;
-    }
-
-    parallaxUV = refinedUV;
-
-    return true;
-}
-
 GBufferOutput SpherePS(SphereOutput input)
 {
     GBufferOutput output;
@@ -472,48 +127,28 @@ GBufferOutput SpherePS(SphereOutput input)
     const GPUMaterial previewMaterial = PreviewMaterial();
     GPUMaterial material = previewMaterial;
 
-    // Unsupported modes and invalid POM inputs retain the interpolated UV.
-    float2 resolvedMaterialUV = input.uv;
+    // The same parallax occlusion mapping as the scene's G-buffer pass (SurfaceDetail.hlsli).
+    SurfaceDetailResult detail;
+    detail.uv = input.uv;
+    detail.height = 0.0f;
+    detail.viewCosine = 0.0f;
+    detail.fade = 0.0f;
+    detail.displaced = false;
+    detail.explicitGradients = false;
+    detail.uvDx = uvDx;
+    detail.uvDy = uvDy;
 
-    // The physical metric uses the geometric plane, independently of normal mapping.
-    float3 worldViewDirection;
-    bool hasWorldViewDirection = TryGetWorldViewDirection(input.worldPosition, worldViewDirection);
-
-    float2 uvPerWorldHeight;
-    bool hasPhysicalHeightUVMetric = TryGetPhysicalHeightUVMetric(
-        input.worldPosition,
-        input.uv,
-        input.normal,
-        worldViewDirection,
-        positionDx,
-        positionDy,
-        uvDx,
-        uvDy,
-        uvPerWorldHeight);
-
-    if(material.surfaceDetailMode == SurfaceDetailModeParallaxOcclusion &&
-       hasWorldViewDirection && hasPhysicalHeightUVMetric)
+    if(SurfaceDetailUsesParallax(material))
     {
-        // Normalized derivative axes avoid overflow from world-space magnitudes.
-        float3 planeNormal = normalize(cross(normalize(positionDx), normalize(positionDy)));
-        planeNormal *= dot(planeNormal, input.normal) < 0.0f ? -1.0f : 1.0f;
-        float viewNormalCosine = dot(worldViewDirection, planeNormal);
-        float2 parallaxUV;
+        float3 toCamera = previewCameraPosition.xyz - input.worldPosition;
+        float distanceSquared = dot(toCamera, toCamera);
 
-        if(TryIntersectPOMHeightfield(
-            material,
-            input.uv,
-            uvDx,
-            uvDy,
-            hasPhysicalHeightUVMetric,
-            uvPerWorldHeight,
-            viewNormalCosine,
-            parallaxUV))
+        if(distanceSquared > 1.0e-8f)
         {
-            resolvedMaterialUV = parallaxUV;
+            detail = SurfaceDetailResolve(material, sampler0, input.uv, uvDx, uvDy, positionDx, positionDy,
+                input.normal, input.tangent, toCamera * rsqrt(distanceSquared), 0.0f);
         }
     }
-
 
     float3 baseColor = previewMaterial.baseColor;
     float roughness = previewMaterial.roughness;
@@ -523,7 +158,7 @@ GBufferOutput SpherePS(SphereOutput input)
     if(previewMaterial.textureIndex != 0xFFFFFFFFu)
     {
         Texture2D<float4> texture = ResourceDescriptorHeap[previewMaterial.textureIndex];
-        baseColor *= texture.Sample(sampler0, resolvedMaterialUV).rgb;
+        baseColor *= SurfaceDetailSample(texture, sampler0, detail, 0.0f).rgb;
     }
 
     bool useARM = previewMaterial.armTextureIndex != 0xFFFFFFFFu && previewMaterial.preferARM != 0u;
@@ -531,7 +166,7 @@ GBufferOutput SpherePS(SphereOutput input)
     if(useARM)
     {
         Texture2D<float4> texture = ResourceDescriptorHeap[previewMaterial.armTextureIndex];
-        float3 arm = texture.Sample(sampler0, resolvedMaterialUV).rgb;
+        float3 arm = SurfaceDetailSample(texture, sampler0, detail, 0.0f).rgb;
         ao = saturate(arm.r);
         roughness = saturate(roughness * arm.g);
         metallic = saturate(metallic * arm.b);
@@ -541,19 +176,19 @@ GBufferOutput SpherePS(SphereOutput input)
         if(previewMaterial.roughnessTextureIndex != 0xFFFFFFFFu)
         {
             Texture2D<float4> texture = ResourceDescriptorHeap[previewMaterial.roughnessTextureIndex];
-            roughness = saturate(roughness * texture.Sample(sampler0, resolvedMaterialUV).r);
+            roughness = saturate(roughness * SurfaceDetailSample(texture, sampler0, detail, 0.0f).r);
         }
 
         if(previewMaterial.metallicTextureIndex != 0xFFFFFFFFu)
         {
             Texture2D<float4> texture = ResourceDescriptorHeap[previewMaterial.metallicTextureIndex];
-            metallic = saturate(metallic * texture.Sample(sampler0, resolvedMaterialUV).r);
+            metallic = saturate(metallic * SurfaceDetailSample(texture, sampler0, detail, 0.0f).r);
         }
 
         if(previewMaterial.aoTextureIndex != 0xFFFFFFFFu)
         {
             Texture2D<float4> texture = ResourceDescriptorHeap[previewMaterial.aoTextureIndex];
-            ao = saturate(texture.Sample(sampler0, resolvedMaterialUV).r);
+            ao = saturate(SurfaceDetailSample(texture, sampler0, detail, 0.0f).r);
         }
     }
 
@@ -563,7 +198,7 @@ GBufferOutput SpherePS(SphereOutput input)
     if(previewMaterial.normalTextureIndex != 0xFFFFFFFFu)
     {
         Texture2D<float4> texture = ResourceDescriptorHeap[previewMaterial.normalTextureIndex];
-        float2 xy = texture.Sample(sampler0, resolvedMaterialUV).rg * 2.0f - 1.0f;
+        float2 xy = SurfaceDetailSample(texture, sampler0, detail, 0.0f).rg * 2.0f - 1.0f;
         float3 sampledNormal = float3(xy, sqrt(saturate(1.0f - dot(xy, xy))));
         float3 tangent = input.tangent.xyz - N * dot(N, input.tangent.xyz);
         float tangentLength = dot(tangent, tangent);

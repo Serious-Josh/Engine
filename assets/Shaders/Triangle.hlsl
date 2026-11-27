@@ -1,4 +1,6 @@
 #include "MaterialLighting.hlsli"
+#include "SurfaceDetail.hlsli"
+#include "SurfaceDetailSilhouette.hlsli"
 #include "PsrEligibility.hlsli"
 
 #define DEBUG_DISPLACEMENT_TEST_LOD 1
@@ -13,7 +15,9 @@ struct VSInput
 
 struct VSOutput
 {
-    float4 position : SV_POSITION;
+    // A pixel shader with a conservative depth output (PSMainParallax) must read the position with this interpolation.
+    // The targets have one sample at the pixel centre, where it is the same value as the default.
+    linear noperspective centroid float4 position : SV_POSITION;
     float3 worldNormal : NORMAL;
     float2 uv : TEXCOORD;
     float4 currentClipPosition : TEXCOORD1;
@@ -35,6 +39,23 @@ struct PSOutput
     // P5D.2A raster identity (GBuffer::IdentityFormat): (TLAS InstanceID + 1, TLAS primitive), or all ones when this
     // draw has no exact TLAS mapping.
     uint2 identity : SV_Target4;
+};
+
+// PSMainParallax's outputs: the same targets, and the depth of the point the view ray meets on the relief. The semantic
+// promises a depth at or behind the triangle's, so the early depth test still rejects hidden fragments.
+struct PSParallaxOutput
+{
+    PSOutput targets;
+    float depth : SV_DepthGreaterEqual;
+};
+
+// What a pixel's motion vector is made from: the clip positions of its point now (without jitter) and a frame ago, and
+// the view depths of both.
+struct MotionInputs
+{
+    float4 currentClipPosition;
+    float4 previousClipPosition;
+    float2 viewDepths;
 };
 
 cbuffer MaterialConstants : register(b0)
@@ -63,24 +84,20 @@ cbuffer CameraConstants : register(b1)
     // UPSCALING.3D: material texture mip bias, non-zero only while DLSS reconstructs the frame (0 keeps Sample).
     float textureMipBias;
     // PSR.2: non-zero only on Path Tracing frames with in-place replacement enabled: identity.x bit 31 marks
-    // PSR-eligible mirrors (PsrEligibility.hlsli). The path tracer's camera for the decode it evaluates.
+    // PSR-eligible mirrors (PsrEligibility.hlsli).
     uint psrEligibility;
+    // The camera the lift scales are measured with (PrimarySurfaceLift.hlsli), which is the path tracer's camera for the
+    // decode the eligibility evaluates. Set on every frame.
     uint2 psrResolution;
     row_major float4x4 psrInverseCameraRelativeViewProjection;
     float3 psrCameraPosition;
-    // Non-zero on Path Tracing frames with a raster primary: the geometric normal is stored with the pixel's lift scale as
-    // its length, measured with the camera above (which those frames always set).
+    // Non-zero on Path Tracing frames with a raster primary: every pixel's geometric normal is stored with its lift scale
+    // as its length. (A relief pixel of PSMainParallax stores its scale on every frame.)
     uint primarySurfaceLiftScale;
-}
-
-float4 SampleMaterialTexture(Texture2D<float4> materialTexture, SamplerState materialSampler, float2 uv)
-{
-    if(textureMipBias != 0.0f)
-    {
-        return materialTexture.SampleBias(materialSampler, uv, textureMipBias);
-    }
-
-    return materialTexture.Sample(materialSampler, uv);
+    // Silhouette parallax occlusion mapping: the ray tracing instance records, or 0xFFFFFFFF
+    // (SurfaceDetailSilhouette.hlsli).
+    uint instanceDataIndex;
+    uint3 cameraPadding;
 }
 
 cbuffer ObjectConstants : register(b2)
@@ -122,325 +139,6 @@ bool TryGetWorldViewDirection(
     }
 
     worldViewDirection = direction * rsqrt(lengthSquared);
-
-    return true;
-}
-
-bool TryGetPhysicalHeightUVMetric(
-    float3 worldPosition,
-    float2 originalUV,
-    float3 worldNormal,
-    float3 worldViewDirection,
-    float3 positionDx,
-    float3 positionDy,
-    float2 uvDx,
-    float2 uvDy,
-    out float2 uvPerWorldHeight)
-{
-    uvPerWorldHeight = float2(0.0f, 0.0f);
-
-    if(!all(isfinite(worldPosition)) || !all(isfinite(originalUV)) ||
-       !all(isfinite(worldNormal)) || !all(isfinite(worldViewDirection)))
-    {
-        return false;
-    }
-
-    if(!all(isfinite(positionDx)) || !all(isfinite(positionDy)) ||
-       !all(isfinite(uvDx)) || !all(isfinite(uvDy)))
-    {
-        return false;
-    }
-
-    // Normalize the UV Jacobian before testing its relative conditioning.
-    // Signed determinants preserve mirrored UV charts.
-    const float minimumScale = 1.0e-15f;
-    const float conditioningTolerance = 1.0e-6f;
-    float uvScale = max(max(abs(uvDx.x), abs(uvDx.y)), max(abs(uvDy.x), abs(uvDy.y)));
-
-    if(uvScale < minimumScale)
-    {
-        return false;
-    }
-
-    float2 Ux = uvDx / uvScale;
-    float2 Uy = uvDy / uvScale;
-    float D = Ux.x * Uy.y - Ux.y * Uy.x;
-    float uvMagnitudeSquared = dot(Ux, Ux) + dot(Uy, Uy);
-
-    if(abs(D) <= conditioningTolerance * uvMagnitudeSquared)
-    {
-        return false;
-    }
-
-    float3 Pu = ((positionDx * Uy.y - positionDy * Ux.y) / D) / uvScale;
-    float3 Pv = ((positionDy * Ux.x - positionDx * Uy.x) / D) / uvScale;
-
-    if(!all(isfinite(Pu)) || !all(isfinite(Pv)))
-    {
-        return false;
-    }
-
-    // Scale both axes equally so the Gram matrix cannot overflow from world units.
-    float metricScale = max(max(abs(Pu.x), abs(Pu.y)), abs(Pu.z));
-    metricScale = max(metricScale, max(max(abs(Pv.x), abs(Pv.y)), abs(Pv.z)));
-
-    if(metricScale < minimumScale)
-    {
-        return false;
-    }
-
-    float3 U = Pu / metricScale;
-    float3 V = Pv / metricScale;
-    float g00 = dot(U, U);
-    float g01 = dot(U, V);
-    float g11 = dot(V, V);
-
-    float determinant = g00 * g11 - g01 * g01;
-    float trace = g00 + g11;
-
-    if(!isfinite(determinant) || determinant <= conditioningTolerance * trace * trace)
-    {
-        return false;
-    }
-
-    float3 planeNormal = cross(U, V);
-    float normalLengthSquared = dot(planeNormal, planeNormal);
-    float referenceScale = max(max(abs(worldNormal.x), abs(worldNormal.y)), abs(worldNormal.z));
-
-    if(!isfinite(normalLengthSquared) || normalLengthSquared < minimumScale || referenceScale < minimumScale)
-    {
-        return false;
-    }
-
-    float3 N = planeNormal * rsqrt(normalLengthSquared);
-    float orientation = dot(N, worldNormal / referenceScale);
-
-    if(!isfinite(orientation) || abs(orientation) <= conditioningTolerance)
-    {
-        return false;
-    }
-
-    N *= orientation < 0.0f ? -1.0f : 1.0f;
-    float viewLengthSquared = dot(worldViewDirection, worldViewDirection);
-
-    if(!isfinite(viewLengthSquared) || viewLengthSquared < minimumScale)
-    {
-        return false;
-    }
-
-    float3 viewDirection = worldViewDirection * rsqrt(viewLengthSquared);
-    float Vn = dot(viewDirection, N);
-
-    // Reject back faces and angles within approximately 2.9 degrees of grazing.
-    if(!isfinite(Vn) || Vn <= 0.05f)
-    {
-        return false;
-    }
-
-    float3 W = viewDirection / Vn - N;
-    float2 rhs = float2(dot(U, W), dot(V, W));
-    float2 q = float2(g11 * rhs.x - g01 * rhs.y, g00 * rhs.y - g01 * rhs.x);
-    q = (q / determinant) / metricScale;
-
-    if(!all(isfinite(W)) || !all(isfinite(rhs)) || !all(isfinite(q)))
-    {
-        return false;
-    }
-
-    // q is UV travel per world-space height; future POM uses originalUV + q * height.
-    uvPerWorldHeight = q;
-
-    return true;
-}
-
-bool TryIntersectPOMHeightfield(
-    GPUMaterial material,
-    float2 originalUV,
-    float2 originalUVDx,
-    float2 originalUVDy,
-    bool metricValid,
-    float2 uvPerWorldHeight,
-    float viewNormalCosine,
-    out float2 parallaxUV)
-{
-    parallaxUV = originalUV;
-
-    // Geometry fallback requires a separate representation-selection contract.
-    if(material.surfaceDetailMode != SurfaceDetailModeParallaxOcclusion ||
-       material.heightTextureIndex == 0xFFFFFFFFu || !metricValid)
-    {
-        return false;
-    }
-
-    if(!all(isfinite(originalUV)) || !all(isfinite(originalUVDx)) ||
-       !all(isfinite(originalUVDy)) || !all(isfinite(uvPerWorldHeight)))
-    {
-        return false;
-    }
-
-    if(!isfinite(material.heightScale) || !isfinite(material.heightBias) ||
-       !isfinite(viewNormalCosine) || viewNormalCosine <= 0.05f || viewNormalCosine > 1.0f)
-    {
-        return false;
-    }
-
-    // Heights are world distances. Do not normalize away the reference-plane bias.
-    const float minimumHeightRange = 1.0e-6f;
-    float heightEnd = material.heightBias + material.heightScale;
-    float hMin = min(material.heightBias, heightEnd);
-    float hMax = max(material.heightBias, heightEnd);
-    float heightRange = hMax - hMin;
-
-    if(!isfinite(heightEnd) || !isfinite(heightRange) ||
-       abs(material.heightScale) <= minimumHeightRange || heightRange <= minimumHeightRange)
-    {
-        return false;
-    }
-
-    // Bound the entire signed interval, including bias, without clipping the ray.
-    // A one-UV-unit Euclidean radius is a conservative initial sampling limit.
-    const float maximumUVDisplacement = 1.0f;
-    float2 minOffset = uvPerWorldHeight * hMin;
-    float2 maxOffset = uvPerWorldHeight * hMax;
-
-    if(!all(isfinite(minOffset)) || !all(isfinite(maxOffset)))
-    {
-        return false;
-    }
-
-    float minTravelSquared = dot(minOffset, minOffset);
-    float maxTravelSquared = dot(maxOffset, maxOffset);
-
-    if(!isfinite(minTravelSquared) || !isfinite(maxTravelSquared) ||
-       max(minTravelSquared, maxTravelSquared) > maximumUVDisplacement * maximumUVDisplacement)
-    {
-        return false;
-    }
-
-    if(!all(isfinite(originalUV + minOffset)) || !all(isfinite(originalUV + maxOffset)))
-    {
-        return false;
-    }
-
-    float projectedTravel = length(maxOffset - minOffset);
-    float obliqueness = 1.0f - saturate(viewNormalCosine);
-    uint stepCount = 8u + (uint)ceil(24.0f * max(saturate(projectedTravel), obliqueness));
-    stepCount = min(stepCount, 32u);
-
-    Texture2D<float4> heightTexture = ResourceDescriptorHeap[
-        NonUniformResourceIndex(material.heightTextureIndex)];
-    float sampledHeight = heightTexture.SampleGrad(
-        sampler0, originalUV + maxOffset, originalUVDx, originalUVDy).r;
-
-    // The interval assumes a normalized height channel; other ranges are unsupported.
-    if(!isfinite(sampledHeight) || sampledHeight < 0.0f || sampledHeight > 1.0f)
-    {
-        return false;
-    }
-
-    float surfaceHeight = material.heightScale * sampledHeight + material.heightBias;
-
-    if(!isfinite(surfaceHeight) || surfaceHeight > hMax)
-    {
-        return false;
-    }
-
-    if(surfaceHeight == hMax)
-    {
-        parallaxUV = originalUV + maxOffset;
-        return true;
-    }
-
-    float upperHeight = hMax;
-    float lowerHeight = hMin;
-    bool bracketFound = false;
-
-    [loop]
-    for(uint step = 1u; step <= 32u; ++step)
-    {
-        if(step > stepCount)
-        {
-            break;
-        }
-
-        float rayHeight = lerp(hMax, hMin, float(step) / float(stepCount));
-        float2 rayUV = originalUV + uvPerWorldHeight * rayHeight;
-        if(!isfinite(rayHeight) || !all(isfinite(rayUV)))
-        {
-            return false;
-        }
-
-        sampledHeight = heightTexture.SampleGrad(sampler0, rayUV, originalUVDx, originalUVDy).r;
-
-        if(!isfinite(sampledHeight) || sampledHeight < 0.0f || sampledHeight > 1.0f)
-        {
-            return false;
-        }
-
-        surfaceHeight = material.heightScale * sampledHeight + material.heightBias;
-
-        if(!isfinite(surfaceHeight))
-        {
-            return false;
-        }
-
-        if(rayHeight <= surfaceHeight)
-        {
-            lowerHeight = rayHeight;
-            bracketFound = true;
-            break;
-        }
-
-        upperHeight = rayHeight;
-    }
-
-    if(!bracketFound)
-    {
-        return false;
-    }
-
-    [unroll]
-    for(uint refinement = 0u; refinement < 4u; ++refinement)
-    {
-        float rayHeight = lerp(lowerHeight, upperHeight, 0.5f);
-        float2 rayUV = originalUV + uvPerWorldHeight * rayHeight;
-        if(!isfinite(rayHeight) || !all(isfinite(rayUV)))
-        {
-            return false;
-        }
-
-        sampledHeight = heightTexture.SampleGrad(sampler0, rayUV, originalUVDx, originalUVDy).r;
-
-        if(!isfinite(sampledHeight) || sampledHeight < 0.0f || sampledHeight > 1.0f)
-        {
-            return false;
-        }
-
-        surfaceHeight = material.heightScale * sampledHeight + material.heightBias;
-
-        if(!isfinite(surfaceHeight))
-        {
-            return false;
-        }
-
-        if(rayHeight <= surfaceHeight)
-        {
-            lowerHeight = rayHeight;
-        }
-        else
-        {
-            upperHeight = rayHeight;
-        }
-    }
-
-    float2 refinedUV = originalUV + uvPerWorldHeight * lerp(lowerHeight, upperHeight, 0.5f);
-
-    if(!all(isfinite(refinedUV)))
-    {
-        return false;
-    }
-
-    parallaxUV = refinedUV;
 
     return true;
 }
@@ -503,7 +201,55 @@ VSOutput VSMain(VSInput input)
     return output;
 }
 
-PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
+PathTracePrimaryCamera GetLiftCamera()
+{
+    PathTracePrimaryCamera camera;
+    camera.inverseCameraRelativeViewProjection = psrInverseCameraRelativeViewProjection;
+    camera.cameraPosition = psrCameraPosition;
+    camera.resolution = psrResolution;
+    return camera;
+}
+
+// The depth the rasterizer would store for a world point (the jittered viewProjection). Never in front of
+// rasterizedDepth, which SV_DepthGreaterEqual promises, and never the background's 1.
+float GetReliefDepth(float3 worldPosition, float rasterizedDepth)
+{
+    const float largestSurfaceDepth = 0.99999994f;
+    float4 clipPosition = mul(viewProjection, float4(worldPosition, 1.0f));
+    float depth = clipPosition.z / clipPosition.w;
+
+    if(!isfinite(depth))
+    {
+        return rasterizedDepth;
+    }
+
+    return max(min(depth, largestSurfaceDepth), rasterizedDepth);
+}
+
+// The motion inputs of the point worldOffset away from the rasterized one (the visible point of a relief). The offset
+// goes back to object space (the inverse of model's 3x3 is the transpose of normalMatrix's) and forward through the
+// previous frame's matrices, as the vertex shader takes the vertex itself. Every term is linear in the offset, so adding
+// to the interpolated values is exact. This is the one place a displaced point's motion is worked out.
+MotionInputs GetOffsetMotionInputs(VSOutput input, float3 worldOffset)
+{
+    float3 objectOffset = mul(worldOffset, (float3x3)normalMatrix);
+    float3 previousWorldOffset = mul((float3x3)previousModel, objectOffset);
+
+    MotionInputs motionInputs;
+    motionInputs.currentClipPosition = input.currentClipPosition +
+        mul(unjitteredViewProjection, float4(worldOffset, 0.0f));
+    motionInputs.previousClipPosition = input.previousClipPosition +
+        mul(previousViewProjection, float4(previousWorldOffset, 0.0f));
+    motionInputs.viewDepths = input.viewDepths + float2(
+        mul(view, float4(worldOffset, 0.0f)).z,
+        mul(previousView, float4(previousWorldOffset, 0.0f)).z);
+    return motionInputs;
+}
+
+// Both pixel shaders. reliefDepth is PSMainParallax's: a parallax pixel then behaves as the point the view ray really
+// meets (depth, motion vectors and the lift scale that brings ray origins back to the mesh surface) instead of the flat
+// triangle. `depth` is the depth to store, the rasterized one wherever that does not apply.
+PSOutput ResolveGBuffer(VSOutput input, uint primitiveID, bool reliefDepth, out float depth)
 {
     PSOutput output;
 
@@ -518,46 +264,59 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
     GPUMaterial material = materials[materialIndex];
     uint normalTextureIndex = material.normalTextureIndex;
 
-    // Unsupported modes and invalid POM inputs retain the interpolated UV.
-    float2 resolvedMaterialUV = input.uv;
+    // Parallax occlusion mapping (SurfaceDetail.hlsli): the UV where the view ray meets the material's height field. The
+    // mesh itself carries no relief, so its reference height is 0.
+    SurfaceDetailResult detail;
+    detail.uv = input.uv;
+    detail.height = 0.0f;
+    detail.viewCosine = 0.0f;
+    detail.fade = 0.0f;
+    detail.displaced = false;
+    detail.explicitGradients = false;
+    detail.uvDx = uvDx;
+    detail.uvDy = uvDy;
 
-    // The physical metric uses the geometric plane, independently of normal mapping.
-    float3 worldViewDirection;
-    bool hasWorldViewDirection = TryGetWorldViewDirection(input.worldPosition, worldViewDirection);
+    // The offset from the rasterized point to the visible point of the relief (zero for every other pixel).
+    float3 reliefOffset = float3(0.0f, 0.0f, 0.0f);
 
-    float2 uvPerWorldHeight;
-    bool hasPhysicalHeightUVMetric = TryGetPhysicalHeightUVMetric(
-        input.worldPosition,
-        input.uv,
-        input.worldNormal,
-        worldViewDirection,
-        positionDx,
-        positionDy,
-        uvDx,
-        uvDy,
-        uvPerWorldHeight);
-
-    if(material.surfaceDetailMode == SurfaceDetailModeParallaxOcclusion &&
-       hasWorldViewDirection && hasPhysicalHeightUVMetric)
+    if(SurfaceDetailUsesParallax(material))
     {
-        // Normalized derivative axes avoid overflow from world-space magnitudes.
-        float3 planeNormal = normalize(cross(normalize(positionDx), normalize(positionDy)));
-        planeNormal *= dot(planeNormal, input.worldNormal) < 0.0f ? -1.0f : 1.0f;
-        float viewNormalCosine = dot(worldViewDirection, planeNormal);
-        float2 parallaxUV;
+        float3 worldViewDirection;
 
-        if(TryIntersectPOMHeightfield(
-            material,
-            input.uv,
-            uvDx,
-            uvDy,
-            hasPhysicalHeightUVMetric,
-            uvPerWorldHeight,
-            viewNormalCosine,
-            parallaxUV))
+        if(TryGetWorldViewDirection(input.worldPosition, worldViewDirection))
         {
-            resolvedMaterialUV = parallaxUV;
+            detail = SurfaceDetailResolve(material, sampler0, input.uv, uvDx, uvDy, positionDx, positionDy,
+                input.worldNormal, input.worldTangent, worldViewDirection, 0.0f);
+
+            if(reliefDepth)
+            {
+                reliefOffset = SurfaceDetailWorldOffset(detail, worldViewDirection);
+
+                // Silhouette parallax occlusion mapping: a view ray that leaves the mesh before it meets the relief
+                // shows what lies behind. Only parallax draws, whose identity names their triangle.
+                bool silhouette = (material.lobeFlags & GPU_MATERIAL_PARALLAX_SILHOUETTE) != 0u && detail.displaced &&
+                    rasterInstance != 0xFFFFFFFFu && instanceDataIndex != 0xFFFFFFFFu;
+
+                if(silhouette)
+                {
+                    StructuredBuffer<RayTracingInstanceData> instances = ResourceDescriptorHeap[instanceDataIndex];
+
+                    if(SurfaceDetailLeavesSilhouette(instances[rasterInstance], rasterPrimitiveBase + primitiveID,
+                        detail.uv))
+                    {
+                        discard;
+                    }
+                }
+            }
         }
+    }
+
+    const bool relief = any(reliefOffset != 0.0f);
+    depth = input.position.z;
+
+    if(relief)
+    {
+        depth = GetReliefDepth(input.worldPosition + reliefOffset, input.position.z);
     }
 
     Texture2D<float4> baseColorTexture =
@@ -566,11 +325,7 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
         ];
 
     float3 sampledBaseColor =
-        SampleMaterialTexture(
-            baseColorTexture,
-            sampler0,
-            resolvedMaterialUV
-        ).rgb;
+        SurfaceDetailSample(baseColorTexture, sampler0, detail, textureMipBias).rgb;
 
     float3 finalBaseColor =
         baseColor *
@@ -583,7 +338,7 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
     {
         Texture2D<float4> armTexture = ResourceDescriptorHeap[
             NonUniformResourceIndex(material.armTextureIndex)];
-        float3 sampledARM = SampleMaterialTexture(armTexture, sampler0, resolvedMaterialUV).rgb;
+        float3 sampledARM = SurfaceDetailSample(armTexture, sampler0, detail, textureMipBias).rgb;
         armRoughnessMetallic = sampledARM.gb;
         materialAO = saturate(sampledARM.r);
     }
@@ -591,7 +346,7 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
     {
         Texture2D<float4> aoTexture = ResourceDescriptorHeap[
             NonUniformResourceIndex(material.aoTextureIndex)];
-        materialAO = saturate(SampleMaterialTexture(aoTexture, sampler0, resolvedMaterialUV).r);
+        materialAO = saturate(SurfaceDetailSample(aoTexture, sampler0, detail, textureMipBias).r);
     }
 
     float finalRoughness = roughness;
@@ -602,7 +357,7 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
     else if(roughnessTextureIndex != 0xFFFFFFFFu)
     {
         Texture2D<float4> roughnessTexture = ResourceDescriptorHeap[roughnessTextureIndex];
-        float sampledRoughness = SampleMaterialTexture(roughnessTexture, sampler0, resolvedMaterialUV).r;
+        float sampledRoughness = SurfaceDetailSample(roughnessTexture, sampler0, detail, textureMipBias).r;
         finalRoughness = saturate(roughness * sampledRoughness);
     }
 
@@ -618,7 +373,7 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
     if(normalTextureIndex != 0xFFFFFFFFu)
     {
         Texture2D<float4> normalTexture = ResourceDescriptorHeap[normalTextureIndex];
-        float2 normalXY = SampleMaterialTexture(normalTexture, sampler0, resolvedMaterialUV).rg * 2.0f - 1.0f;
+        float2 normalXY = SurfaceDetailSample(normalTexture, sampler0, detail, textureMipBias).rg * 2.0f - 1.0f;
         float normalZ = sqrt(saturate(1.0f - dot(normalXY, normalXY)));
         float3 sampledNormal = float3(normalXY, normalZ);
         float3 tangent = input.worldTangent.xyz - N * dot(N, input.worldTangent.xyz);
@@ -655,7 +410,7 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
     {
         Texture2D<float4> metallicTexture = ResourceDescriptorHeap[
             NonUniformResourceIndex(material.metallicTextureIndex)];
-        float sampledMetallic = SampleMaterialTexture(metallicTexture, sampler0, resolvedMaterialUV).r;
+        float sampledMetallic = SurfaceDetailSample(metallicTexture, sampler0, detail, textureMipBias).r;
         effectiveMetallic = saturate(effectiveMetallic * sampledMetallic);
     }
 
@@ -665,45 +420,58 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
     output.identity = rasterInstance == 0xFFFFFFFFu ? uint2(0xFFFFFFFFu, 0xFFFFFFFFu) :
         uint2(rasterInstance + 1u, rasterPrimitiveBase + primitiveID);
 
-    if(psrEligibility != 0u && rasterInstance != 0xFFFFFFFFu)
+    // A relief pixel is never an eligible mirror: PSR recovers a mirror as its flat triangle.
+    if(psrEligibility != 0u && rasterInstance != 0xFFFFFFFFu && !relief)
     {
-        PathTracePrimaryCamera camera;
-        camera.inverseCameraRelativeViewProjection = psrInverseCameraRelativeViewProjection;
-        camera.cameraPosition = psrCameraPosition;
-        camera.resolution = psrResolution;
         StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
 
         if(PsrRasterEligible(uint2(input.position.xy), input.position.z, output.material, output.surface,
-            output.geometricNormal, camera, materials))
+            output.geometricNormal, GetLiftCamera(), materials))
         {
             output.identity.x |= PSR_IDENTITY_ELIGIBLE;
         }
     }
 
-    // The path tracer's lift scale, as the stored geometric normal's length. An eligible mirror keeps its unit normal:
-    // PSR recovers the mirror from its triangle, not from this sample.
-    if(primarySurfaceLiftScale != 0u && !PsrIdentityEligible(output.identity.x))
+    // The pixel's lift scale, as the stored geometric normal's length (PrimarySurfaceLift.hlsli).
+    if(relief)
     {
-        PathTracePrimaryCamera camera;
-        camera.inverseCameraRelativeViewProjection = psrInverseCameraRelativeViewProjection;
-        camera.cameraPosition = psrCameraPosition;
-        camera.resolution = psrResolution;
+        // On every frame: the stored depth lies under the mesh, and every pass that traces from it reads this scale to
+        // return to the mesh surface. The screen derivatives of the position span the triangle's own plane.
+        float3 surfacePosition = mul(model, float4(input.objectPosition, 1.0f)).xyz;
+
+        output.geometricNormal.xyz *= PathTracePrimaryReliefLiftScale(uint2(input.position.xy), depth, surfacePosition,
+            output.geometricNormal.xyz, cross(positionDx, positionDy), GetLiftCamera());
+    }
+    else if(primarySurfaceLiftScale != 0u && !PsrIdentityEligible(output.identity.x))
+    {
+        // The path tracer's lift scale. An eligible mirror keeps its unit normal: PSR recovers the mirror from its
+        // triangle, not from this sample.
         float3 surfacePosition = mul(model, float4(input.objectPosition, 1.0f)).xyz;
 
         output.geometricNormal.xyz *= PathTracePrimaryRasterLiftScale(uint2(input.position.xy), input.position.z,
-            surfacePosition, output.geometricNormal.xyz, camera);
+            surfacePosition, output.geometricNormal.xyz, GetLiftCamera());
     }
 
-    if(all(isfinite(input.currentClipPosition)) &&
-       all(isfinite(input.previousClipPosition)) &&
-       all(isfinite(input.viewDepths)) &&
-       abs(input.currentClipPosition.w) > 1.0e-6f &&
-       abs(input.previousClipPosition.w) > 1.0e-6f)
+    MotionInputs motionInputs;
+    motionInputs.currentClipPosition = input.currentClipPosition;
+    motionInputs.previousClipPosition = input.previousClipPosition;
+    motionInputs.viewDepths = input.viewDepths;
+
+    if(relief)
+    {
+        motionInputs = GetOffsetMotionInputs(input, reliefOffset);
+    }
+
+    if(all(isfinite(motionInputs.currentClipPosition)) &&
+       all(isfinite(motionInputs.previousClipPosition)) &&
+       all(isfinite(motionInputs.viewDepths)) &&
+       abs(motionInputs.currentClipPosition.w) > 1.0e-6f &&
+       abs(motionInputs.previousClipPosition.w) > 1.0e-6f)
     {
         float2 currentNDC =
-            input.currentClipPosition.xy / input.currentClipPosition.w;
+            motionInputs.currentClipPosition.xy / motionInputs.currentClipPosition.w;
         float2 previousNDC =
-            input.previousClipPosition.xy / input.previousClipPosition.w;
+            motionInputs.previousClipPosition.xy / motionInputs.previousClipPosition.w;
 
         float2 currentUV =
             currentNDC * float2(0.5f, -0.5f) + float2(0.5f, 0.5f);
@@ -714,7 +482,7 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
 
         float4 motionVector = float4(
             motion,
-            input.viewDepths.y - input.viewDepths.x,
+            motionInputs.viewDepths.y - motionInputs.viewDepths.x,
             0.0f
         );
 
@@ -726,5 +494,21 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
 
     output.motion.a = materialAO;
 
+    return output;
+}
+
+// Every draw whose material has no parallax: the depth is the rasterizer's.
+PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
+{
+    float depth;
+    return ResolveGBuffer(input, primitiveID, false, depth);
+}
+
+// Draws whose material uses parallax occlusion mapping (SurfaceDetailUsesParallax; the renderer selects the pipeline per
+// draw), so that only they pay for a pixel shader that writes depth.
+PSParallaxOutput PSMainParallax(VSOutput input, uint primitiveID : SV_PrimitiveID)
+{
+    PSParallaxOutput output;
+    output.targets = ResolveGBuffer(input, primitiveID, true, output.depth);
     return output;
 }

@@ -83,6 +83,12 @@ PreparationStep Renderer::PrepareConfiguration(const ConfigurationIdentity& iden
     {
         if(preparation.state == ShaderLibraryPreparationState::Ready)
         {
+            // Startup timing: each preparation set's first readiness for this request, on the startup timeline.
+            if(bit != 0u && (m_preparedSteps & bit) == 0u)
+            {
+                TransitionTiming::StartupMilestone(std::string("preparation set ready: ") + what);
+            }
+
             m_preparedSteps |= bit;
         }
 
@@ -161,6 +167,16 @@ PreparationStep Renderer::PrepareConfiguration(const ConfigurationIdentity& iden
             }
 
             note("ReSTIR PT pipelines", pipelines, 16u);
+        }
+
+        // Layered prep (F5): the material tier the scene needs (its layered lobes and relief shadow), prepared beside the
+        // base set since the scene's materials were known, so the request is presented with those features from its
+        // first lit frame rather than popping in. A failed tier set does not hold the request (it renders without them).
+        // Polled on every pass, never latched: the scene's materials can arrive after the other sets are ready, and the
+        // tier they need then holds the request again.
+        if((m_preparedSteps & 16u) != 0u)
+        {
+            note("ReSTIR PT material tier pipelines", PrepareReSTIRPTMaterialTier(), 0u);
         }
 
         if(m_restirPtSettings.sharc && ReSTIRPTSharcAvailable() && due(32u))
@@ -304,7 +320,29 @@ const RenderingConfiguration& Renderer::SelectPresentedConfiguration(const Rende
 
     if(!m_packagedRuntime && !status.startupPreparing && status.presented.lightingMode != RendererLightingMode::Legacy)
     {
-        PrepareReSTIRPTPipelines();
+        // Startup work (4.1): once ReSTIR PT's own set is ready, the ReSTIR DI set warms behind it.
+        if(PrepareReSTIRPTPipelines().state == ShaderLibraryPreparationState::Ready &&
+            status.presented.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT)
+        {
+            WarmReSTIRDISet(requested);
+        }
+    }
+
+    // Layered prep (F1): while ReSTIR PT is requested, the material tier the published table needs is requested here every
+    // frame, not only from ReSTIR PT recordings, so it prepares while the rest of the configuration (its DXR pipelines,
+    // seconds each when the driver is cold) still prepares: beside the base set before the pass exists, and taken and
+    // adopted (UpdateReSTIRPTTierPipelines) once it does, before the first ReSTIR PT recording.
+    if(requested.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT && !m_restirPtPass.HasFailed())
+    {
+        if(m_restirPtPass.IsInitialized())
+        {
+            UpdateReSTIRPTTierPipelines();
+        }
+        else if(m_restirPtPipelinePreparation == ReSTIRPTPipelinePreparation::Preparing ||
+            m_restirPtPipelinePreparation == ReSTIRPTPipelinePreparation::Prepared)
+        {
+            RequestReSTIRPTTierPipelines();
+        }
     }
 
     // The previous switching frame: if the renderer could not activate the presented mode (it fell back in that recording),
@@ -348,6 +386,66 @@ const RenderingConfiguration& Renderer::SelectPresentedConfiguration(const Rende
     const PreparationStep step = PrepareConfiguration(identity, detail);
     preparation.Prepared(requested, step, detail, now);
     return Presented();
+}
+
+void Renderer::WarmReSTIRDISet(const RenderingConfiguration& requested)
+{
+    using namespace std::chrono_literals;
+
+    // Layered prep (F2): never while a ReSTIR PT material tier's set or kernel group prepares: on a driver-cold start its
+    // DXR pipelines (seconds each) would share the CPU with the kernels the materials on screen wait for. Creations already
+    // in flight finish; the warm-up continues once that ReSTIR PT work is done.
+    if(m_restirDiWarmupSettled || !m_asynchronousDxrPreparation || !m_litFramePresented ||
+        std::chrono::steady_clock::now() - m_firstLitFrameTime < 3s || IsReSTIRPTMaterialWorkPreparing())
+    {
+        return;
+    }
+
+    // The identity a switch to ReSTIR DI would request with the project's settings (its denoiser, SHARC and PSR chain).
+    RenderingConfiguration restirDi = requested;
+    restirDi.lightingMode = RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
+    const ConfigurationIdentity identity = MakeConfigurationIdentity(restirDi);
+    const PathTraceLibraryNeeds needs = GetPathTraceLibraryNeeds(identity.lightingMode, identity.denoiser, identity.sharc);
+    ShaderLibraryPreparation preparation = PrepareDxrLibraries(needs, true);
+
+    // Follow-up 3: the PSR set that request uses (PrepareConfiguration's PSR step): its auxiliary pipelines, then its lighting
+    // libraries (a two-bounce chain the replacement pass cannot provide uses single bounce, as there).
+    if(identity.psrChain != 0 && preparation.state != ShaderLibraryPreparationState::Failed)
+    {
+        const ShaderLibraryPreparation auxiliary = PreparePsrAuxiliary();
+        ShaderLibraryPreparation lighting{};
+        lighting.state = ShaderLibraryPreparationState::PreparingPipelines;
+
+        if(auxiliary.state == ShaderLibraryPreparationState::Ready)
+        {
+            const std::uint32_t chain = identity.psrChain == 2u && !m_psrInPlaceReplacePass.IsChainAvailable() ? 1u :
+                identity.psrChain;
+            PathTraceLibraryNeeds psrNeeds{};
+            psrNeeds.primary = PathTracePrimary::RasterReSTIRDI;
+            psrNeeds.psrChain = chain;
+            psrNeeds.extraction = needs.extraction;
+            psrNeeds.rawDiffuseHitDistance = needs.rawDiffuseHitDistance;
+            psrNeeds.radianceCache = identity.sharc;
+            lighting = PrepareDxrLibraries(psrNeeds, true);
+        }
+
+        for(const ShaderLibraryPreparation* step : std::initializer_list<const ShaderLibraryPreparation*>{&auxiliary, &lighting})
+        {
+            if(step->state == ShaderLibraryPreparationState::Failed ||
+                (step->state != ShaderLibraryPreparationState::Ready && preparation.state == ShaderLibraryPreparationState::Ready))
+            {
+                preparation = *step;
+            }
+        }
+    }
+
+    if(preparation.state == ShaderLibraryPreparationState::Ready || preparation.state == ShaderLibraryPreparationState::Failed)
+    {
+        m_restirDiWarmupSettled = true;
+        TransitionTiming::StartupMilestone("ReSTIR DI background warm-up settled");
+        Log::Info(std::string("ReSTIR DI set (PSR ") + std::to_string(identity.psrChain) + ") warmed in the background: " +
+            (preparation.state == ShaderLibraryPreparationState::Ready ? "ready." : "failed; a switch prepares it again."));
+    }
 }
 
 const RenderingConfiguration& Renderer::Presented()
@@ -433,6 +531,10 @@ bool Renderer::IsPendingConfigurationNrdGroup(int group) const
 
 void Renderer::BeginConfigurationPreparation(const RenderingConfiguration& requested)
 {
+    // Startup work (4.6, decision 3): the Editor prepares the RayQuery flavour only while the setting is on; the TraceRay
+    // fallback is compiled if a RayQuery library fails or the setting is turned off (PrepareTraceRayFallbacks).
+    m_pathTraceReferencePass.SetRayQueryFirst(requested.pathTrace.secondaryShadowRayQuery, m_shaderLibrary);
+
     // Stage 4.4: the same selection a frame makes, made as soon as the configuration is known (before the first frame),
     // so its libraries and pipelines start compiling while the project and scene initialize.
     SelectPresentedConfiguration(requested);

@@ -54,7 +54,9 @@ cbuffer AirSolverConstants : register(b0)
     uint piece1WriteIndex;
     uint pieceIndex;
     uint visibilityIndex;
-    uint2 visibilityPadding;
+    // AIR optimization report items 1, 2 and 4: the activity word the steps OR their findings into (CSResetActivity clears it).
+    uint activityIndex;
+    uint visibilityPadding;
     // CSMotorVisibility: the motor (an index into `motors`), and the box of cells to compute: from visibilityBoxMinimum (x a
     // multiple of 16), visibilityBoxWords.x words of 16 cells along x by visibilityBoxWords.y by visibilityBoxWords.z cells.
     int3 visibilityBoxMinimum;
@@ -721,6 +723,30 @@ float4 StepPiece(int3 cell, uint64_t mask, uint piece)
     return float4(velocity, RelaxTemperature(sampled.w));
 }
 
+// AIR optimization report items 1 and 2: the activity word's bits (AirField.cpp, ActivityMoving and ActivityWarm). A velocity component
+// above AirDormantSpeed (AirField::DormantSpeed) is motion; any non-zero ΔT is warm air (exact: 0 stays 0 under advection and relaxation).
+static const uint AirActivityMoving = 1;
+static const uint AirActivityWarm = 2;
+static const float AirDormantSpeed = 1.0e-4;
+
+// One step's new state of a piece, noted in the activity word: one atomic per wave at most, and none once the word holds the wave's bits.
+void NoteActivity(float4 state0, float4 state1)
+{
+    const bool moving = any(abs(state0.xyz) > AirDormantSpeed) || any(abs(state1.xyz) > AirDormantSpeed);
+    const bool warm = state0.w != 0.0 || state1.w != 0.0;
+    const uint bits = (WaveActiveAnyTrue(moving) ? AirActivityMoving : 0u) | (WaveActiveAnyTrue(warm) ? AirActivityWarm : 0u);
+
+    if(bits != 0 && WaveIsFirstLane())
+    {
+        RWByteAddressBuffer activity = ResourceDescriptorHeap[NonUniformResourceIndex(activityIndex)];
+
+        if((activity.Load(0) & bits) != bits)
+        {
+            activity.InterlockedOr(0, bits);
+        }
+    }
+}
+
 // Both pieces of a cell, the full path, written to the output buffers.
 void StepCell(uint3 slot)
 {
@@ -734,6 +760,7 @@ void StepCell(uint3 slot)
     const float4 state1 = own.piece1 != 0 ? StepPiece(cell, own.piece1, 1) : float4(0.0, 0.0, 0.0, 0.0);
     output0.Store4(address, asuint(state0));
     output1.Store4(address, asuint(state1));
+    NoteActivity(state0, state1);
 }
 
 // The two-pass step. CSStepOpen settles every cell whose whole step meets only open cells: it is one whole piece, its backtrace
@@ -792,6 +819,7 @@ void CSStepOpen(uint3 slot : SV_DispatchThreadID)
         const uint address = AirVelocityAddress(field, slot);
         output0.Store4(address, asuint(float4(velocity, temperature)));
         output1.Store4(address, asuint(float4(0.0, 0.0, 0.0, 0.0)));
+        NoteActivity(float4(velocity, temperature), float4(0.0, 0.0, 0.0, 0.0));
         return;
     }
 
@@ -818,6 +846,30 @@ void CSPrepareSplit()
     list.Store(0, count);
     arguments.Store3(4, uint3(min(groups, SplitGroupsPerRow), (groups + SplitGroupsPerRow - 1) / SplitGroupsPerRow, 1));
     arguments.Store(0, 0);
+}
+
+// AIR optimization report items 1, 2 and 4: one thread clears the activity word before a frame's steps.
+[numthreads(1, 1, 1)]
+void CSResetActivity()
+{
+    RWByteAddressBuffer activity = ResourceDescriptorHeap[NonUniformResourceIndex(activityIndex)];
+    activity.Store(0, 0);
+}
+
+// AIR optimization report item 2: a dormant field's velocity (both pieces, ΔT 0 by then) set exactly to rest, once, as it goes dormant.
+[numthreads(8, 8, 8)]
+void CSZeroVelocity(uint3 slot : SV_DispatchThreadID)
+{
+    if(any(slot >= field.dimensions))
+    {
+        return;
+    }
+
+    RWByteAddressBuffer output0 = ResourceDescriptorHeap[NonUniformResourceIndex(velocityWriteIndex)];
+    RWByteAddressBuffer output1 = ResourceDescriptorHeap[NonUniformResourceIndex(piece1WriteIndex)];
+    const uint address = AirVelocityAddress(field, slot);
+    output0.Store4(address, uint4(0, 0, 0, 0));
+    output1.Store4(address, uint4(0, 0, 0, 0));
 }
 
 // One thread: zeroes the counter (new storage).

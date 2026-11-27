@@ -4,8 +4,12 @@
 #include "Core/Log.h"
 
 #include <d3d12.h>
+#include <windows.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 RayTracingPipelineWorker::~RayTracingPipelineWorker()
@@ -13,11 +17,11 @@ RayTracingPipelineWorker::~RayTracingPipelineWorker()
     Shutdown();
 }
 
-bool RayTracingPipelineWorker::Start()
+bool RayTracingPipelineWorker::Start(unsigned int threadCount)
 {
     std::lock_guard lock(m_mutex);
 
-    if(m_thread.joinable())
+    if(!m_threads.empty())
     {
         return false;
     }
@@ -25,20 +29,39 @@ bool RayTracingPipelineWorker::Start()
     m_running = true;
     m_stopRequested = false;
 
-    try
+    for(unsigned int index = 0; index < (std::max)(threadCount, 1u); ++index)
     {
-        m_thread = std::thread([this]
+        try
         {
-            Run();
-        });
-    }
-    catch(const std::system_error&)
-    {
-        m_running = false;
-        return false;
+            m_threads.emplace_back([this]
+            {
+                Run();
+            });
+        }
+        catch(const std::system_error&)
+        {
+            break;
+        }
     }
 
-    return true;
+    m_running = !m_threads.empty();
+    return m_running;
+}
+
+unsigned int RayTracingPipelineWorker::DefaultThreadCount()
+{
+    if(const char* value = std::getenv("ENGINE_DXR_PIPELINE_WORKERS"))
+    {
+        const int requested = std::atoi(value);
+
+        if(requested >= 1 && requested <= 8)
+        {
+            return static_cast<unsigned int>(requested);
+        }
+    }
+
+    const unsigned int hardwareThreads = (std::max)(std::thread::hardware_concurrency(), 1u);
+    return std::clamp(hardwareThreads / 8u, 2u, 4u);
 }
 
 void RayTracingPipelineWorker::Shutdown()
@@ -48,7 +71,7 @@ void RayTracingPipelineWorker::Shutdown()
     {
         std::lock_guard lock(m_mutex);
 
-        if(!m_thread.joinable())
+        if(m_threads.empty())
         {
             return;
         }
@@ -56,21 +79,25 @@ void RayTracingPipelineWorker::Shutdown()
         m_stopRequested = true;
         m_running = false;
 
-        // Queued jobs never start; only the creation in flight is waited for.
-        for(const std::string& queuedKey : m_queue)
+        // Queued jobs never start; only the creations in flight are waited for.
+        for(std::deque<std::string>* queue : {&m_queue, &m_backgroundQueue})
         {
-            const auto found = m_jobs.find(queuedKey);
-
-            if(found != m_jobs.end())
+            for(const std::string& queuedKey : *queue)
             {
-                found->second.request.device->Release();
-                m_jobs.erase(found);
+                const auto found = m_jobs.find(queuedKey);
+
+                if(found != m_jobs.end())
+                {
+                    found->second.request.device->Release();
+                    m_jobs.erase(found);
+                }
             }
+
+            m_activity.dropped += queue->size();
+            queue->clear();
         }
 
-        m_activity.dropped += m_queue.size();
         m_activity.queued = 0;
-        m_queue.clear();
 
         for(const auto& [key, job] : m_jobs)
         {
@@ -88,11 +115,16 @@ void RayTracingPipelineWorker::Shutdown()
         Log::Info("Waiting for an in-flight DXR pipeline creation to finish before shutdown.");
     }
 
-    m_thread.join();
+    for(std::thread& thread : m_threads)
+    {
+        thread.join();
+    }
+
+    m_threads.clear();
 
     // Untaken results were never used by the GPU; their objects and the device references go now.
     std::lock_guard lock(m_mutex);
-    // Only completed jobs remain after the join: queued ones were erased above and the one in flight has finished.
+    // Only completed jobs remain after the join: queued ones were erased above and those in flight have finished.
     m_activity.discarded += m_jobs.size();
     m_activity.untaken = 0;
 
@@ -124,12 +156,14 @@ bool RayTracingPipelineWorker::Submit(RayTracingPipelineRequest request)
         // Held until the job's result is taken or discarded.
         request.device->AddRef();
         const std::string key = request.key;
+        const bool background = request.background;
         Job job{};
         job.outcome.key = key;
         job.outcome.device = request.device;
+        job.submitted = std::chrono::steady_clock::now();
         job.request = std::move(request);
         m_jobs.emplace(key, std::move(job));
-        m_queue.push_back(key);
+        (background ? m_backgroundQueue : m_queue).push_back(key);
         ++m_activity.submitted;
         ++m_activity.queued;
     }
@@ -149,6 +183,33 @@ RayTracingPipelineJobState RayTracingPipelineWorker::GetState(const std::string&
     }
 
     return found->second.state;
+}
+
+bool RayTracingPipelineWorker::CancelQueued(const std::string& key)
+{
+    std::lock_guard lock(m_mutex);
+    const auto found = m_jobs.find(key);
+
+    if(found == m_jobs.end() || found->second.state != RayTracingPipelineJobState::Queued)
+    {
+        return false;
+    }
+
+    for(std::deque<std::string>* queue : {&m_queue, &m_backgroundQueue})
+    {
+        const auto queued = std::find(queue->begin(), queue->end(), key);
+
+        if(queued != queue->end())
+        {
+            queue->erase(queued);
+        }
+    }
+
+    found->second.request.device->Release();
+    m_jobs.erase(found);
+    --m_activity.queued;
+    ++m_activity.dropped;
+    return true;
 }
 
 std::optional<RayTracingPipelineOutcome> RayTracingPipelineWorker::TakeCompleted(const std::string& key)
@@ -190,7 +251,7 @@ void RayTracingPipelineWorker::Run()
     {
         m_wake.wait(lock, [this]
         {
-            return m_stopRequested || !m_queue.empty();
+            return m_stopRequested || !m_queue.empty() || !m_backgroundQueue.empty();
         });
 
         if(m_stopRequested)
@@ -198,19 +259,37 @@ void RayTracingPipelineWorker::Run()
             break;
         }
 
-        const std::string key = m_queue.front();
-        m_queue.pop_front();
+        // Ordinary jobs first; a background job only when none is queued.
+        const bool background = m_queue.empty();
+        std::deque<std::string>& queue = background ? m_backgroundQueue : m_queue;
+        const std::string key = queue.front();
+        queue.pop_front();
         Job& job = m_jobs.at(key);
         job.state = RayTracingPipelineJobState::Creating;
         --m_activity.queued;
+        ++m_activity.activeCount;
         m_activity.active = true;
-        m_activity.activeCount = 1;
         m_activity.activeJob = key;
         // Immutable while creating: Submit never replaces a job's request and Shutdown never erases a creating job.
         const RayTracingPipelineRequest& request = job.request;
 
+        // Layered prep diagnostics (ENGINE_STARTUP_TIMING): how long the job waited in its queue before a thread took it.
+        if(TransitionTiming::StartupEnabled())
+        {
+            const auto now = std::chrono::steady_clock::now();
+            Log::Info("[STARTUP] t" + std::to_string(GetCurrentThreadId()) + " Worker job " + key + " started after " +
+                std::to_string(std::chrono::duration<double, std::milli>(now - job.submitted).count()) + " ms in the " +
+                (background ? "background " : "") + "queue at " + std::to_string(TransitionTiming::SecondsSinceProcessStart(now)) +
+                " s");
+        }
+
         // Create without the lock so the owner can poll.
         lock.unlock();
+
+        if(background)
+        {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        }
 
         RayTracingPipelineOutcome outcome{};
         outcome.key = key;
@@ -243,12 +322,21 @@ void RayTracingPipelineWorker::Run()
             }
         }
 
+        if(background)
+        {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+        }
+
         lock.lock();
         job.outcome = std::move(outcome);
         job.state = RayTracingPipelineJobState::Completed;
-        m_activity.active = false;
-        m_activity.activeCount = 0;
-        m_activity.activeJob.clear();
+        --m_activity.activeCount;
+        m_activity.active = m_activity.activeCount > 0;
+
+        if(!m_activity.active)
+        {
+            m_activity.activeJob.clear();
+        }
         ++m_activity.finished;
         ++m_activity.untaken;
     }

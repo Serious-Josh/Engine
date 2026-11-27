@@ -1,3 +1,7 @@
+#include "PrimarySurfaceLift.hlsli"
+#include "SurfaceDetail.hlsli"
+#include "RayTracingInstanceData.hlsli"
+
 struct ShadowPayload
 {
     uint visible;
@@ -24,7 +28,9 @@ struct ShadowConstants
 
     uint accumulatedFrameCount;
     uint geometricNormalIndex;
-    float2 padding;
+    // For a parallax pixel's self-shadowing (GetReliefVisibility): the ray tracing instance records and the materials.
+    uint instanceDataIndex;
+    uint materialBufferIndex;
 };
 
 RaytracingAccelerationStructure scene : register(t0);
@@ -34,6 +40,14 @@ RWTexture2D<float> visibilityTexture :
 
 ConstantBuffer<ShadowConstants> shadowConstants :
     register(b0);
+
+// The G-buffer pass's material sampler (trilinear clamp), which the relief was marched with.
+SamplerState reliefSampler :
+    register(s2);
+
+// The sampled direction to the sun already lies inside its disc, so the relief's own shadow needs no penumbra of its
+// own: this small angle (about one degree) only hides the steps of the march.
+static const float ReliefShadowSoftness = 0.02f;
 
 float Random(
     uint2 pixelIndex,
@@ -246,6 +260,125 @@ float3 ReconstructPreviousWorldPosition(
         worldPosition.w;
 }
 
+// The relief's own shadow on a parallax pixel, towards directionToLight (SurfaceDetailShellVisibility): 1 for an open
+// view of the light, 0 where the relief hides it. The traced shadow ray starts on the mesh surface and never sees the
+// relief below it.
+//
+// One short ray from the lifted origin straight down the normal finds the mesh triangle under it. The triangle's UV
+// there is the relief point's UV, and the rest of the way down to reliefPosition (the point decoded from depth) is the
+// relief's height. A ray that finds something else (a prop standing in the relief) leaves the pixel unshadowed here.
+float GetReliefVisibility(uint2 pixel, uint2 dimensions, float depth, float3 reliefPosition, float3 geometricNormal,
+    float surfaceLift, float3 directionToLight)
+{
+    // The pixel's material, as the G-buffer stores it.
+    Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[shadowConstants.surfaceIndex];
+    StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[shadowConstants.materialBufferIndex];
+    uint materialCount;
+    uint materialStride;
+    materials.GetDimensions(materialCount, materialStride);
+    float storedMaterial = surfaceTexture.Load(int3(pixel, 0)).a;
+
+    if(!(storedMaterial >= 0.0f) || !(storedMaterial < float(materialCount)))
+    {
+        return 1.0f;
+    }
+
+    uint materialIndex = uint(storedMaterial);
+    GPUMaterial material = materials[materialIndex];
+
+    if(!SurfaceDetailUsesParallax(material))
+    {
+        return 1.0f;
+    }
+
+    // The mesh triangle under the lifted origin.
+    const float probeStart = surfaceLift + 0.001f;
+    RayDesc probe;
+    probe.Origin = reliefPosition + geometricNormal * probeStart;
+    probe.Direction = -geometricNormal;
+    probe.TMin = 0.0f;
+    probe.TMax = 0.002f + 0.5f * surfaceLift;
+
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> query;
+    query.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, probe);
+    query.Proceed();
+
+    if(query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+    {
+        return 1.0f;
+    }
+
+    StructuredBuffer<RayTracingInstanceData> instances = ResourceDescriptorHeap[shadowConstants.instanceDataIndex];
+    RayTracingInstanceData instance = instances[query.CommittedInstanceID()];
+    uint primitiveIndex = query.CommittedPrimitiveIndex();
+
+    if(ResolveHitMaterial(instance, primitiveIndex) != materialIndex)
+    {
+        return 1.0f;
+    }
+
+    // The triangle's corners: positions and tangents to world space, UVs as authored.
+    uint3 indices = uint3(primitiveIndex * 3u, primitiveIndex * 3u + 1u, primitiveIndex * 3u + 2u);
+
+    if(instance.indexed != 0u)
+    {
+        ByteAddressBuffer indexBuffer = ResourceDescriptorHeap[NonUniformResourceIndex(instance.indexBufferIndex)];
+        indices = indexBuffer.Load3(primitiveIndex * 3u * 4u);
+    }
+
+    ByteAddressBuffer vertexBuffer = ResourceDescriptorHeap[NonUniformResourceIndex(instance.vertexBufferIndex)];
+    uint3 vertexOffsets = indices * instance.vertexStride;
+    float3x3 objectToWorld = (float3x3)query.CommittedObjectToWorld3x4();
+    float3 position0 = asfloat(vertexBuffer.Load3(vertexOffsets.x));
+    float3 edge1 = mul(objectToWorld, asfloat(vertexBuffer.Load3(vertexOffsets.y)) - position0);
+    float3 edge2 = mul(objectToWorld, asfloat(vertexBuffer.Load3(vertexOffsets.z)) - position0);
+    float2 uv0 = asfloat(vertexBuffer.Load2(vertexOffsets.x + instance.uvOffset));
+    float2 uvEdge1 = asfloat(vertexBuffer.Load2(vertexOffsets.y + instance.uvOffset)) - uv0;
+    float2 uvEdge2 = asfloat(vertexBuffer.Load2(vertexOffsets.z + instance.uvOffset)) - uv0;
+    float2 barycentrics = query.CommittedTriangleBarycentrics();
+
+    // Without vertex tangents SurfaceDetailUVPerHeight solves the mapping from the edges alone.
+    float4 tangent = float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+    if(instance.tangentOffset != 0xFFFFFFFFu)
+    {
+        float3 tangent0 = asfloat(vertexBuffer.Load3(vertexOffsets.x + instance.tangentOffset));
+        float3 tangent1 = asfloat(vertexBuffer.Load3(vertexOffsets.y + instance.tangentOffset));
+        float3 tangent2 = asfloat(vertexBuffer.Load3(vertexOffsets.z + instance.tangentOffset));
+        tangent.xyz = mul(objectToWorld, tangent0 + (tangent1 - tangent0) * barycentrics.x +
+            (tangent2 - tangent0) * barycentrics.y);
+    }
+
+    // The relief point: its UV, and how far under the mesh it lies along the normal.
+    float2 hitUV = uv0 + uvEdge1 * barycentrics.x + uvEdge2 * barycentrics.y;
+    float hitHeight = min(query.CommittedRayT() - probeStart, 0.0f);
+
+    float2 lightUVPerHeight;
+    float lightCosine;
+
+    if(!SurfaceDetailUVPerHeight(geometricNormal, tangent, directionToLight, edge1, edge2, uvEdge1, uvEdge2,
+        lightUVPerHeight, lightCosine))
+    {
+        // A light at the mesh surface's horizon reaches only the top of the relief (or the mapping is degenerate, and
+        // then nothing below the top can be judged).
+        return hitHeight < -1.0e-4f ? 0.0f : 1.0f;
+    }
+
+    // The pixel's size in UV, for the height mip: its width in the world over the triangle's world length per UV.
+    float2 neighbourUV = (float2(pixel) + float2(1.5f, 0.5f)) / float2(dimensions);
+    float4 neighbourPosition = mul(shadowConstants.inverseViewProjection,
+        float4(neighbourUV.x * 2.0f - 1.0f, 1.0f - neighbourUV.y * 2.0f, depth, 1.0f));
+    float pixelSize = length(neighbourPosition.xyz / neighbourPosition.w - reliefPosition);
+    float worldAreaPerUVArea = length(cross(edge1, edge2)) /
+        max(abs(uvEdge1.x * uvEdge2.y - uvEdge1.y * uvEdge2.x), 1.0e-20f);
+    float uvFootprint = pixelSize * rsqrt(max(worldAreaPerUVArea, 1.0e-20f));
+
+    float visibility = SurfaceDetailShellVisibility(SurfaceDetailHeightFieldOf(material), reliefSampler, hitUV,
+        hitHeight, uvFootprint, lightUVPerHeight, lightCosine, ReliefShadowSoftness);
+
+    return isfinite(visibility) ? visibility : 1.0f;
+}
+
 [shader("raygeneration")]
 void RayGeneration()
 {
@@ -340,14 +473,29 @@ void RayGeneration()
     worldPosition /=
         worldPosition.w;
 
+    float3 storedGeometricNormal =
+        geometricNormalTexture.Load(
+            int3(
+                pixelIndex,
+                0
+            )
+        ).rgb;
+
     float3 geometricNormal =
         normalize(
-            geometricNormalTexture.Load(
-                int3(
-                    pixelIndex,
-                    0
-                )
-            ).rgb
+            storedGeometricNormal
+        );
+
+    // A parallax pixel's depth is the relief's, under the mesh: its stored lift takes the origin back to the mesh
+    // surface, or the mesh's own triangle would shadow it. 0 for every other pixel.
+    float surfaceLift =
+        PrimarySurfaceStoredLift(
+            pixelIndex,
+            dimensions,
+            depth,
+            worldPosition.xyz,
+            storedGeometricNormal,
+            shadowConstants.inverseViewProjection
         );
 
     float3 directionToLight =
@@ -372,7 +520,7 @@ void RayGeneration()
 
     ray.Origin =
         worldPosition.xyz +
-        geometricNormal * 0.001f;
+        geometricNormal * (0.001f + surfaceLift);
 
     ray.Direction =
         sampledDirectionToLight;
@@ -401,6 +549,21 @@ void RayGeneration()
         payload.visible != 0
             ? 1.0f
             : 0.0f;
+
+    // A parallax pixel is also shadowed by its own relief, which the traced ray cannot see.
+    if(surfaceLift > 0.0f)
+    {
+        currentVisibility *=
+            GetReliefVisibility(
+                pixelIndex,
+                dimensions,
+                depth,
+                worldPosition.xyz,
+                geometricNormal,
+                surfaceLift,
+                sampledDirectionToLight
+            );
+    }
 
     float accumulatedVisibility =
         currentVisibility;

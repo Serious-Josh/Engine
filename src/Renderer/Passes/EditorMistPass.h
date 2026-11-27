@@ -85,6 +85,29 @@ enum class AirFroxelHistoryClip : std::uint32_t
     HistoryAware = 2
 };
 
+// Fog step 1: how the render volume's fast path blends an open footprint (EditorMist.hlsl, RenderVolumeSample).
+enum class AirMistRenderVolumeFilter : std::uint32_t
+{
+    // Eight Loads blended in the shader with AirRenderMistAndVelocity's own weights: only fp16 rounding differs.
+    Manual = 0,
+    // One hardware trilinear fetch per texture (weights quantized by the sampler, typically to 8 bits).
+    Hardware = 1,
+    // Manual within renderVolumeNearDistance metres of the camera, hardware beyond.
+    Hybrid = 2
+};
+
+// Fog step 2b: when the lit render volume march takes the hybrid froxel lights.
+enum class AirMistFroxelLights : std::uint32_t
+{
+    // On while at least EditorMistPass::FroxelLightsOnCount table Lights reach the lit fog (counted on the GPU, read back a few frames
+    // later), off again once at most FroxelLightsOffCount do; off until the first count arrives.
+    Automatic = 0,
+    // Every Light per sample (the exact path).
+    Off = 1,
+    // Always the hybrid lights.
+    On = 2
+};
+
 // What the mist view draws this frame.
 struct AirMistRenderRequest
 {
@@ -254,6 +277,25 @@ struct AirMistRenderRequest
     bool froxelIntegratedFilter = false;
     // V1d filter diagnostic (temporary; EditorMist.hlsl's filterDiagnostic bits): 0 is the filter as the Editor runs it.
     std::uint32_t froxelFilterDiagnostic = 0;
+    // Fog step 1 (Volumetric_Fog_Optimization_Report.md, item 1): the Original Raymarch reads open footprints from the render volume, a
+    // per-frame fp16 copy of the mist, velocity, sun visibility and indirect fill (CSBuildRenderVolume), instead of
+    // AirRenderMistAndVelocity's gathers. Footprints near geometry, split cells or the window's edge are unchanged. Not used with the
+    // froxel paths. renderVolumeNearDistance (metres) applies to the Hybrid filter.
+    bool renderVolume = true;
+    AirMistRenderVolumeFilter renderVolumeFilter = AirMistRenderVolumeFilter::Manual;
+    float renderVolumeNearDistance = 4.0f;
+    // Step 1b: the fast path also takes footprints with blocked voxels but no split cell (EditorMist.hlsl's label words): the corners
+    // in the sample's own piece's component, exactly as AirRenderMistAndVelocity's link search keeps them.
+    bool renderVolumeExtended = true;
+    // Fog step 2 (Volumetric_Fog_Optimization_Report.md, section 3.4): hybrid froxel lighting for the lit render volume march. The table
+    // Lights' in-scattering beyond froxelLightNearRadius metres of each Light (fading in from r to 2r) comes from a froxel volume rebuilt
+    // every frame (the reduced target / froxelLightDivisor in x and y, froxelLightSlices geometric slices); within it, per sample, for the
+    // Lights a per-froxel mask lists. The haze takes the same split. Needs the render volume and lighting; off: every Light per sample.
+    // Step 2b: automatic by default (AirMistFroxelLights).
+    AirMistFroxelLights froxelLights = AirMistFroxelLights::Automatic;
+    float froxelLightNearRadius = 1.5f;
+    std::uint32_t froxelLightDivisor = 8;
+    std::uint32_t froxelLightSlices = 64;
 
     bool operator==(const AirMistRenderRequest&) const = default;
 };
@@ -423,6 +465,81 @@ public:
     void SetDiagnosticSunVisibilitySamples(std::uint32_t samples) noexcept
     {
         m_diagnosticSunSamples = samples;
+    }
+
+    // Fog step 1 diagnostics: override the request's render volume for every execution (enabled -1: the request's; 0 off; 1 on), its
+    // filter (-1: the request's) and its near distance (negative: the request's). ENGINE_MIST_RENDER_VOLUME, _FILTER and _NEAR set the
+    // same overrides at startup; these setters take precedence.
+    void SetDiagnosticRenderVolume(int enabled, int filter = -1, float nearDistance = -1.0f) noexcept
+    {
+        m_diagnosticRenderVolume = enabled;
+        m_diagnosticRenderVolumeFilter = filter;
+        m_diagnosticRenderVolumeNear = nearDistance;
+    }
+
+    // Fog step 2 diagnostics: override the request's froxelLights for every execution (-1: the request's; 0 off; 1 on; 2 automatic) and
+    // its near radius (negative: the request's). ENGINE_MIST_FROXEL_LIGHTS (0 off, 1 on; unset: the request's) and
+    // ENGINE_MIST_FROXEL_LIGHTS_NEAR set the same at startup.
+    void SetDiagnosticFroxelLights(int enabled, float nearRadius = -1.0f) noexcept
+    {
+        m_diagnosticFroxelLights = enabled;
+        m_diagnosticFroxelLightNear = nearRadius;
+    }
+
+    // Fog step 2: whether the last execution lit through the hybrid froxel lights, and their two volumes' bytes (0 when none exist).
+    bool WasFroxelLightsUsed() const noexcept
+    {
+        return m_froxelLightsUsed;
+    }
+
+    std::uint64_t GetFroxelLightBytes() const noexcept
+    {
+        return m_hybridLightBytes;
+    }
+
+    // Fog step 2b: the automatic choice's thresholds (table Lights reaching the lit fog), and the latest count read back (-1: none yet).
+    static constexpr std::int64_t FroxelLightsOnCount = 8;
+    static constexpr std::int64_t FroxelLightsOffCount = 6;
+
+    std::int64_t GetFogLightCount() const noexcept
+    {
+        return m_fogLightCount;
+    }
+
+    // Step 1b diagnostics: override the request's renderVolumeExtended for every execution (-1: the request's; 0 off; 1 on).
+    void SetDiagnosticRenderVolumeExtended(int extended) noexcept
+    {
+        m_diagnosticRenderVolumeExtended = extended;
+    }
+
+    // Fog step 1 diagnostics: the counting marches (eight counters, EditorMist.hlsl's RenderVolumeCounters), and a
+    // timestamp before the build (the build ends at stamp 1), so a profiler can time it apart from the indirect fill.
+    void SetDiagnosticRenderVolumeCount(bool enabled) noexcept
+    {
+        m_diagnosticRenderVolumeCount = enabled;
+    }
+
+    void SetDiagnosticRenderVolumeTimestamp(ID3D12QueryHeap* timestamps, UINT query) noexcept
+    {
+        m_renderVolumeTimestamps = timestamps;
+        m_renderVolumeQuery = query;
+    }
+
+    // Fog step 1: whether the last execution marched through the render volume, and its three textures' bytes (0 when none exist).
+    bool WasRenderVolumeUsed() const noexcept
+    {
+        return m_renderVolumeUsed;
+    }
+
+    std::uint64_t GetRenderVolumeBytes() const noexcept
+    {
+        return m_renderVolumeBytes;
+    }
+
+    // Fog step 1 diagnostics: the counting marches' counters (empty until they first run), for a profiler to read back.
+    Buffer& GetRenderVolumeCounters() noexcept
+    {
+        return m_renderVolumeCounters;
     }
 
     // V1a: the last execution's froxel volume (0 x 0 x 0 when it did not use one).
@@ -713,6 +830,73 @@ private:
     bool m_diagnosticFroxelIndirectSkipEmpty = false;
     bool m_diagnosticForceAtmosphere = false;
     std::uint32_t m_diagnosticSunSamples = 0;
+    // Fog step 1: the render volume (EditorMist.hlsl): CSBuildRenderVolume and the three *Volume marches, built on first use (a failure
+    // is not retried; the march then reads AirRenderMistAndVelocity as before), the counting marches (diagnostic, likewise), and the
+    // mist (RGBA16F), velocity and sun visibility (RGBA16F) and flag and indirect fill (R16G16F) textures at the window's size. The
+    // textures are retired with the other storage, or when a frame does not use them.
+    bool EnsureRenderVolumePipelines(bool counting);
+    bool EnsureRenderVolumeTextures(const std::array<std::uint32_t, 3>& size, std::uint64_t lastSubmissionFence);
+    void RetireRenderVolume(std::uint64_t fence);
+    ComputePipeline m_renderVolumeBuildPipeline;
+    ComputePipeline m_raymarchVolumePipeline;
+    ComputePipeline m_atmosphereVolumePipeline;
+    ComputePipeline m_boundedAtmosphereVolumePipeline;
+    ComputePipeline m_raymarchVolumeCountPipeline;
+    ComputePipeline m_atmosphereVolumeCountPipeline;
+    ComputePipeline m_boundedAtmosphereVolumeCountPipeline;
+    bool m_renderVolumePipelinesFailed = false;
+    bool m_renderVolumeCountPipelinesFailed = false;
+    std::array<FroxelTexture, 3> m_renderVolume;
+    std::array<std::uint32_t, 3> m_renderVolumeSize{0, 0, 0};
+    std::uint64_t m_renderVolumeBytes = 0;
+    bool m_renderVolumeUsed = false;
+    // Eight uints (EditorMist.hlsl's RenderVolumeCounters), created on the counting marches' first use.
+    Buffer m_renderVolumeCounters;
+    int m_diagnosticRenderVolume = -1;
+    int m_diagnosticRenderVolumeFilter = -1;
+    float m_diagnosticRenderVolumeNear = -1.0f;
+    bool m_diagnosticRenderVolumeCount = false;
+    int m_diagnosticRenderVolumeExtended = -1;
+    // Fog step 2: CSFroxelHybridLights and the three *VolumeLights marches (built on first use; a failure is not retried and the march
+    // lights every sample as before), and the far-light (RGBA16F) and near-mask (R32G32_UINT) volumes at the froxel size, retired with the
+    // other storage or when a frame does not use them.
+    bool EnsureHybridLightPipelines();
+    bool EnsureHybridLightTextures(const std::array<std::uint32_t, 3>& size);
+    void RetireHybridLights(std::uint64_t fence);
+    ComputePipeline m_froxelHybridLightsPipeline;
+    ComputePipeline m_raymarchVolumeLightsPipeline;
+    ComputePipeline m_atmosphereVolumeLightsPipeline;
+    ComputePipeline m_boundedAtmosphereVolumeLightsPipeline;
+    bool m_hybridLightPipelinesFailed = false;
+    std::array<FroxelTexture, 2> m_hybridLights;
+    std::array<std::uint32_t, 3> m_hybridLightSize{0, 0, 0};
+    std::uint64_t m_hybridLightBytes = 0;
+    bool m_froxelLightsUsed = false;
+    // Step 2b: the automatic choice. CSCountFogLights writes m_fogLightCountBuffer; each counting frame copies it into one of
+    // FogLightCountSlots readback slots, read once the GPU passes the fence after the frame's last submission.
+    static constexpr std::size_t FogLightCountSlots = 4;
+    struct FogLightCountSlot
+    {
+        std::uint64_t fence = 0;
+        bool pending = false;
+    };
+    bool EnsureFogLightCount();
+    void CollectFogLightCounts(std::uint64_t completedFence);
+    ComputePipeline m_fogLightCountPipeline;
+    bool m_fogLightCountFailed = false;
+    Buffer m_fogLightCountBuffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_fogLightCountReadback;
+    std::array<FogLightCountSlot, FogLightCountSlots> m_fogLightCountSlots;
+    std::size_t m_fogLightCountNext = 0;
+    std::size_t m_fogLightCountRead = 0;
+    std::int64_t m_fogLightCount = -1;
+    bool m_automaticFroxelLights = false;
+    // The frame's last submission fence, for EnsureHybridLightTextures' retirement of a resized pair.
+    std::uint64_t m_lastSubmissionFenceForHybrid = 0;
+    int m_diagnosticFroxelLights = -1;
+    float m_diagnosticFroxelLightNear = -1.0f;
+    ID3D12QueryHeap* m_renderVolumeTimestamps = nullptr;
+    UINT m_renderVolumeQuery = 0;
     // One float per froxel (x fastest, then y, then the depth slice); empty until the diagnostic path first runs.
     Buffer m_froxels;
     std::size_t m_froxelCapacity = 0;

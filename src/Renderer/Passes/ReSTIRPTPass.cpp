@@ -2,6 +2,7 @@
 
 #include "Core/Log.h"
 #include "Debug/MemoryRegistry.h"
+#include "Debug/TransitionTiming.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/Shader/ShaderLibrary.h"
 #include "Renderer/UploadBuffer.h"
@@ -207,6 +208,8 @@ namespace
         // (PackagedShaderInventory's ReSTIR PT rows list exactly these). The others are test-only (diagnostics, the
         // visibility bench) or off by default (temporal reuse, the duplication map) and need a development switch.
         bool production;
+        // Startup work (4.2): the ReSTIRPTKernelGroup a non-production kernel belongs to (0 for production).
+        std::uint32_t group = 0;
     };
 
     // Every pipeline the pass owns. The unified initial sampling is production; the temporal, diagnostics and visibility
@@ -216,62 +219,74 @@ namespace
     // OpenPBR: these are the base tier (coat, fuzz, thin film and anisotropy compiled out, ShaderVariantTable.inl).
     constexpr PipelineSource PipelineSources[] = {
         {"ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::diagnostics,
-            false},
-        {"ReSTIRPT/RestirPtInitialTemporal.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::temporal, false},
+            false, ReSTIRPTKernelGroupDiagnostics},
+        {"ReSTIRPT/RestirPtInitialTemporal.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::temporal, false,
+            ReSTIRPTKernelGroupTemporal},
         // Wall boiling (experimental, on by default): the ReGIR kernel with light-traced bounce connections.
         {"ReSTIRPT/RestirPtInitialReGIRLightBounce.hlsl", "RestirPtInitialCS", true,
             &ReSTIRPTPreparedPipelines::initialReGIRLightBounce, true},
         {"ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "RestirPtSpatialPairsCS", true,
-            &ReSTIRPTPreparedPipelines::spatialPairsDiagnostics, false},
+            &ReSTIRPTPreparedPipelines::spatialPairsDiagnostics, false, ReSTIRPTKernelGroupDiagnostics},
         {"ReSTIRPT/RestirPtInitialReGIR.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::initialReGIR, true},
         {"ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "RestirPtTemporalCS", true,
-            &ReSTIRPTPreparedPipelines::temporalPassDiagnostics, false},
+            &ReSTIRPTPreparedPipelines::temporalPassDiagnostics, false, ReSTIRPTKernelGroupDiagnostics},
         {"ReSTIRPT/RestirPtInitialVisibilityBench.hlsl", "RestirPtInitialCS", true,
-            &ReSTIRPTPreparedPipelines::visibilityBench, false},
+            &ReSTIRPTPreparedPipelines::visibilityBench, false, ReSTIRPTKernelGroupVisibilityBench},
         {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::initial, true},
         {"ReSTIRPT/RestirPtInitialTemporal.hlsl", "RestirPtTemporalCS", true, &ReSTIRPTPreparedPipelines::temporalPass,
-            false},
+            false, ReSTIRPTKernelGroupTemporal},
         {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtSpatialPairsCS", true, &ReSTIRPTPreparedPipelines::spatialPairs, true},
         {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtSpatialResampleCS", true, &ReSTIRPTPreparedPipelines::spatialResample,
             true},
-        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtDuplicationCS", true, &ReSTIRPTPreparedPipelines::duplication, false},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtDuplicationCS", true, &ReSTIRPTPreparedPipelines::duplication, false,
+            ReSTIRPTKernelGroupDuplication},
         {"ReSTIRPT/RestirPtLightTiles.hlsl", "main", false, &ReSTIRPTPreparedPipelines::lightTiles, true},
         // M5.6 O0: the ReGIR light map.
         {"ReSTIRPT/RestirPtReGIRLights.hlsl", "main", false, &ReSTIRPTPreparedPipelines::regirLights, true},
     };
 
-    // OpenPBR: the layered tier of the production kernels (those lobes compiled in), a set of its own prepared only once a
-    // published material needs it (ReSTIRPTPreparedPipelines::layered). Largest first, as above.
-    constexpr PipelineSource LayeredPipelineSources[] = {
-        {"ReSTIRPT/RestirPtInitialReGIRLightBounceLayered.hlsl", "RestirPtInitialCS", true,
-            &ReSTIRPTPreparedPipelines::initialReGIRLightBounceLayered, true},
-        {"ReSTIRPT/RestirPtInitialTemporalLayered.hlsl", "RestirPtInitialCS", true,
-            &ReSTIRPTPreparedPipelines::temporalLayered, false},
-        {"ReSTIRPT/RestirPtInitialReGIRLayered.hlsl", "RestirPtInitialCS", true,
-            &ReSTIRPTPreparedPipelines::initialReGIRLayered, true},
-        {"ReSTIRPT/RestirPtInitialLayered.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::initialLayered,
+    // Material tiers: the production kernels of another tier (the OpenPBR layered lobes, the POM relief shadow, or
+    // both compiled in), a set of its own prepared only once a published material needs it
+    // (ReSTIRPTPreparedPipelines::tier). The paths are the base tier's; the tier's suffix goes before ".hlsl"
+    // (KernelShaderPath). Largest first, as above.
+    constexpr PipelineSource TierPipelineSources[] = {
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounce.hlsl", "RestirPtInitialCS", true,
+            &ReSTIRPTPreparedPipelines::initialReGIRLightBounceTier, true},
+        {"ReSTIRPT/RestirPtInitialTemporal.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::temporalTier,
+            false, ReSTIRPTKernelGroupTemporal},
+        {"ReSTIRPT/RestirPtInitialReGIR.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::initialReGIRTier,
             true},
-        {"ReSTIRPT/RestirPtInitialTemporalLayered.hlsl", "RestirPtTemporalCS", true,
-            &ReSTIRPTPreparedPipelines::temporalPassLayered, false},
-        {"ReSTIRPT/RestirPtInitialLayered.hlsl", "RestirPtSpatialPairsCS", true,
-            &ReSTIRPTPreparedPipelines::spatialPairsLayered, true},
-        {"ReSTIRPT/RestirPtInitialLayered.hlsl", "RestirPtSpatialResampleCS", true,
-            &ReSTIRPTPreparedPipelines::spatialResampleLayered, true},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtInitialCS", true, &ReSTIRPTPreparedPipelines::initialTier, true},
+        {"ReSTIRPT/RestirPtInitialTemporal.hlsl", "RestirPtTemporalCS", true,
+            &ReSTIRPTPreparedPipelines::temporalPassTier, false, ReSTIRPTKernelGroupTemporal},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtSpatialPairsCS", true, &ReSTIRPTPreparedPipelines::spatialPairsTier,
+            true},
+        {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtSpatialResampleCS", true,
+            &ReSTIRPTPreparedPipelines::spatialResampleTier, true},
     };
 
-    // At most this many threads create the pipelines (a quarter of the hardware threads): the driver's cost is a few
-    // large kernels, so more threads would not end sooner, and the Editor keeps the rest of the CPU.
-    constexpr unsigned int MaximumPipelineThreads = 4;
+    // At most this many threads create the pipelines (a quarter of the hardware threads, startup work 4.8: up to 8 for a cold
+    // set; never more than the set has kernels), below normal priority, so the Editor keeps the rest of the CPU.
+    constexpr unsigned int MaximumPipelineThreads = 8;
 
-    // The shader a source compiles from: a kernel's SHARC twin ("<name>Sharc.hlsl", ShaderVariantTable.inl) when the set
-    // renders the SHARC radiance cache at x3, otherwise the source's own path.
-    std::string KernelShaderPath(const PipelineSource& source, bool sharc)
+    // Startup work (4.2): whether a set creates this source: its production kernels when the set holds them, a kernel group
+    // when the set adds it (never in a packaged game, which cooks no group).
+    bool SourceSelected(const PipelineSource& source, const ReSTIRPTPreparedPipelines& prepared, bool packaged)
+    {
+        return source.production ? prepared.production : !packaged && (prepared.groups & source.group) != 0u;
+    }
+
+    // The shader a source compiles from (ShaderVariantTable.inl): a kernel of another material tier is
+    // "<name><tier suffix>.hlsl", and its SHARC twin "<name><tier suffix>Sharc.hlsl" when the set renders the SHARC
+    // radiance cache at x3; otherwise the source's own path.
+    std::string KernelShaderPath(const PipelineSource& source, ReSTIRPTMaterialTier tier, bool sharc)
     {
         std::string path = source.path;
 
-        if(sharc && source.kernel)
+        if(source.kernel)
         {
-            path.insert(path.size() - std::string_view(".hlsl").size(), "Sharc");
+            const std::string suffix = std::string(ReSTIRPTMaterialTierSuffix(tier)) + (sharc ? "Sharc" : "");
+            path.insert(path.size() - std::string_view(".hlsl").size(), suffix);
         }
 
         return path;
@@ -283,14 +298,17 @@ namespace
     // load on a library several threads share (the packaged one); the driver's compile below runs unlocked. Returns the
     // failure, empty on success.
     std::string CreatePipeline(ID3D12Device* device, ShaderLibrary& shaderLibrary, std::mutex* libraryMutex,
-        const PipelineSource& source, bool sharc, ComputePipeline& pipeline)
+        const PipelineSource& source, ReSTIRPTMaterialTier tier, bool sharc, ComputePipeline& pipeline)
     {
-        const std::string shaderPath = KernelShaderPath(source, sharc);
+        const std::string shaderPath = KernelShaderPath(source, tier, sharc);
         ShaderDescription shaderDescription{};
         shaderDescription.path = shaderPath.c_str();
         shaderDescription.entryPoint = source.entryPoint;
         shaderDescription.stage = ShaderStage::Compute;
         Shader* shader = nullptr;
+        const unsigned int hitsBefore = shaderLibrary.GetShaderCacheHitCount();
+        const bool packagedLoad = libraryMutex != nullptr;
+        const auto loadStart = std::chrono::steady_clock::now();
 
         if(libraryMutex)
         {
@@ -307,8 +325,17 @@ namespace
             return shaderPath + " (" + source.entryPoint + ") did not compile.";
         }
 
+        // Layered prep diagnostics (ENGINE_STARTUP_TIMING): the DXIL load (a persistent-cache hit or DXC) and the driver's
+        // pipeline creation of each kernel, on one line per kernel. One cached flag test when unset.
+        const bool timed = TransitionTiming::StartupEnabled();
+        const bool loadHit = timed && shaderLibrary.GetShaderCacheHitCount() != hitsBefore;
+        const auto loaded = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
         ComputePipelineDescription description{};
         description.computeShader = shader;
+        // Layered prep (F3): every ReSTIR PT kernel (base, kernel groups and tiers) through the persistent pipeline cache,
+        // so a driver-cold executable (another build configuration, a copy, a cook) does not compile them again.
+        description.persistentCache = true;
 
         if(source.kernel)
         {
@@ -323,7 +350,22 @@ namespace
             description.rootParameters = {Parameter(RootParameterType::ConstantBuffer, 0)};
         }
 
-        if(!pipeline.Initialize(device, description))
+        const bool created = pipeline.Initialize(device, description);
+
+        if(timed)
+        {
+            const auto end = std::chrono::steady_clock::now();
+            Log::Info("[STARTUP] t" + std::to_string(GetCurrentThreadId()) + " ReSTIR PT kernel " + shaderPath + ":" +
+                source.entryPoint + " (" + ReSTIRPTMaterialTierSuffix(tier) + (tier == ReSTIRPTMaterialTier::Base ?
+                "base" : "") + ") load " + std::to_string(std::chrono::duration<double, std::milli>(loaded - loadStart)
+                .count()) + " ms (" + (packagedLoad ? "packaged" : loadHit ? "cache hit" : "DXC") + ") create " +
+                std::to_string(std::chrono::duration<double, std::milli>(end - loaded).count()) + " ms (" +
+                (pipeline.WasCreatedFromCache() ? "PSO cache hit" : "driver") + ") [" +
+                std::to_string(TransitionTiming::SecondsSinceProcessStart(loadStart)) + " s .. " +
+                std::to_string(TransitionTiming::SecondsSinceProcessStart(end)) + " s]");
+        }
+
+        if(!created)
         {
             return "the pipeline of " + shaderPath + " (" + source.entryPoint + ") could not be created.";
         }
@@ -379,6 +421,39 @@ namespace
     }
 }
 
+const char* ReSTIRPTMaterialTierSuffix(ReSTIRPTMaterialTier tier)
+{
+    switch(tier)
+    {
+    case ReSTIRPTMaterialTier::Layered:
+        return "Layered";
+    case ReSTIRPTMaterialTier::Relief:
+        return "Relief";
+    case ReSTIRPTMaterialTier::LayeredRelief:
+        return "LayeredRelief";
+    case ReSTIRPTMaterialTier::Base:
+    default:
+        return "";
+    }
+}
+
+const char* ReSTIRPTMaterialTierDescription(ReSTIRPTMaterialTier tier)
+{
+    switch(tier)
+    {
+    case ReSTIRPTMaterialTier::Layered:
+        return "layered (OpenPBR coat, fuzz, thin film, anisotropy)";
+    case ReSTIRPTMaterialTier::Relief:
+        return "relief (parallax occlusion mapping self-shadowing)";
+    case ReSTIRPTMaterialTier::LayeredRelief:
+        return "layered relief (OpenPBR coat, fuzz, thin film, anisotropy and parallax occlusion mapping "
+            "self-shadowing)";
+    case ReSTIRPTMaterialTier::Base:
+    default:
+        return "base";
+    }
+}
+
 void ReSTIRPTPreparedPipelines::Shutdown()
 {
     for(const PipelineSource& source : PipelineSources)
@@ -386,7 +461,7 @@ void ReSTIRPTPreparedPipelines::Shutdown()
         (this->*source.pipeline).Shutdown();
     }
 
-    for(const PipelineSource& source : LayeredPipelineSources)
+    for(const PipelineSource& source : TierPipelineSources)
     {
         (this->*source.pipeline).Shutdown();
     }
@@ -414,16 +489,19 @@ bool ReSTIRPTPass::PreparePipelines(ID3D12Device* device, const ReSTIRPTShaderSo
 
     if(packaged)
     {
+        // Startup work (4.2): a packaged game cooks no kernel group.
+        prepared.groups = 0;
         packagedLibrary = std::make_unique<ShaderLibrary>();
         packagedLibraryReady = packagedLibrary->InitializePackaged(*source.packagedShaders);
     }
 
     // Each thread takes the next pipeline of the table until none is left, with its own ShaderLibrary (a library is used
     // by one thread at a time) or the shared packaged one, below normal priority so the compiles never take CPU from the
-    // render thread. Each slot of the table is written by exactly one thread. A layered set holds the layered tier only
+    // render thread. Each slot of the table is written by exactly one thread. Another tier's set holds that tier only
     // (no pairing textures). A packaged set leaves the non-production slots empty (PipelineSource::production).
-    const std::span<const PipelineSource> sources = prepared.layered ?
-        std::span<const PipelineSource>(LayeredPipelineSources) : std::span<const PipelineSource>(PipelineSources);
+    const bool tierSet = prepared.tier != ReSTIRPTMaterialTier::Base;
+    const std::span<const PipelineSource> sources = tierSet ?
+        std::span<const PipelineSource>(TierPipelineSources) : std::span<const PipelineSource>(PipelineSources);
     const std::size_t PipelineCount = sources.size();
     std::vector<std::string> failures(PipelineCount);
     std::atomic<std::size_t> nextPipeline{0};
@@ -442,7 +520,7 @@ bool ReSTIRPTPass::PreparePipelines(ID3D12Device* device, const ReSTIRPTShaderSo
             {
                 const PipelineSource& pipelineSource = sources[index];
 
-                if(packaged && !pipelineSource.production)
+                if(!SourceSelected(pipelineSource, prepared, packaged))
                 {
                     continue;
                 }
@@ -455,7 +533,7 @@ bool ReSTIRPTPass::PreparePipelines(ID3D12Device* device, const ReSTIRPTShaderSo
                 }
 
                 failures[index] = CreatePipeline(device, shaderLibrary, packaged ? &libraryMutex : nullptr, pipelineSource,
-                    prepared.sharc, prepared.*pipelineSource.pipeline);
+                    prepared.tier, prepared.sharc, prepared.*pipelineSource.pipeline);
             }
         }
         catch(const std::exception&)
@@ -466,7 +544,10 @@ bool ReSTIRPTPass::PreparePipelines(ID3D12Device* device, const ReSTIRPTShaderSo
         privateLibrary.Shutdown();
     };
 
-    const unsigned int threadCount = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, MaximumPipelineThreads);
+    const std::size_t selectedCount = static_cast<std::size_t>(std::count_if(sources.begin(), sources.end(),
+        [&](const PipelineSource& candidate) { return SourceSelected(candidate, prepared, packaged); }));
+    const unsigned int threadCount = (std::min)(std::clamp(std::thread::hardware_concurrency() / 4u, 1u,
+        MaximumPipelineThreads), static_cast<unsigned int>((std::max)(selectedCount, std::size_t{1})));
     std::vector<std::thread> threads;
     threads.reserve(threadCount);
 
@@ -487,7 +568,7 @@ bool ReSTIRPTPass::PreparePipelines(ID3D12Device* device, const ReSTIRPTShaderSo
 
     try
     {
-        if(!prepared.layered)
+        if(!tierSet && prepared.production)
         {
             pairingFailure = BuildPairingTexels(prepared.pairingTexels, prepared.pairingSummary);
         }
@@ -544,6 +625,125 @@ bool ReSTIRPTPass::Fail(const std::string& failure)
     return false;
 }
 
+std::uint32_t ReSTIRPTPass::KernelGroupsFor(const ReSTIRPTSettings& settings)
+{
+    std::uint32_t groups = 0;
+
+    if(settings.selfShift || settings.temporalRoundTrip || settings.spatialRoundTrip)
+    {
+        groups |= ReSTIRPTKernelGroupDiagnostics;
+    }
+
+    if(settings.visibilityBench != ReSTIRPTSettings::VisibilityBench::None)
+    {
+        groups |= ReSTIRPTKernelGroupVisibilityBench;
+    }
+
+    if(settings.reservoir && settings.temporal)
+    {
+        groups |= ReSTIRPTKernelGroupTemporal;
+    }
+
+    if(settings.duplication != ReSTIRPTSettings::Duplication::Off)
+    {
+        groups |= ReSTIRPTKernelGroupDuplication;
+    }
+
+    return groups;
+}
+
+std::uint32_t ReSTIRPTPass::GetAdoptedKernelGroups() const
+{
+    std::uint32_t groups = m_kernelGroups;
+
+    // A tier's kernels replace the base tier's temporal kernels while that tier renders.
+    if(const TierPipelines* tier = ActiveTierPipelines(); tier && !tier->temporalKernels)
+    {
+        groups &= ~static_cast<std::uint32_t>(ReSTIRPTKernelGroupTemporal);
+    }
+
+    return groups;
+}
+
+std::uint32_t ReSTIRPTPass::RestrictToAdoptedKernels(ReSTIRPTSettings& settings) const
+{
+    const std::uint32_t missing = KernelGroupsFor(settings) & ~GetAdoptedKernelGroups();
+
+    if(missing & ReSTIRPTKernelGroupDiagnostics)
+    {
+        settings.selfShift = false;
+        settings.temporalRoundTrip = false;
+        settings.spatialRoundTrip = false;
+    }
+
+    if(missing & ReSTIRPTKernelGroupVisibilityBench)
+    {
+        settings.visibilityBench = ReSTIRPTSettings::VisibilityBench::None;
+    }
+
+    if(missing & ReSTIRPTKernelGroupTemporal)
+    {
+        settings.temporal = false;
+    }
+
+    if(missing & ReSTIRPTKernelGroupDuplication)
+    {
+        settings.duplication = ReSTIRPTSettings::Duplication::Off;
+    }
+
+    return missing;
+}
+
+bool ReSTIRPTPass::AdoptKernelGroups(const ReSTIRPTPreparedPipelines& prepared)
+{
+    if(!m_initialized || prepared.production || !prepared.failure.empty())
+    {
+        return false;
+    }
+
+    if(prepared.tier != ReSTIRPTMaterialTier::Base)
+    {
+        TierPipelines& tier = m_tierPipelines[static_cast<std::size_t>(prepared.tier)];
+
+        if(!tier.ready || (prepared.groups & ReSTIRPTKernelGroupTemporal) == 0u)
+        {
+            return false;
+        }
+
+        tier.temporal.CopyFrom(prepared.temporalTier);
+        tier.temporalPass.CopyFrom(prepared.temporalPassTier);
+        tier.temporalKernels = true;
+        return true;
+    }
+
+    // Only the members of the added groups: the production kernels already adopted stay.
+    if(prepared.groups & ReSTIRPTKernelGroupDiagnostics)
+    {
+        m_diagnosticsPipeline.CopyFrom(prepared.diagnostics);
+        m_spatialPairsDiagnosticsPipeline.CopyFrom(prepared.spatialPairsDiagnostics);
+        m_temporalPassDiagnosticsPipeline.CopyFrom(prepared.temporalPassDiagnostics);
+    }
+
+    if(prepared.groups & ReSTIRPTKernelGroupVisibilityBench)
+    {
+        m_visibilityBenchPipeline.CopyFrom(prepared.visibilityBench);
+    }
+
+    if(prepared.groups & ReSTIRPTKernelGroupTemporal)
+    {
+        m_temporalPipeline.CopyFrom(prepared.temporal);
+        m_temporalPassPipeline.CopyFrom(prepared.temporalPass);
+    }
+
+    if(prepared.groups & ReSTIRPTKernelGroupDuplication)
+    {
+        m_duplicationPipeline.CopyFrom(prepared.duplication);
+    }
+
+    m_kernelGroups |= prepared.groups & ReSTIRPTKernelGroupAll;
+    return true;
+}
+
 void ReSTIRPTPass::AdoptPipelines(const ReSTIRPTPreparedPipelines& prepared)
 {
     m_initialPipeline.CopyFrom(prepared.initial);
@@ -560,23 +760,33 @@ void ReSTIRPTPass::AdoptPipelines(const ReSTIRPTPreparedPipelines& prepared)
     m_duplicationPipeline.CopyFrom(prepared.duplication);
     m_lightTilePipeline.CopyFrom(prepared.lightTiles);
     m_regirLightsPipeline.CopyFrom(prepared.regirLights);
+    // Startup work (4.2): a packaged set holds no group.
+    m_kernelGroups = prepared.groups & ReSTIRPTKernelGroupAll;
 }
 
-bool ReSTIRPTPass::AdoptLayeredPipelines(const ReSTIRPTPreparedPipelines& prepared)
+bool ReSTIRPTPass::AdoptTierPipelines(const ReSTIRPTPreparedPipelines& prepared)
 {
-    if(!m_initialized || !prepared.layered || !prepared.failure.empty())
+    const std::size_t index = static_cast<std::size_t>(prepared.tier);
+
+    if(!m_initialized || prepared.tier == ReSTIRPTMaterialTier::Base || index >= m_tierPipelines.size() ||
+       m_tierPipelines[index].ready || !prepared.failure.empty())
     {
         return false;
     }
 
-    m_initialLayeredPipeline.CopyFrom(prepared.initialLayered);
-    m_temporalLayeredPipeline.CopyFrom(prepared.temporalLayered);
-    m_initialReGIRLayeredPipeline.CopyFrom(prepared.initialReGIRLayered);
-    m_initialReGIRLightBounceLayeredPipeline.CopyFrom(prepared.initialReGIRLightBounceLayered);
-    m_spatialPairsLayeredPipeline.CopyFrom(prepared.spatialPairsLayered);
-    m_spatialResampleLayeredPipeline.CopyFrom(prepared.spatialResampleLayered);
-    m_temporalPassLayeredPipeline.CopyFrom(prepared.temporalPassLayered);
-    m_layeredReady = true;
+    TierPipelines& tier = m_tierPipelines[index];
+    tier.tier = prepared.tier;
+    tier.initial.CopyFrom(prepared.initialTier);
+    tier.temporal.CopyFrom(prepared.temporalTier);
+    tier.initialReGIR.CopyFrom(prepared.initialReGIRTier);
+    tier.initialReGIRLightBounce.CopyFrom(prepared.initialReGIRLightBounceTier);
+    tier.spatialPairs.CopyFrom(prepared.spatialPairsTier);
+    tier.spatialResample.CopyFrom(prepared.spatialResampleTier);
+    tier.temporalPass.CopyFrom(prepared.temporalPassTier);
+    tier.ready = true;
+    // Startup work (4.2): whether the set created the tier's temporal kernels.
+    tier.temporalKernels = (prepared.groups & ReSTIRPTKernelGroupTemporal) != 0u &&
+        tier.temporalPass.GetRootSignature() != nullptr;
     return true;
 }
 
@@ -1148,15 +1358,21 @@ void ReSTIRPTPass::Shutdown()
     m_initialPipeline.Shutdown();
     m_initialReGIRPipeline.Shutdown();
     m_initialReGIRLightBouncePipeline.Shutdown();
-    m_initialLayeredPipeline.Shutdown();
-    m_temporalLayeredPipeline.Shutdown();
-    m_initialReGIRLayeredPipeline.Shutdown();
-    m_initialReGIRLightBounceLayeredPipeline.Shutdown();
-    m_spatialPairsLayeredPipeline.Shutdown();
-    m_spatialResampleLayeredPipeline.Shutdown();
-    m_temporalPassLayeredPipeline.Shutdown();
-    m_layeredMaterials = false;
-    m_layeredReady = false;
+    for(TierPipelines& tier : m_tierPipelines)
+    {
+        tier.initial.Shutdown();
+        tier.temporal.Shutdown();
+        tier.initialReGIR.Shutdown();
+        tier.initialReGIRLightBounce.Shutdown();
+        tier.spatialPairs.Shutdown();
+        tier.spatialResample.Shutdown();
+        tier.temporalPass.Shutdown();
+        tier.ready = false;
+        tier.temporalKernels = false;
+    }
+
+    m_kernelGroups = 0;
+    m_materialTier = ReSTIRPTMaterialTier::Base;
     m_temporalPipeline.Shutdown();
     m_diagnosticsPipeline.Shutdown();
     m_visibilityBenchPipeline.Shutdown();

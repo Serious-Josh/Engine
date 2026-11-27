@@ -6,6 +6,7 @@
 
 #include <d3d12.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -429,26 +430,67 @@ struct ReSTIRPTShaderSource
     std::shared_ptr<const std::vector<std::byte>> packagedShaders;
 };
 
+// The material tiers of ReSTIR PT's production kernels, one bit per feature compiled in (ShaderVariantTable.inl): the
+// OpenPBR layered lobes (coat, fuzz, thin film, anisotropy) and, POM B2, the relief's own shadow at parallax occlusion
+// mapping pixels. The base tier compiles both out; each other tier is a pipeline set of its own, prepared only once a
+// published material needs it. The value is also the tier's index.
+enum class ReSTIRPTMaterialTier : std::uint32_t
+{
+    Base = 0,
+    Layered = 1,
+    Relief = 2,
+    LayeredRelief = 3
+};
+
+constexpr std::size_t ReSTIRPTMaterialTierCount = 4;
+
+// The tier a material table needs.
+constexpr ReSTIRPTMaterialTier ReSTIRPTMaterialTierFor(bool layeredLobes, bool parallax)
+{
+    return static_cast<ReSTIRPTMaterialTier>((layeredLobes ? 1u : 0u) | (parallax ? 2u : 0u));
+}
+
+// The suffix the variant table gives the tier's kernels ("Layered", "Relief", "LayeredRelief"; empty for the base
+// tier), and a description for the log.
+const char* ReSTIRPTMaterialTierSuffix(ReSTIRPTMaterialTier tier);
+const char* ReSTIRPTMaterialTierDescription(ReSTIRPTMaterialTier tier);
+
 // ReSTIR PT's compute pipelines and its pairing textures' texels, prepared apart from the pass (ReSTIRPTPass::
 // PreparePipelines), so activating ReSTIR PT creates no pipeline on the render thread: the GPU driver takes 0.1-0.5 s per
 // kernel with a warm shader cache and seconds per kernel after a shader change. Holds only immutable device objects and CPU
 // data that no GPU work has used. ReSTIRPTPass::Initialize adopts the pipelines (adding references); Shutdown releases this
 // set's own references.
+// Startup work (4.2): the test-only and off-by-default kernels, in groups a development switch needs together. The
+// Editor prepares the production kernels at startup (with the groups the saved settings already use) and a group on first
+// use; a packaged game never cooks or prepares any group.
+enum ReSTIRPTKernelGroup : std::uint32_t
+{
+    // The T-2.1 self-shift and the temporal and spatial round trips (RestirPtInitialDiagnostics.hlsl).
+    ReSTIRPTKernelGroupDiagnostics = 1u << 0,
+    // The M5.2 C0 visibility bench.
+    ReSTIRPTKernelGroupVisibilityBench = 1u << 1,
+    // Temporal reuse: the fused temporal kernel and the separate temporal pass (and a material tier's).
+    ReSTIRPTKernelGroupTemporal = 1u << 2,
+    // The M5.4 C7 duplication map.
+    ReSTIRPTKernelGroupDuplication = 1u << 3,
+    ReSTIRPTKernelGroupAll = (1u << 4) - 1u,
+};
+
 struct ReSTIRPTPreparedPipelines
 {
     ComputePipeline initial;
     ComputePipeline temporal;
     ComputePipeline initialReGIR;
     ComputePipeline initialReGIRLightBounce;
-    // OpenPBR: the layered tier of the production kernels (coat, fuzz, thin film and anisotropy compiled in), filled only
-    // in a layered set (below); the members above are the base tier.
-    ComputePipeline initialLayered;
-    ComputePipeline temporalLayered;
-    ComputePipeline initialReGIRLayered;
-    ComputePipeline initialReGIRLightBounceLayered;
-    ComputePipeline spatialPairsLayered;
-    ComputePipeline spatialResampleLayered;
-    ComputePipeline temporalPassLayered;
+    // Another material tier's production kernels, filled only in that tier's own set (`tier` below); the members above
+    // are the base tier.
+    ComputePipeline initialTier;
+    ComputePipeline temporalTier;
+    ComputePipeline initialReGIRTier;
+    ComputePipeline initialReGIRLightBounceTier;
+    ComputePipeline spatialPairsTier;
+    ComputePipeline spatialResampleTier;
+    ComputePipeline temporalPassTier;
     ComputePipeline diagnostics;
     ComputePipeline visibilityBench;
     ComputePipeline spatialPairs;
@@ -465,9 +507,13 @@ struct ReSTIRPTPreparedPipelines
     // Whether the kernels are the SHARC twins (ShaderVariantTable.inl, the SHARC radiance cache at x3 compiled in), set by
     // the caller before preparing from NVIDIA SHARC's capability; a set prepared for the other choice is not adopted.
     bool sharc = false;
-    // OpenPBR: set by the caller for the layered tier's own set (only its *Layered members, no pairing textures), prepared
-    // once a published material needs it and adopted by ReSTIRPTPass::AdoptLayeredPipelines.
-    bool layered = false;
+    // Set by the caller: Base for the pass's own set; another tier for that tier's set (only its *Tier members, no
+    // pairing textures), prepared once a published material needs it and adopted by ReSTIRPTPass::AdoptTierPipelines.
+    ReSTIRPTMaterialTier tier = ReSTIRPTMaterialTier::Base;
+    // Startup work (4.2), set by the caller: whether the set holds its tier's production kernels (false for a set that only
+    // adds kernel groups to an adopted one), and which ReSTIRPTKernelGroup bits it adds. Packaged sources ignore the groups.
+    bool production = true;
+    std::uint32_t groups = ReSTIRPTKernelGroupAll;
     // The first failure (a shader that did not compile, a pipeline that could not be created, a failed pairing check).
     std::string failure;
 
@@ -631,11 +677,11 @@ class ReSTIRPTPass
 
         // M5.2: the fused temporal kernel only while temporal reuse is on without its own pass (the production kernel
         // carries none of its code).
-        const bool layered = UsesLayeredPipelines();
+        const TierPipelines* tier = ActiveTierPipelines();
 
         if(settings.reservoir && settings.temporal && !temporalPass)
         {
-            return layered ? m_temporalLayeredPipeline : m_temporalPipeline;
+            return tier ? tier->temporal : m_temporalPipeline;
         }
 
         // M5.6 O0: the ReGIR variant only on frames whose ReGIR light map was recorded (RecordReGIRLights); its
@@ -646,13 +692,13 @@ class ReSTIRPTPass
 
             if(lightBounce)
             {
-                return layered ? m_initialReGIRLightBounceLayeredPipeline : m_initialReGIRLightBouncePipeline;
+                return tier ? tier->initialReGIRLightBounce : m_initialReGIRLightBouncePipeline;
             }
 
-            return layered ? m_initialReGIRLayeredPipeline : m_initialReGIRPipeline;
+            return tier ? tier->initialReGIR : m_initialReGIRPipeline;
         }
 
-        return layered ? m_initialLayeredPipeline : m_initialPipeline;
+        return tier ? tier->initial : m_initialPipeline;
     }
 
     // M5.4 C1: the temporal reuse pass (its diagnostics variant with the temporal round trip).
@@ -663,7 +709,8 @@ class ReSTIRPTPass
             return m_temporalPassDiagnosticsPipeline;
         }
 
-        return UsesLayeredPipelines() ? m_temporalPassLayeredPipeline : m_temporalPassPipeline;
+        const TierPipelines* tier = ActiveTierPipelines();
+        return tier ? tier->temporalPass : m_temporalPassPipeline;
     }
 
     // M5.3 spatial reuse's pre-pass (the diagnostics variant for the round trip) and resampling pass.
@@ -674,33 +721,60 @@ class ReSTIRPTPass
             return m_spatialPairsDiagnosticsPipeline;
         }
 
-        return UsesLayeredPipelines() ? m_spatialPairsLayeredPipeline : m_spatialPairsPipeline;
+        const TierPipelines* tier = ActiveTierPipelines();
+        return tier ? tier->spatialPairs : m_spatialPairsPipeline;
     }
 
     const ComputePipeline& GetSpatialResamplePipeline() const
     {
-        return UsesLayeredPipelines() ? m_spatialResampleLayeredPipeline : m_spatialResamplePipeline;
+        const TierPipelines* tier = ActiveTierPipelines();
+        return tier ? tier->spatialResample : m_spatialResamplePipeline;
     }
 
-    // OpenPBR tiers: whether this frame's material table has a coat, fuzz, thin film or anisotropic material, so the
-    // getters above return the layered kernels once their set was adopted (the base tier compiles those lobes out; until
-    // then such materials render without them). Set before each dispatch.
-    void SetLayeredMaterials(bool layeredMaterials)
+    // Material tiers: the tier this frame's material table needs (ReSTIRPTMaterialTierFor), so the getters above return
+    // that tier's kernels once its set was adopted. Until then they return the richest adopted tier it contains, or the
+    // base tier, and the features that tier compiles out are not rendered. Set before each dispatch.
+    void SetMaterialTier(ReSTIRPTMaterialTier tier)
     {
-        m_layeredMaterials = layeredMaterials;
+        m_materialTier = tier;
     }
 
-    // Adopts a layered set (ReSTIRPTPreparedPipelines::layered) into the initialized pass; false when the set failed.
-    bool AdoptLayeredPipelines(const ReSTIRPTPreparedPipelines& prepared);
+    // Adopts another tier's set (ReSTIRPTPreparedPipelines::tier) into the initialized pass, once per tier; false when
+    // the set failed or the tier already has one.
+    bool AdoptTierPipelines(const ReSTIRPTPreparedPipelines& prepared);
 
-    bool HasLayeredPipelines() const
+    // Whether the tier's kernels can run (the base tier's always can).
+    bool HasTierPipelines(ReSTIRPTMaterialTier tier) const
     {
-        return m_layeredReady;
+        return tier == ReSTIRPTMaterialTier::Base || m_tierPipelines[static_cast<std::size_t>(tier)].ready;
     }
 
-    bool UsesLayeredPipelines() const
+    // Startup work (4.2): the kernel groups these settings select (ReSTIRPTKernelGroup bits), as the getters below do.
+    static std::uint32_t KernelGroupsFor(const ReSTIRPTSettings& settings);
+    // The groups adopted for the base tier, and for the tier the getters return (the temporal group only; a tier set has no
+    // other group).
+    std::uint32_t GetAdoptedKernelGroups() const;
+    std::uint32_t GetAdoptedBaseKernelGroups() const
     {
-        return m_layeredMaterials && m_layeredReady;
+        return m_kernelGroups;
+    }
+
+    bool HasTierTemporalKernels(ReSTIRPTMaterialTier tier) const
+    {
+        return tier == ReSTIRPTMaterialTier::Base || m_tierPipelines[static_cast<std::size_t>(tier)].temporalKernels;
+    }
+    // Settings with every switch whose kernels are not adopted turned off, so a frame records the production kernels while
+    // a group is prepared. Returns the groups that were missing.
+    std::uint32_t RestrictToAdoptedKernels(ReSTIRPTSettings& settings) const;
+    // Adopts a set prepared with production = false: its groups join the base tier, or, for a tier's set, that tier (which
+    // must be adopted). False when nothing could be adopted.
+    bool AdoptKernelGroups(const ReSTIRPTPreparedPipelines& prepared);
+
+    // The tier the getters above return.
+    ReSTIRPTMaterialTier GetActiveMaterialTier() const
+    {
+        const TierPipelines* tier = ActiveTierPipelines();
+        return tier ? tier->tier : ReSTIRPTMaterialTier::Base;
     }
 
     // M5.3 test only: the pairing textures (packed int8 deltas, 254^2 + 230^2 + 210^2 texels) and their measured
@@ -767,16 +841,45 @@ class ReSTIRPTPass
     // Wall boiling (experimental): the ReGIR kernel with light-traced bounce connections (RESTIR_PT_LIGHT_BOUNCE).
     ComputePipeline m_initialReGIRLightBouncePipeline;
     bool m_regirThisFrame = false;
-    // OpenPBR: the layered tier of the production kernels (SetLayeredMaterials selects it).
-    ComputePipeline m_initialLayeredPipeline;
-    ComputePipeline m_temporalLayeredPipeline;
-    ComputePipeline m_initialReGIRLayeredPipeline;
-    ComputePipeline m_initialReGIRLightBounceLayeredPipeline;
-    ComputePipeline m_spatialPairsLayeredPipeline;
-    ComputePipeline m_spatialResampleLayeredPipeline;
-    ComputePipeline m_temporalPassLayeredPipeline;
-    bool m_layeredMaterials = false;
-    bool m_layeredReady = false;
+    // Material tiers: the production kernels of each tier but the base (indexed by tier; entry 0 is unused, the
+    // members above are the base tier). A tier's set is adopted once and kept until Shutdown, so no recorded frame can
+    // still use a replaced pipeline.
+    struct TierPipelines
+    {
+        ReSTIRPTMaterialTier tier = ReSTIRPTMaterialTier::Base;
+        ComputePipeline initial;
+        ComputePipeline temporal;
+        ComputePipeline initialReGIR;
+        ComputePipeline initialReGIRLightBounce;
+        ComputePipeline spatialPairs;
+        ComputePipeline spatialResample;
+        ComputePipeline temporalPass;
+        bool ready = false;
+        // Startup work (4.2): whether temporal and temporalPass were created (the temporal kernel group).
+        bool temporalKernels = false;
+    };
+
+    std::array<TierPipelines, ReSTIRPTMaterialTierCount> m_tierPipelines;
+    // Startup work (4.2): the ReSTIRPTKernelGroup bits adopted for the base tier.
+    std::uint32_t m_kernelGroups = 0;
+    ReSTIRPTMaterialTier m_materialTier = ReSTIRPTMaterialTier::Base;
+
+    // The desired tier's set, else the richest adopted tier whose features it contains (its bits are a subset), else
+    // nullptr for the base tier.
+    const TierPipelines* ActiveTierPipelines() const
+    {
+        const std::uint32_t desired = static_cast<std::uint32_t>(m_materialTier);
+
+        for(std::uint32_t tier = desired; tier != 0u; tier = (tier - 1u) & desired)
+        {
+            if(m_tierPipelines[tier].ready)
+            {
+                return &m_tierPipelines[tier];
+            }
+        }
+
+        return nullptr;
+    }
     Buffer m_counters;
     Buffer m_reservoirs[2];
     // M5.3: spatial pipelines, the scratch reservoirs (the initial/temporal kernel's output while spatial reuse runs), the

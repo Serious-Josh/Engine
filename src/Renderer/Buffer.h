@@ -92,6 +92,14 @@ class Buffer
         m_resourceState.Reset(state);
     }
 
+    // AIR async compute: CPU tracking only. Outside the work of an open recording, a buffer is in COMMON on the GPU (buffers decay
+    // at the end of every ExecuteCommandLists), whatever state the tracking last recorded; a compute-queue list, which cannot name
+    // graphics-only states such as PIXEL_SHADER_RESOURCE in a barrier, starts its transitions from there.
+    void AssumeDecayedToCommon()
+    {
+        m_resourceState.Reset(D3D12_RESOURCE_STATE_COMMON);
+    }
+
     void Transition(
         ID3D12GraphicsCommandList* commandList,
         D3D12_RESOURCE_STATES newState);

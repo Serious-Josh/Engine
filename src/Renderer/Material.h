@@ -11,6 +11,18 @@
 
 class Pipeline;
 
+// Whether a published material renders with parallax occlusion mapping: SurfaceDetailUsesParallax in
+// assets/Shaders/SurfaceDetail.hlsli, which this must match (the renderer picks the G-buffer pipeline with it).
+// GeometryWithParallaxFallback renders as its fallback until displaced geometry exists.
+inline bool SurfaceDetailUsesParallax(const GPUMaterial& material)
+{
+    const bool parallaxMode =
+        material.surfaceDetailMode == static_cast<std::uint32_t>(SurfaceDetailMode::ParallaxOcclusion) ||
+        material.surfaceDetailMode == static_cast<std::uint32_t>(SurfaceDetailMode::GeometryWithParallaxFallback);
+
+    return parallaxMode && material.heightTextureIndex != UINT_MAX && std::abs(material.heightScale) > 1.0e-6f;
+}
+
 // A runtime material: OpenPBR Surface parameters (OpenPBR 1.1.2 names in comments) plus its texture bindings. The
 // asset form is MaterialAssetData; MaterialParameterPropagation copies one into the other.
 struct Material
@@ -25,6 +37,9 @@ struct Material
     Texture* armTexture = nullptr;
     Texture* aoTexture = nullptr;
     Texture* heightTexture = nullptr;
+    // Layered prep (F5): the material's asset names a height texture, resident or still streaming in (heightTexture is the
+    // fallback meanwhile), so the ReSTIR PT tier it needs is known from its definition before the texture arrives.
+    bool heightTextureAssigned = false;
 
     SurfaceDetailMode surfaceDetailMode = SurfaceDetailMode::NormalOnly;
 
@@ -56,6 +71,9 @@ struct Material
     float coatIor = OpenPBRMaterialParameters::DefaultCoatIor;
     float coatDarkening = 1.0f;
     bool coatFollowsBaseNormal = false;
+    // Silhouette parallax occlusion mapping: with parallax, the relief cuts the mesh's outline at its open and sharp
+    // edges (the default; off keeps the mesh's straight outline).
+    bool parallaxSilhouette = true;
 
     // Fuzz: fuzz_weight, fuzz_color, fuzz_roughness.
     float fuzzWeight = 0.0f;
@@ -157,6 +175,11 @@ struct Material
         if(aoDiffuse > 0.0f || aoSpecularWeight > 0.0f)
         {
             flags |= GpuMaterialLobeFlags::PathTracedAO;
+        }
+
+        if(parallaxSilhouette)
+        {
+            flags |= GpuMaterialLobeFlags::ParallaxSilhouette;
         }
 
         return flags;

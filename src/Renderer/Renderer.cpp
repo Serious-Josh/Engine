@@ -26,6 +26,7 @@
 #include "Renderer/Passes/DiffuseIrradiancePass.h"
 #include "Renderer/Passes/GGXMultiscatterIrradiancePass.h"
 #include "Renderer/Texture.h"
+#include "Renderer/Vertex.h"
 #include "Material.h"
 #include "Scene/Camera.h"
 #include "ShaderData.h"
@@ -48,6 +49,7 @@
 #include <iterator>
 #include <utility>
 #include <cstdlib>
+#include <string_view>
 #include <climits>
 #include <chrono>
 #include <atomic>
@@ -3218,10 +3220,19 @@ bool Renderer::Initialize(
     if(!m_packagedRuntime)
     {
         // M0c.5 Stage 5.4: DXR libraries compile on several threads, each with its own DXC (a cold cache compiles 16
-        // libraries of 4.5–8 s each). One per eight hardware threads, from 1 to 4, which leaves the render thread, the
-        // pipeline worker and the system their cores; ENGINE_SHADER_COMPILE_WORKERS (1–8) overrides it for measurement.
+        // libraries of 4.5–8 s each). Startup work (4.8): one per four hardware threads, from 1 to 8, at below-normal
+        // priority (ShaderLibraryCompileWorker), and at most one per 768 MiB of free physical memory (a large DXC compile
+        // holds several hundred MiB); ENGINE_SHADER_COMPILE_WORKERS (1–8) overrides it for measurement.
         const unsigned int hardwareThreads = (std::max)(std::thread::hardware_concurrency(), 1u);
-        unsigned int compileThreads = std::clamp(hardwareThreads / 8u, 1u, 4u);
+        unsigned int compileThreads = std::clamp(hardwareThreads / 4u, 1u, 8u);
+        MEMORYSTATUSEX memory{};
+        memory.dwLength = sizeof(memory);
+
+        if(GlobalMemoryStatusEx(&memory))
+        {
+            const std::uint64_t byMemory = memory.ullAvailPhys / (768ull * 1024ull * 1024ull);
+            compileThreads = static_cast<unsigned int>(std::clamp<std::uint64_t>(byMemory, 1u, compileThreads));
+        }
         char workerOverride[3]{};
         const DWORD overrideLength = GetEnvironmentVariableA("ENGINE_SHADER_COMPILE_WORKERS", workerOverride,
             sizeof(workerOverride));
@@ -3249,7 +3260,15 @@ bool Renderer::Initialize(
     // ER.1 Phase 4: DXR state objects and shader tables are created on their own worker once the libraries are ready.
     const bool librariesPreparable = m_packagedRuntime || m_shaderCompileWorkerRunning;
     m_pipelineWorker = std::make_unique<RayTracingPipelineWorker>();
-    m_pipelineWorkerRunning = librariesPreparable && m_pipelineWorker->Start();
+    // Startup work (4.5): several threads (RayTracingPipelineWorker::DefaultThreadCount), CreateStateObject being
+    // free-threaded; each pipeline still has one job.
+    const unsigned int pipelineThreads = RayTracingPipelineWorker::DefaultThreadCount();
+    m_pipelineWorkerRunning = librariesPreparable && m_pipelineWorker->Start(pipelineThreads);
+
+    if(m_pipelineWorkerRunning)
+    {
+        Log::Info("DXR pipeline worker: " + std::to_string(pipelineThreads) + " thread(s).");
+    }
     m_asynchronousDxrPreparation = m_shaderCompileWorkerRunning || m_pipelineWorkerRunning;
 
     if(librariesPreparable && !m_pipelineWorkerRunning)
@@ -3309,6 +3328,29 @@ bool Renderer::Initialize(
         m_lightSamplingEnabled = true;
         m_lightSamplingAlways = true;
         Log::Info("Shared light sampling enabled (ENGINE_LIGHT_SAMPLING=1).");
+    }
+
+    // World-level noise fix: ENGINE_LIGHT_SAMPLING_CAMERA_WEIGHT=0 restores the pure power global distribution.
+    if(const char* cameraWeight = std::getenv("ENGINE_LIGHT_SAMPLING_CAMERA_WEIGHT"); cameraWeight && std::strcmp(cameraWeight, "0") == 0)
+    {
+        m_lightSamplingSettings.cameraWeighting = false;
+        Log::Info("Light sampling camera weighting off (ENGINE_LIGHT_SAMPLING_CAMERA_WEIGHT=0).");
+    }
+
+    // Tuning (LightSamplingSettings): ENGINE_LIGHT_SAMPLING_CAMERA_REACH (metres), ENGINE_LIGHT_SAMPLING_CAMERA_FAR (factor).
+    if(const char* reach = std::getenv("ENGINE_LIGHT_SAMPLING_CAMERA_REACH"); reach && *reach)
+    {
+        m_lightSamplingSettings.cameraReachRadius = std::strtof(reach, nullptr);
+    }
+
+    if(const char* farFactor = std::getenv("ENGINE_LIGHT_SAMPLING_CAMERA_FAR"); farFactor && *farFactor)
+    {
+        m_lightSamplingSettings.cameraFarFactor = std::strtod(farFactor, nullptr);
+    }
+
+    if(const char* frustum = std::getenv("ENGINE_LIGHT_SAMPLING_CAMERA_FRUSTUM"); frustum && std::strcmp(frustum, "0") == 0)
+    {
+        m_lightSamplingSettings.cameraFrustum = false;
     }
 
     // M4.3: ReGIR presampling reads the shared light sampling. M4.3.5: on by default (ENGINE_REGIR=0 disables ReGIR); the
@@ -3739,6 +3781,12 @@ bool Renderer::InitializeSceneRenderer(const HDRImageData* initialEnvironment, s
         return false;
     }
 
+    // Not fatal: without it parallax materials draw with their own pipeline and keep the triangle's depth.
+    if(!InitializeParallaxGeometryPipeline())
+    {
+        Log::Warning("Parallax depth offset is unavailable; parallax materials keep a flat depth.");
+    }
+
     beginStartupPhase("Editor overlay passes (collider, grid, voxel)");
     if(!m_packagedRuntime && !m_editorColliderPass.Initialize(device, m_shaderLibrary))
     {
@@ -4019,6 +4067,58 @@ bool Renderer::InitializeSceneRenderer(const HDRImageData* initialEnvironment, s
 // M0c.5 Stage 5.3: the Legacy (Ray Tracing) passes at the current render extent, once: from InitializeSceneRenderer, or for a
 // project workflow start from EnsureLegacyLightingExtent, before its first Legacy frame reads a pass. A failure is final;
 // Shutdown releases a partial set.
+// The parallax G-buffer pipeline: the layout every material pipeline has (FileSceneAssetCatalog and the demo scenes
+// create identical ones) with Triangle.hlsl's PSMainParallax in place of PSMain. ENGINE_POM_DEPTH_OFFSET=0 leaves it
+// out, for comparisons against the flat depth.
+bool Renderer::InitializeParallaxGeometryPipeline()
+{
+    m_parallaxGeometryPipeline.Shutdown();
+    const char* depthOffsetSetting = std::getenv("ENGINE_POM_DEPTH_OFFSET");
+
+    if(depthOffsetSetting && std::string_view(depthOffsetSetting) == "0")
+    {
+        return false;
+    }
+
+    const Shader* vertexShader = m_shaderLibrary.Load({"Triangle.hlsl", "VSMain", ShaderStage::Vertex});
+    const Shader* pixelShader = m_shaderLibrary.Load({"Triangle.hlsl", "PSMainParallax", ShaderStage::Pixel});
+
+    if(!vertexShader || !pixelShader)
+    {
+        return false;
+    }
+
+    const VertexLayout vertexLayout = CreateVertexLayout();
+    PipelineDescription description{};
+    description.vertexShader = vertexShader;
+    description.pixelShader = pixelShader;
+    description.vertexLayout = &vertexLayout;
+
+    description.renderTargets.count = 5;
+    description.renderTargets.formats[0] = GBuffer::MaterialFormat;
+    description.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    description.renderTargets.formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    description.renderTargets.formats[3] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    description.renderTargets.formats[4] = GBuffer::IdentityFormat;
+
+    // MaterialConstants (root constants), CameraConstants and ObjectConstants, as DrawMaterialRange sets them.
+    description.rootParameters.push_back({RootParameterType::Constants, 0, 11, D3D12_SHADER_VISIBILITY_PIXEL});
+    description.rootParameters.push_back({RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_ALL});
+    description.rootParameters.push_back({RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_ALL});
+
+    description.depthEnabled = true;
+    description.mirroredWindingVariant = true;
+    description.depthFormat = DXGI_FORMAT_D32_FLOAT;
+
+    if(!m_parallaxGeometryPipeline.Initialize(m_graphicsDevice.GetDevice(), description))
+    {
+        m_parallaxGeometryPipeline.Shutdown();
+        return false;
+    }
+
+    return true;
+}
+
 bool Renderer::InitializeLegacyLighting()
 {
     if(m_legacyLightingInitialized)
@@ -4232,8 +4332,11 @@ void Renderer::SelectPathTraceLibraries()
         return;
     }
 
+    // Startup work (4.6): a game cooked with the RayQuery flavour only builds its pipelines from the twins.
+    m_pathTraceReferencePass.SelectRayQueryOnly(m_shaderLibrary);
     const std::string message = std::string("Path-tracing libraries: ") +
-        PathTraceLibraryVariantName(selection.variant) + " (" + selection.reason + ").";
+        PathTraceLibraryVariantName(selection.variant) + " (" + selection.reason + ")" +
+        (m_pathTraceReferencePass.IsRayQueryOnly() ? "; RayQuery shadow rays only (no TraceRay originals cooked)." : ".");
 
     if(selection.warning)
     {
@@ -5241,8 +5344,6 @@ void Renderer::DrawMaterialRange(
         return;
     }
 
-    selectedMaterial.pipeline->Bind(commandList, HasMirroredWinding(objectConstants.model));
-
     const auto materialIndex = selectedMaterial.gpuIndex;
 
     if(materialIndex >= m_materialPublication.desired.size())
@@ -5254,6 +5355,13 @@ void Renderer::DrawMaterialRange(
     // Legacy raster root constants must agree with the table used by deferred/DXR passes.
     // Snapshot changes are rejected during recording, so this is the recorded revision.
     const auto& material = m_materialPublication.desired[materialIndex];
+
+    // A parallax material draws with the pixel shader that writes the relief's depth, decided from the record the
+    // shader reads. The pipeline has every material pipeline's layout, and all root arguments are set below.
+    const bool parallaxPipeline = m_parallaxGeometryPipeline.IsInitialized() && SurfaceDetailUsesParallax(material);
+    const Pipeline& pipeline = parallaxPipeline ? m_parallaxGeometryPipeline : *selectedMaterial.pipeline;
+    pipeline.Bind(commandList, HasMirroredWinding(objectConstants.model));
+
     MaterialConstants materialConstants{};
     materialConstants.textureIndex = material.textureIndex;
     materialConstants.roughness = material.roughness;
@@ -6567,15 +6675,16 @@ PathTracePrimary Renderer::GetLightingModePrimary(RendererLightingMode mode) con
 
 bool Renderer::IsLightingModeReady(RendererLightingMode mode) const
 {
+    // M5.1: ReSTIR PT Enhanced needs its own pass instead of the RTXDI reservoirs. Startup work (4.1): and the path tracer's
+    // targets, not the ReSTIR DI primary's pipelines, which it never records.
+    if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT)
+    {
+        return m_pathTraceReferencePass.IsInitialized() && m_restirPtPass.IsInitialized();
+    }
+
     if(!m_pathTraceReferencePass.IsPrimaryReady(GetLightingModePrimary(mode)))
     {
         return false;
-    }
-
-    // M5.1: ReSTIR PT Enhanced needs its own pass instead of the RTXDI reservoirs.
-    if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT)
-    {
-        return m_restirPtPass.IsInitialized();
     }
 
     return mode != RendererLightingMode::PathTracedRasterPrimaryReSTIRDI || m_rtxdiResources.IsInitialized();
@@ -6608,10 +6717,12 @@ PathTraceLibraryNeeds Renderer::GetPathTraceLibraryNeeds(RendererLightingMode mo
     needs.radianceCache = sharc && rasterPrimary;
     needs.radianceCacheRender = SharcRenderLibrary(extract, split, needs.rawDiffuseHitDistance);
     needs.radianceCacheImplementation = m_pathTraceReferencePass.GetRadianceCacheImplementation();
+    // Startup work (4.1): ReSTIR PT Enhanced prepares only what its frames dispatch (GetRequiredLibraries).
+    needs.restirPt = mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT;
     return needs;
 }
 
-ShaderLibraryPreparation Renderer::PrepareDxrLibraries(const PathTraceLibraryNeeds& needs)
+ShaderLibraryPreparation Renderer::PrepareDxrLibraries(const PathTraceLibraryNeeds& needs, bool background)
 {
     ShaderLibraryPreparation combined{};
     combined.state = ShaderLibraryPreparationState::Ready;
@@ -6657,13 +6768,24 @@ ShaderLibraryPreparation Renderer::PrepareDxrLibraries(const PathTraceLibraryNee
         ShaderLibraryPreparation preparation =
             m_pathTraceReferencePass.PrepareLibrary(m_shaderLibrary, *m_shaderCompileWorker, library.path);
 
-        // The reference library is listed first. A new revision of it may fix a sticky reference failure; the next
-        // gate retries it.
-        if(index == 0 && preparation.acceptedNewRevision && !m_pathTraceReferencePass.IsInitialized() &&
+        // The reference library is listed first (not for ReSTIR PT, which needs none). A new revision of it may fix a
+        // sticky reference failure; the next gate retries it.
+        if(index == 0 && !needs.restirPt && preparation.acceptedNewRevision && !m_pathTraceReferencePass.IsInitialized() &&
             m_pathTraceStatus.availability == PathTraceReferenceAvailability::Unavailable)
         {
             m_pathTraceStatus.availability = PathTraceReferenceAvailability::NotRequested;
             m_pathTraceStatus.unavailableReason.clear();
+        }
+
+        // Startup work (4.6): a required twin (RayQuery first, Editor) that fails to compile switches the Editor back to the
+        // TraceRay originals, which the next poll lists and compiles; the request keeps preparing rather than failing.
+        if(!library.optional && preparation.state == ShaderLibraryPreparationState::Failed && !m_packagedRuntime &&
+            PathTraceReferencePass::IsRayQueryTwinLibrary(library.path) && m_pathTraceReferencePass.AbandonRayQueryFirst())
+        {
+            Log::Warning("RayQuery library " + library.path.generic_string() + " failed to compile; the TraceRay "
+                "visibility fallback is compiled instead.");
+            preparation = {};
+            preparation.state = ShaderLibraryPreparationState::Queued;
         }
 
         // A RayQuery twin that fails leaves its pipeline on TraceRay (InitializeVisibilityPipelines warns), as a
@@ -6687,16 +6809,29 @@ ShaderLibraryPreparation Renderer::PrepareDxrLibraries(const PathTraceLibraryNee
     }
 
     // ER.1 Phase 4: with every library ready, the configuration's DXR pipelines are created in the background; the
-    // creation paths then adopt them instead of calling CreateStateObject while recording.
+    // creation paths then adopt them instead of calling CreateStateObject while recording. Startup work (4.5): the
+    // pipelines of the libraries already accepted are queued meanwhile, so creation overlaps the remaining compiles.
     const bool librariesReady = combined.state == ShaderLibraryPreparationState::Ready;
 
-    if(librariesReady && m_pipelineWorkerRunning)
+    if(m_pipelineWorkerRunning)
     {
-        combined = m_pathTraceReferencePass.PreparePipelines(*m_pipelineWorker, m_graphicsDevice.GetRayTracingDevice(),
-            needs);
+        if(librariesReady)
+        {
+            combined = m_pathTraceReferencePass.PreparePipelines(*m_pipelineWorker, m_graphicsDevice.GetRayTracingDevice(),
+                needs, nullptr, background);
+        }
+        else if(combined.state != ShaderLibraryPreparationState::Failed)
+        {
+            m_pathTraceReferencePass.PreparePipelines(*m_pipelineWorker, m_graphicsDevice.GetRayTracingDevice(), needs,
+                &m_preparedDxrLibraries, background);
+        }
     }
 
-    RecordDxrPreparation(combined, librariesReady, GetDxrResultsTaken() != resultsTakenBefore);
+    if(!background)
+    {
+        RecordDxrPreparation(combined, librariesReady, GetDxrResultsTaken() != resultsTakenBefore);
+    }
+
     return combined;
 }
 
@@ -6902,8 +7037,11 @@ void Renderer::CreateLightingModeResources(RendererLightingMode mode)
 {
     TransitionTiming::Scope er1Scope("CreateLightingModeResources");
     const PathTracePrimary primary = GetLightingModePrimary(mode);
+    const bool restirPt = mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT;
 
-    if(EnsurePathTraceReference() && primary != PathTracePrimary::Camera)
+    // Startup work (4.1): ReSTIR PT Enhanced creates the path tracer's targets but no primary pipeline; every other mode
+    // creates its primary's pipelines (the Camera one included: Initialize no longer builds it).
+    if(EnsurePathTraceReference() && !restirPt)
     {
         std::string ignoredFailure;
         m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary, primary, ignoredFailure);
@@ -7257,32 +7395,45 @@ bool Renderer::TryGetPreviousGBuffer(PreviousGBufferView& view) const
     return true;
 }
 
+// Startup work (4.1): the prerequisites every raster-primary mode shares, without any pipeline: DXR, the G-buffer, the
+// material count and the path tracer's targets. Empty when they hold, else why not.
+std::string Renderer::RasterPrimaryPrerequisiteFailure()
+{
+    if(!m_graphicsDevice.SupportsRayTracing())
+    {
+        return "Ray tracing is not supported.";
+    }
+
+    if(m_gBuffer.GetDepth().GetResource() == nullptr || m_gBuffer.GetSurface().GetResource() == nullptr ||
+        m_gBuffer.GetMaterial().GetResource() == nullptr || m_gBuffer.GetGeometricNormal().GetResource() == nullptr)
+    {
+        return "The G-buffer is not available.";
+    }
+
+    if(m_materialPublication.desired.size() > PathTraceRasterPrimaryMaximumMaterials)
+    {
+        return std::to_string(m_materialPublication.desired.size()) + " materials exceed the " +
+            std::to_string(PathTraceRasterPrimaryMaximumMaterials) + " indices the G-buffer stores exactly.";
+    }
+
+    // The path tracer's own gate: material tables and its resources. Its failure is sticky, so this does not retry every
+    // frame.
+    if(!EnsurePathTraceReference())
+    {
+        return "Reference path tracer unavailable: " + m_pathTraceStatus.unavailableReason;
+    }
+
+    return {};
+}
+
 void Renderer::EvaluatePathTraceRasterPrimary()
 {
     PathTraceModeAvailability& status = m_rasterPrimaryStatus.rasterPrimary;
     const PathTraceModeAvailability previous = status;
 
-    if(!m_graphicsDevice.SupportsRayTracing())
+    if(std::string prerequisite = RasterPrimaryPrerequisiteFailure(); !prerequisite.empty())
     {
-        status = {PathTraceRasterPrimaryAvailability::Unavailable, "Ray tracing is not supported."};
-    }
-    else if(m_gBuffer.GetDepth().GetResource() == nullptr || m_gBuffer.GetSurface().GetResource() == nullptr ||
-        m_gBuffer.GetMaterial().GetResource() == nullptr || m_gBuffer.GetGeometricNormal().GetResource() == nullptr)
-    {
-        status = {PathTraceRasterPrimaryAvailability::Unavailable, "The G-buffer is not available."};
-    }
-    else if(m_materialPublication.desired.size() > PathTraceRasterPrimaryMaximumMaterials)
-    {
-        status = {PathTraceRasterPrimaryAvailability::Unavailable,
-            std::to_string(m_materialPublication.desired.size()) + " materials exceed the " +
-            std::to_string(PathTraceRasterPrimaryMaximumMaterials) + " indices the G-buffer stores exactly."};
-    }
-    // The reference mode's own gate: material tables, the DXR library (absent from historical cooked
-    // bundles) and its resources. Its failure is sticky, so this does not retry every frame.
-    else if(!EnsurePathTraceReference())
-    {
-        status = {PathTraceRasterPrimaryAvailability::Unavailable,
-            "Reference path tracer unavailable: " + m_pathTraceStatus.unavailableReason};
+        status = {PathTraceRasterPrimaryAvailability::Unavailable, std::move(prerequisite)};
     }
     else
     {
@@ -7359,24 +7510,19 @@ void Renderer::EvaluatePathTraceReSTIRDI()
     }
 }
 
-// M5.1 ReSTIR PT Enhanced (configuration B): the raster-primary prerequisites and the ReSTIR DI mode's primary pipeline
-// (configuration B records its G-buffer path, targets and denoisers), then its own pass. Packaged games run it from the
+// M5.1 ReSTIR PT Enhanced (configuration B): the raster-primary prerequisites (configuration B records the ReSTIR DI
+// primary's G-buffer path, targets and denoisers), then its own pass. Packaged games run it from the
 // cooked production kernels (PackagedShaderInventory's ReSTIR PT rows).
 void Renderer::EvaluatePathTraceReSTIRPT()
 {
-    EvaluatePathTraceRasterPrimary();
+    // Startup work (4.1): the raster-primary prerequisites without any primary pipeline (configuration B records the ReSTIR
+    // DI primary's G-buffer path and targets, but none of its DXR pipelines).
     PathTraceModeAvailability& status = m_restirPtAvailability;
     const PathTraceModeAvailability previous = status;
-    std::string pipelineFailure;
 
-    if(m_rasterPrimaryStatus.rasterPrimary.availability != PathTraceRasterPrimaryAvailability::Available)
+    if(std::string prerequisite = RasterPrimaryPrerequisiteFailure(); !prerequisite.empty())
     {
-        status = {PathTraceRasterPrimaryAvailability::Unavailable, m_rasterPrimaryStatus.rasterPrimary.reason};
-    }
-    else if(!m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary,
-        PathTracePrimary::RasterReSTIRDI, pipelineFailure))
-    {
-        status = {PathTraceRasterPrimaryAvailability::Unavailable, pipelineFailure};
+        status = {PathTraceRasterPrimaryAvailability::Unavailable, std::move(prerequisite)};
     }
     else if(!EnsureReSTIRPT())
     {
@@ -7618,6 +7764,22 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         m_restirPtPass.InvalidateHistory();
         return;
     }
+
+    // Material tiers: the layered kernels only while this frame's material table has a coat, fuzz, thin film or
+    // anisotropic material, the relief kernels only while it has a parallax material (each prepared on first need).
+    UpdateReSTIRPTTierPipelines();
+    m_restirPtPass.SetMaterialTier(NeededReSTIRPTMaterialTier());
+
+    // Startup work (4.2): a development switch whose kernels are not prepared yet is off for this recording (its group is
+    // prepared meanwhile; the production kernels render). The requested settings are restored when the recording ends.
+    UpdateReSTIRPTKernelGroups();
+    struct RequestedSettings
+    {
+        ReSTIRPTSettings& live;
+        ReSTIRPTSettings requested;
+        ~RequestedSettings() { live = requested; }
+    } requestedSettings{m_restirPtSettings, m_restirPtSettings};
+    m_restirPtPass.RestrictToAdoptedKernels(m_restirPtSettings);
 
     const std::uint32_t tableLights = frameLighting.table.lightCount;
     const bool samplingPublished = m_lightSamplingReport.available && m_lightSamplingPublishedLightCount == tableLights;
@@ -7909,10 +8071,9 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     }
 
     m_restirPtPass.PrepareInitialPass(commandList);
-    // OpenPBR tiers: the layered kernels only while this frame's material table has a coat, fuzz, thin film or
-    // anisotropic material (prepared on first need).
-    UpdateReSTIRPTLayeredPipelines();
-    m_restirPtPass.SetLayeredMaterials(m_materialPublication.layeredLobes);
+    // Material tiers: the layered kernels only while this frame's material table has a coat, fuzz, thin film or
+    // anisotropic material, the relief kernels only while it has a parallax material (each prepared on first need).
+    m_restirPtPass.SetMaterialTier(NeededReSTIRPTMaterialTier());
     m_pathTraceReferencePass.ExecuteReSTIRPT(commandList, m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap,
         m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight,
         m_restirPtPass.GetInitialPipeline(m_restirPtSettings, temporalPass), address, transformsAddress, extract,
@@ -8218,12 +8379,13 @@ bool Renderer::SubmitReSTIRPTPipelines()
     }
 
     // A worker of its own, so a slow preparation (seconds per kernel after a shader change) never delays the
-    // configuration's DXR pipelines on the shared pipeline worker.
+    // configuration's DXR pipelines on the shared pipeline worker. Layered prep (F1): two threads, so a material tier's set
+    // prepares beside the base set or a kernel group instead of queuing behind it.
     if(!m_restirPtPipelineWorker)
     {
         auto worker = std::make_unique<RayTracingPipelineWorker>();
 
-        if(!worker->Start())
+        if(!worker->Start(ReSTIRPTPipelineWorkerThreads))
         {
             return false;
         }
@@ -8235,6 +8397,9 @@ bool Renderer::SubmitReSTIRPTPipelines()
     const bool sharcAvailable = ReSTIRPTSharcAvailable();
     auto prepared = std::make_shared<ReSTIRPTPreparedPipelines>();
     prepared->sharc = sharcAvailable;
+    // Startup work (4.2): the production kernels and only the kernel groups the settings already use; the others are
+    // prepared on first use (UpdateReSTIRPTKernelGroups).
+    prepared->groups = ReSTIRPTPass::KernelGroupsFor(m_restirPtSettings);
     const ReSTIRPTShaderSource shaderSource = GetReSTIRPTShaderSource();
     // Read only by the job (free-threaded device methods); Shutdown joins the worker before the device is released.
     ID3D12Device* device = m_graphicsDevice.GetDevice();
@@ -8305,7 +8470,7 @@ void Renderer::ReleasePreparedReSTIRPTPipelines()
     }
 }
 
-bool Renderer::SubmitReSTIRPTLayeredPipelines()
+bool Renderer::SubmitReSTIRPTTierPipelines(ReSTIRPTMaterialTier tier)
 {
     if(!m_graphicsDevice.GetDevice() || !m_graphicsDevice.GetRayTracingDevice())
     {
@@ -8316,7 +8481,7 @@ bool Renderer::SubmitReSTIRPTLayeredPipelines()
     {
         auto worker = std::make_unique<RayTracingPipelineWorker>();
 
-        if(!worker->Start())
+        if(!worker->Start(ReSTIRPTPipelineWorkerThreads))
         {
             return false;
         }
@@ -8328,11 +8493,13 @@ bool Renderer::SubmitReSTIRPTLayeredPipelines()
     const bool sharcAvailable = ReSTIRPTSharcAvailable();
     auto prepared = std::make_shared<ReSTIRPTPreparedPipelines>();
     prepared->sharc = sharcAvailable;
-    prepared->layered = true;
+    prepared->tier = tier;
+    // Startup work (4.2): a tier's temporal kernels only while temporal reuse is on (else on first use).
+    prepared->groups = ReSTIRPTPass::KernelGroupsFor(m_restirPtSettings) & ReSTIRPTKernelGroupTemporal;
     const ReSTIRPTShaderSource shaderSource = GetReSTIRPTShaderSource();
     ID3D12Device* device = m_graphicsDevice.GetDevice();
     RayTracingPipelineRequest request{};
-    request.key = ReSTIRPTLayeredPipelineJobKey;
+    request.key = ReSTIRPTTierPipelineJobKeys[static_cast<std::size_t>(tier)];
     request.device = m_graphicsDevice.GetRayTracingDevice();
     request.prepareAuxiliary = [prepared, shaderSource, device]()
     {
@@ -8344,81 +8511,341 @@ bool Renderer::SubmitReSTIRPTLayeredPipelines()
         return false;
     }
 
-    m_restirPtPreparedLayeredPipelines = std::move(prepared);
-    m_restirPtLayeredPreparing = true;
-    m_restirPtLayeredRequested = std::chrono::steady_clock::now();
-    Log::Info("ReSTIR PT layered pipelines (OpenPBR coat, fuzz, thin film, anisotropy): preparing on the ReSTIR PT "
-        "worker; until they are ready those lobes are not rendered.");
+    ReSTIRPTTierPreparation& preparation = m_restirPtTierPreparations[static_cast<std::size_t>(tier)];
+    preparation.prepared = std::move(prepared);
+    preparation.preparing = true;
+    preparation.requested = std::chrono::steady_clock::now();
+    Log::Info(std::string("ReSTIR PT ") + ReSTIRPTMaterialTierDescription(tier) +
+        " pipelines: preparing on the ReSTIR PT worker; until they are ready those features are not rendered.");
     return true;
 }
 
-void Renderer::UpdateReSTIRPTLayeredPipelines()
+void Renderer::TakeReSTIRPTTierPipelines(ReSTIRPTMaterialTier tier)
 {
-    if(!m_materialPublication.layeredLobes || !m_restirPtPass.IsInitialized() || m_restirPtPass.HasLayeredPipelines() ||
-        m_restirPtLayeredFailed)
+    ReSTIRPTTierPreparation& preparation = m_restirPtTierPreparations[static_cast<std::size_t>(tier)];
+    const char* jobKey = ReSTIRPTTierPipelineJobKeys[static_cast<std::size_t>(tier)];
+
+    if(!m_restirPtPipelineWorker || m_restirPtPipelineWorker->GetState(jobKey) != RayTracingPipelineJobState::Completed)
     {
         return;
     }
 
-    if(!m_restirPtLayeredPreparing)
-    {
-        if(!SubmitReSTIRPTLayeredPipelines())
-        {
-            m_restirPtLayeredFailed = true;
-            Log::Warning("ReSTIR PT layered pipelines: no worker could take them; coat, fuzz, thin film and anisotropy "
-                "are not rendered in ReSTIR PT.");
-        }
-
-        return;
-    }
-
-    if(!m_restirPtPipelineWorker ||
-        m_restirPtPipelineWorker->GetState(ReSTIRPTLayeredPipelineJobKey) != RayTracingPipelineJobState::Completed)
-    {
-        return;
-    }
-
-    const std::optional<RayTracingPipelineOutcome> outcome =
-        m_restirPtPipelineWorker->TakeCompleted(ReSTIRPTLayeredPipelineJobKey);
-    m_restirPtLayeredPreparing = false;
+    const std::optional<RayTracingPipelineOutcome> outcome = m_restirPtPipelineWorker->TakeCompleted(jobKey);
+    preparation.preparing = false;
 
     // Created on another device: released, and prepared again on the next frame that needs them.
     if(!outcome || outcome->device != m_graphicsDevice.GetRayTracingDevice())
     {
-        ReleasePreparedReSTIRPTLayeredPipelines();
+        ReleasePreparedReSTIRPTTierPipelines(tier);
         return;
     }
 
-    if(!outcome->succeeded && m_restirPtPreparedLayeredPipelines->failure.empty())
+    if(!outcome->succeeded && preparation.prepared->failure.empty())
     {
-        m_restirPtPreparedLayeredPipelines->failure = "the pipeline preparation job failed.";
+        preparation.prepared->failure = "the pipeline preparation job failed.";
     }
 
     const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-        m_restirPtLayeredRequested).count();
-    const bool sameSharc = m_restirPtPreparedLayeredPipelines->sharc == NvidiaSharcCapabilityFailure().empty();
+        preparation.requested).count();
+    const bool sameSharc = preparation.prepared->sharc == NvidiaSharcCapabilityFailure().empty();
+    const std::string name = std::string("ReSTIR PT ") + ReSTIRPTMaterialTierDescription(tier) + " pipelines: ";
 
-    if(sameSharc && m_restirPtPass.AdoptLayeredPipelines(*m_restirPtPreparedLayeredPipelines))
+    if(sameSharc && m_restirPtPass.AdoptTierPipelines(*preparation.prepared))
     {
-        Log::Info("ReSTIR PT layered pipelines: prepared and adopted " + std::to_string(milliseconds) +
-            " ms after the request.");
+        Log::Info(name + "prepared and adopted " + std::to_string(milliseconds) + " ms after the request.");
     }
     else
     {
-        m_restirPtLayeredFailed = true;
-        Log::Error("ReSTIR PT layered pipelines: preparation failed after " + std::to_string(milliseconds) + " ms: " +
-            (sameSharc ? m_restirPtPreparedLayeredPipelines->failure : std::string("the SHARC choice changed.")));
+        preparation.failed = true;
+        Log::Error(name + "preparation failed after " + std::to_string(milliseconds) + " ms: " +
+            (sameSharc ? preparation.prepared->failure : std::string("the SHARC choice changed.")));
     }
 
-    ReleasePreparedReSTIRPTLayeredPipelines();
+    ReleasePreparedReSTIRPTTierPipelines(tier);
 }
 
-void Renderer::ReleasePreparedReSTIRPTLayeredPipelines()
+void Renderer::UpdateReSTIRPTTierPipelines()
 {
-    if(m_restirPtPreparedLayeredPipelines)
+    if(!m_restirPtPass.IsInitialized())
     {
-        m_restirPtPreparedLayeredPipelines->Shutdown();
-        m_restirPtPreparedLayeredPipelines.reset();
+        return;
+    }
+
+    // Every tier's finished preparation, also one the material table no longer needs (it stays adopted for later).
+    for(std::size_t index = 1; index < ReSTIRPTMaterialTierCount; ++index)
+    {
+        if(m_restirPtTierPreparations[index].preparing)
+        {
+            TakeReSTIRPTTierPipelines(static_cast<ReSTIRPTMaterialTier>(index));
+        }
+    }
+
+    RequestReSTIRPTTierPipelines();
+}
+
+ReSTIRPTMaterialTier Renderer::NeededReSTIRPTMaterialTier() const
+{
+    const ReSTIRPTMaterialTier published = ReSTIRPTMaterialTierFor(m_materialPublication.layeredLobes,
+        m_materialPublication.parallax);
+    return static_cast<ReSTIRPTMaterialTier>(static_cast<std::uint32_t>(published) |
+        static_cast<std::uint32_t>(m_sceneMaterialTierHint.value_or(ReSTIRPTMaterialTier::Base)));
+}
+
+ShaderLibraryPreparation Renderer::PrepareReSTIRPTMaterialTier()
+{
+    ShaderLibraryPreparation result{};
+    result.state = ShaderLibraryPreparationState::Ready;
+
+    if(!m_restirPtPass.IsInitialized())
+    {
+        result.state = ShaderLibraryPreparationState::PreparingPipelines;
+        return result;
+    }
+
+    UpdateReSTIRPTTierPipelines();
+    const ReSTIRPTMaterialTier tier = NeededReSTIRPTMaterialTier();
+
+    if(m_restirPtPass.HasTierPipelines(tier) || m_restirPtTierPreparations[static_cast<std::size_t>(tier)].failed)
+    {
+        return result;
+    }
+
+    // The wait's limit counts from this request's first poll here, i.e. once its base set was ready.
+    static const std::chrono::milliseconds limit = []()
+    {
+        char value[16]{};
+        const DWORD length = GetEnvironmentVariableA("ENGINE_TIER_GATE_SECONDS", value, sizeof(value));
+        return length > 0 && length < sizeof(value) ?
+            std::chrono::milliseconds(static_cast<long long>((std::max)(0.0, std::atof(value)) * 1000.0)) :
+            std::chrono::milliseconds(ReSTIRPTTierGateLimit);
+    }();
+    const std::uint64_t generation = m_configurationPreparation.GetStatus().generation;
+    const auto now = std::chrono::steady_clock::now();
+
+    if(generation != m_restirPtTierGateGeneration)
+    {
+        m_restirPtTierGateGeneration = generation;
+        m_restirPtTierGateStart = now;
+        m_restirPtTierGateExpired = false;
+    }
+
+    if(now - m_restirPtTierGateStart >= limit)
+    {
+        if(!m_restirPtTierGateExpired)
+        {
+            m_restirPtTierGateExpired = true;
+            Log::Warning(std::string("ReSTIR PT ") + ReSTIRPTMaterialTierDescription(tier) + " pipelines: not ready " +
+                std::to_string(std::chrono::duration<double>(limit).count()) + " s after the base set; presenting "
+                "without those features until they are adopted.");
+        }
+
+        return result;
+    }
+
+    result.state = ShaderLibraryPreparationState::PreparingPipelines;
+    return result;
+}
+
+void Renderer::RequestReSTIRPTTierPipelines()
+{
+    // Layered prep (F5): a table published after this frame's hint waits for the next hint (one frame), so its tier is
+    // never decided without the definitions (it would ask for layered before layered relief).
+    if(m_sceneMaterialTierHint && m_sceneMaterialTierHintRevision != m_materialPublication.revision)
+    {
+        return;
+    }
+
+    const ReSTIRPTMaterialTier tier = NeededReSTIRPTMaterialTier();
+
+    if(tier == ReSTIRPTMaterialTier::Base)
+    {
+        return;
+    }
+
+    ReSTIRPTTierPreparation& preparation = m_restirPtTierPreparations[static_cast<std::size_t>(tier)];
+
+    // Layered prep (F1): a smaller tier this one contains (layered or relief, when layered relief is needed) that no thread
+    // has started yet is dropped: the needed set supersedes it (its materials render through the base tier meanwhile).
+    for(std::size_t index = 1; index < ReSTIRPTMaterialTierCount; ++index)
+    {
+        ReSTIRPTTierPreparation& smaller = m_restirPtTierPreparations[index];
+
+        if(index != static_cast<std::size_t>(tier) && (index & static_cast<std::size_t>(tier)) == index &&
+            smaller.preparing && m_restirPtPipelineWorker &&
+            m_restirPtPipelineWorker->CancelQueued(ReSTIRPTTierPipelineJobKeys[index]))
+        {
+            smaller.preparing = false;
+            ReleasePreparedReSTIRPTTierPipelines(static_cast<ReSTIRPTMaterialTier>(index));
+            Log::Info(std::string("ReSTIR PT ") + ReSTIRPTMaterialTierDescription(static_cast<ReSTIRPTMaterialTier>(index)) +
+                " pipelines: dropped before they started; the " + ReSTIRPTMaterialTierDescription(tier) +
+                " set supersedes them.");
+        }
+    }
+
+    if(m_restirPtPass.HasTierPipelines(tier) || preparation.preparing || preparation.failed)
+    {
+        return;
+    }
+
+    if(!SubmitReSTIRPTTierPipelines(tier))
+    {
+        preparation.failed = true;
+        Log::Warning(std::string("ReSTIR PT ") + ReSTIRPTMaterialTierDescription(tier) + " pipelines: no worker could "
+            "take them; those features are not rendered in ReSTIR PT.");
+    }
+}
+
+bool Renderer::IsReSTIRPTMaterialWorkPreparing() const
+{
+    for(std::size_t index = 0; index < ReSTIRPTMaterialTierCount; ++index)
+    {
+        if(m_restirPtTierPreparations[index].preparing || m_restirPtKernelGroupPreparations[index].preparing)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::optional<ReSTIRPTMaterialTier> Renderer::GetSettledReSTIRPTMaterialTier() const
+{
+    if(!m_restirPtPass.IsInitialized())
+    {
+        return std::nullopt;
+    }
+
+    for(const ReSTIRPTTierPreparation& preparation : m_restirPtTierPreparations)
+    {
+        if(preparation.preparing)
+        {
+            return std::nullopt;
+        }
+    }
+
+    const ReSTIRPTMaterialTier tier = NeededReSTIRPTMaterialTier();
+
+    if(!m_restirPtPass.HasTierPipelines(tier) && !m_restirPtTierPreparations[static_cast<std::size_t>(tier)].failed)
+    {
+        return std::nullopt;
+    }
+
+    return tier;
+}
+
+bool Renderer::SubmitReSTIRPTKernelGroups(ReSTIRPTMaterialTier tier, std::uint32_t groups)
+{
+    if(!m_restirPtPipelineWorker || !m_graphicsDevice.GetDevice() || !m_graphicsDevice.GetRayTracingDevice())
+    {
+        return false;
+    }
+
+    auto prepared = std::make_shared<ReSTIRPTPreparedPipelines>();
+    prepared->sharc = ReSTIRPTSharcAvailable();
+    prepared->tier = tier;
+    prepared->production = false;
+    prepared->groups = groups;
+    const ReSTIRPTShaderSource shaderSource = GetReSTIRPTShaderSource();
+    ID3D12Device* device = m_graphicsDevice.GetDevice();
+    RayTracingPipelineRequest request{};
+    request.key = ReSTIRPTKernelGroupJobKeys[static_cast<std::size_t>(tier)];
+    request.device = m_graphicsDevice.GetRayTracingDevice();
+    request.prepareAuxiliary = [prepared, shaderSource, device]()
+    {
+        return ReSTIRPTPass::PreparePipelines(device, shaderSource, *prepared);
+    };
+
+    if(!m_restirPtPipelineWorker->Submit(std::move(request)))
+    {
+        return false;
+    }
+
+    ReSTIRPTKernelGroupPreparation& preparation = m_restirPtKernelGroupPreparations[static_cast<std::size_t>(tier)];
+    preparation.prepared = std::move(prepared);
+    preparation.preparing = true;
+    preparation.requested = std::chrono::steady_clock::now();
+    Log::Info(std::string("ReSTIR PT kernel groups 0x") + std::to_string(groups) + " (" +
+        ReSTIRPTMaterialTierDescription(tier) + " tier): preparing on first use; the production kernels render meanwhile.");
+    return true;
+}
+
+void Renderer::UpdateReSTIRPTKernelGroups()
+{
+    // Packaged games cook no group (nothing selects one without a development switch).
+    if(m_packagedRuntime || !m_restirPtPass.IsInitialized())
+    {
+        return;
+    }
+
+    for(std::size_t index = 0; index < ReSTIRPTMaterialTierCount; ++index)
+    {
+        ReSTIRPTKernelGroupPreparation& preparation = m_restirPtKernelGroupPreparations[index];
+        const char* jobKey = ReSTIRPTKernelGroupJobKeys[index];
+
+        if(!preparation.preparing || !m_restirPtPipelineWorker ||
+            m_restirPtPipelineWorker->GetState(jobKey) != RayTracingPipelineJobState::Completed)
+        {
+            continue;
+        }
+
+        const std::optional<RayTracingPipelineOutcome> outcome = m_restirPtPipelineWorker->TakeCompleted(jobKey);
+        preparation.preparing = false;
+        const std::uint32_t groups = preparation.prepared->groups;
+        const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+            preparation.requested).count();
+        const bool sameSharc = preparation.prepared->sharc == ReSTIRPTSharcAvailable();
+
+        if(outcome && outcome->device == m_graphicsDevice.GetRayTracingDevice() && outcome->succeeded && sameSharc &&
+            m_restirPtPass.AdoptKernelGroups(*preparation.prepared))
+        {
+            Log::Info("ReSTIR PT kernel groups 0x" + std::to_string(groups) + ": prepared and adopted " +
+                std::to_string(milliseconds) + " ms after the request.");
+        }
+        else if(outcome && outcome->device == m_graphicsDevice.GetRayTracingDevice())
+        {
+            preparation.failedGroups |= groups;
+            Log::Error("ReSTIR PT kernel groups 0x" + std::to_string(groups) + ": preparation failed after " +
+                std::to_string(milliseconds) + " ms: " + (preparation.prepared->failure.empty() ?
+                std::string("the set could not be adopted.") : preparation.prepared->failure));
+        }
+
+        preparation.prepared->Shutdown();
+        preparation.prepared.reset();
+    }
+
+    // The base tier's groups, then the temporal kernels of the tier the getters return.
+    const std::uint32_t needed = ReSTIRPTPass::KernelGroupsFor(m_restirPtSettings);
+    ReSTIRPTKernelGroupPreparation& base = m_restirPtKernelGroupPreparations[0];
+    const std::uint32_t baseMissing = needed & ~m_restirPtPass.GetAdoptedBaseKernelGroups() & ~base.failedGroups;
+
+    if(baseMissing != 0u && !base.preparing && !SubmitReSTIRPTKernelGroups(ReSTIRPTMaterialTier::Base, baseMissing))
+    {
+        base.failedGroups |= baseMissing;
+    }
+
+    const ReSTIRPTMaterialTier tier = m_restirPtPass.GetActiveMaterialTier();
+
+    if(tier != ReSTIRPTMaterialTier::Base && (needed & ReSTIRPTKernelGroupTemporal) != 0u &&
+        !m_restirPtPass.HasTierTemporalKernels(tier))
+    {
+        ReSTIRPTKernelGroupPreparation& preparation = m_restirPtKernelGroupPreparations[static_cast<std::size_t>(tier)];
+
+        if(!preparation.preparing && (preparation.failedGroups & ReSTIRPTKernelGroupTemporal) == 0u &&
+            !SubmitReSTIRPTKernelGroups(tier, ReSTIRPTKernelGroupTemporal))
+        {
+            preparation.failedGroups |= ReSTIRPTKernelGroupTemporal;
+        }
+    }
+}
+
+void Renderer::ReleasePreparedReSTIRPTTierPipelines(ReSTIRPTMaterialTier tier)
+{
+    ReSTIRPTTierPreparation& preparation = m_restirPtTierPreparations[static_cast<std::size_t>(tier)];
+
+    if(preparation.prepared)
+    {
+        preparation.prepared->Shutdown();
+        preparation.prepared.reset();
     }
 }
 
@@ -10199,8 +10626,20 @@ bool Renderer::RecordPathTraceReference(
             (primary == PathTracePrimary::Raster || primary == PathTracePrimary::RasterReSTIRDI))
         {
             std::string extractionFailure;
-            extract = m_pathTraceReferencePass.EnsureSignalExtraction(m_graphicsDevice, m_shaderLibrary,
-                m_resourceDescriptorHeap, primary, extractionFailure);
+
+            // Startup work (4.1): a ReSTIR PT frame writes the extraction outputs from its own kernels; it needs them, not the
+            // extraction pipelines.
+            if(restirPtFrame)
+            {
+                extract = m_pathTraceReferencePass.EnsureSignalExtractionTargets(m_graphicsDevice.GetDevice(),
+                    m_resourceDescriptorHeap);
+                extractionFailure = extract ? "" : "The signal extraction outputs could not be allocated.";
+            }
+            else
+            {
+                extract = m_pathTraceReferencePass.EnsureSignalExtraction(m_graphicsDevice, m_shaderLibrary,
+                    m_resourceDescriptorHeap, primary, extractionFailure);
+            }
 
             if(extract && splitReSTIRDI)
             {
@@ -10227,7 +10666,7 @@ bool Renderer::RecordPathTraceReference(
                     std::string rawFailure;
                     Texture* rawDiffuseHitDistance = nullptr;
 
-                    if(m_pathTraceReferencePass.EnsureSignalExtraction(m_graphicsDevice, m_shaderLibrary,
+                    if(restirPtFrame || m_pathTraceReferencePass.EnsureSignalExtraction(m_graphicsDevice, m_shaderLibrary,
                         m_resourceDescriptorHeap, primary, rawFailure, true))
                     {
                         rawDiffuseHitDistance = m_pathTraceReferencePass.EnsureRawDiffuseHitDistanceTexture(
@@ -13173,6 +13612,8 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::RecordLightSampling(ID3D12GraphicsCommandLis
 {
     m_lightSamplingReport.enabled = m_lightSamplingEnabled || restirPtFrame;
     m_lightSamplingReport.available = false;
+    // World-level noise fix: the previous frame's structures, to tell whether this frame's camera weighting differs.
+    const std::shared_ptr<LightSamplingData> previousFrameData = std::move(m_frameLightSamplingData);
     m_frameLightSamplingData.reset();
 
     // M4.3.5: with ReGIR the only consumer, nothing is built (or published) on frames that do not use it. M5.1:
@@ -13272,6 +13713,80 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::RecordLightSampling(ID3D12GraphicsCommandLis
         m_lightSamplingCache = lightingRevision != 0 ? data : nullptr;
         m_lightSamplingCacheRevision = lightingRevision;
         m_lightSamplingCacheTable = lightingRevision != 0 ? lighting.table : SceneLightTable{};
+    }
+
+    // World-level noise fix: the camera-weighted global distribution (LightSamplingSettings::cameraWeighting), in place.
+    // A full build this frame is copied whole; otherwise the rewritten words go out as a patch over the previous
+    // publication (merged with this frame's incremental ranges).
+    {
+        // The frame's view (RenderView rows: right, up, forward; Matrix4::Perspective for the field of view and far plane).
+        LightSamplingCameraView cameraView;
+        const Matrix4& view = m_recordedView;
+        const Matrix4& projection = m_recordedProjection;
+
+        for(int axis = 0; axis < 3; ++axis)
+        {
+            cameraView.position[axis] = m_frameCameraPosition[axis];
+            cameraView.right[axis] = view.m[0][axis];
+            cameraView.up[axis] = view.m[1][axis];
+            cameraView.forward[axis] = view.m[2][axis];
+        }
+
+        if(projection.m[1][1] > 0.0f && projection.m[0][0] > 0.0f)
+        {
+            cameraView.verticalFov = 2.0f * std::atan(1.0f / projection.m[1][1]);
+            cameraView.aspectRatio = projection.m[1][1] / projection.m[0][0];
+            const float nearPlane = projection.m[2][2] != 0.0f ? -projection.m[2][3] / projection.m[2][2] : 0.0f;
+            const float farPlane = projection.m[2][2] != 1.0f ? projection.m[2][2] * nearPlane / (projection.m[2][2] - 1.0f) :
+                0.0f;
+            cameraView.farPlane = std::isfinite(farPlane) && farPlane > nearPlane ? farPlane : 0.0f;
+        }
+
+        const LightSamplingCameraUpdate cameraUpdate = UpdateLightSamplingCameraWeighting(lighting.table,
+            m_lightSamplingSettings, cameraView, *data, dirty);
+
+        if(cameraUpdate.rewritten)
+        {
+            if(!revisionChanged)
+            {
+                incremental = true;
+                ++m_lightSamplingPublication;
+            }
+
+            // ReSTIR PT stores 1 / p_1 of a sample's own frame (rcRadiance): with temporal reuse, a changed weighting drops
+            // history like a global lighting discontinuity. Only a classification that differs from the previous frame's
+            // counts: a full build that reapplies the same classification changes no probability.
+            const std::shared_ptr<LightSamplingData>& previous = previousFrameData;
+            bool weightsChanged = previous.get() == data.get();
+
+            if(!weightsChanged)
+            {
+                const auto reachOf = [](const LightSamplingData* source, std::uint32_t light) -> std::uint8_t
+                {
+                    return source && source->cameraWeighting.applied && light < source->cameraWeighting.reach.size() ?
+                        source->cameraWeighting.reach[light] : 1;
+                };
+
+                for(std::uint32_t light = 0; light < lighting.table.lightCount && !weightsChanged; ++light)
+                {
+                    weightsChanged = reachOf(previous.get(), light) != reachOf(data.get(), light);
+                }
+            }
+
+            if(weightsChanged && m_restirPtSettings.temporal)
+            {
+                ++m_restirPtLightingEpoch;
+            }
+
+            if(weightsChanged)
+            {
+                Log::Info("Light sampling camera weighting: " + std::to_string(cameraUpdate.farLights) + " of " +
+                    std::to_string(data->incremental.globalMembers.size()) + " global lights far, " +
+                    std::to_string(cameraUpdate.changedLights) + " reclassified, " +
+                    std::to_string(cameraUpdate.milliseconds) + " ms" +
+                    (m_restirPtSettings.temporal ? " (ReSTIR PT history dropped)." : "."));
+            }
+        }
     }
 
     // M4.1.1: while lights sit in the wide pool after incremental updates, rebuild in full on a worker (one at a time).
@@ -13770,7 +14285,17 @@ bool Renderer::RecordRenderFrame(
     ApplyPathTraceDenoiser(denoiser, rasterPrimaryMode);
     ApplyPathTraceDenoiserStages(options.pathTraceDenoiserStages);
     const bool queryReady = m_pathTraceReferencePass.IsSecondaryShadowRayQueryReady();
-    const bool queryActive = options.pathTraceReference.secondaryShadowRayQuery && queryReady;
+    bool queryActive = options.pathTraceReference.secondaryShadowRayQuery && queryReady;
+
+    // Startup work (4.6, decision 3): the Editor built its twinned pipelines from RayQuery only. With the setting turned
+    // off, their TraceRay pipelines are prepared on first use; RayQuery keeps rendering until the whole set is ready.
+    if(!options.pathTraceReference.secondaryShadowRayQuery && m_pathTraceReferencePass.HasRayQuerySlots())
+    {
+        const ShaderLibraryPreparation fallback = m_pathTraceReferencePass.PrepareTraceRayFallbacks(m_graphicsDevice,
+            m_shaderLibrary, m_shaderCompileWorkerRunning ? m_shaderCompileWorker.get() : nullptr,
+            m_pipelineWorkerRunning ? m_pipelineWorker.get() : nullptr);
+        queryActive = fallback.state != ShaderLibraryPreparationState::Ready;
+    }
     m_pathTraceStatus.secondaryShadowRayQueryReady = queryReady;
 
     if(queryActive != m_pathTraceStatus.secondaryShadowRayQueryActive)
@@ -13781,7 +14306,7 @@ bool Renderer::RecordRenderFrame(
         m_pathTraceStatus.secondaryShadowRayQueryActive = queryActive;
     }
 
-    m_pathTraceReferencePass.SelectSecondaryShadowRayQuery(queryActive);
+    m_pathTraceReferencePass.SelectSecondaryShadowRayQuery(options.pathTraceReference.secondaryShadowRayQuery && queryReady);
 
     ApplyCameraJitter(options.pathTraceCameraJitter);
     ApplyDlssInputPreparation(options.dlssInputPreparation);
@@ -13857,9 +14382,9 @@ bool Renderer::RecordRenderFrame(
     }
 
     // AIR.1: after the residency uploads, so its obstacle mask reads this frame's VX.5 binding; before any pass.
+    // AIR async compute: on the compute queue when nothing in this frame reads AIR (RecordAirWork).
     MarkDredStage(commandList, L"Frame: AIR");
-    m_airField.Record(commandList, m_resourceDescriptorHeap, m_uploadBuffer, options.air.value_or(AirFrameRequest{}), m_voxelResidency.GetBinding(),
-        frameIndex, m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+    RecordAirWork(commandList, options, frameIndex);
 
     // Camera-selected displacement LODs.
     // Diagnostic only; does not modify geometry.
@@ -14072,9 +14597,9 @@ bool Renderer::RecordRenderFrame(
         std::string referenceFailure;
         const auto referenceRunnable = [&]()
         {
-            return EnsurePathTraceReference() && (primary == PathTracePrimary::Camera ||
+            return EnsurePathTraceReference() &&
                 m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary, primary,
-                    referenceFailure));
+                    referenceFailure);
         };
         bool runnable = pathTraceSettingsValid &&
             ((referenceRequested && referenceRunnable()) || (rasterPrimaryRequested && rasterPrimaryAvailable) ||
@@ -14638,24 +15163,26 @@ bool Renderer::RecordRenderFrame(
         (m_psrLightingThisFrame || (!m_sharcSettings.enabled &&
             options.psrDebugView != ToneMapDebugView::None));
 
-    // Every raster-primary frame gives the geometry pass the path tracer's camera: the pass measures how far each pixel's
-    // decoded point will lie under its surface and stores the lift scale that clears it (PathTracePrimaryRasterLiftScale).
+    // On a raster-primary frame the geometry pass measures how far each pixel's decoded point will lie under its surface
+    // and stores the lift scale that clears it (PathTracePrimaryRasterLiftScale).
     const bool rasterPrimaryFrame = runPathTrace &&
         (pathTracePrimary == PathTracePrimary::Raster || pathTracePrimary == PathTracePrimary::RasterReSTIRDI);
 
     // M5.5: guide-only PSR marks eligibility too (the identity flag; B's shaders strip it), replacing after lighting.
-    if(psrInPlace || m_psrGuideOnlyThisFrame || rasterPrimaryFrame)
-    {
-        cameraConstants.psrEligibility = psrInPlace || m_psrGuideOnlyThisFrame ? 1u : 0u;
-        cameraConstants.primarySurfaceLiftScale = rasterPrimaryFrame ? 1u : 0u;
-        cameraConstants.psrResolution[0] = m_sceneWidth;
-        cameraConstants.psrResolution[1] = m_sceneHeight;
-        cameraConstants.psrInverseCameraRelativeViewProjection =
-            CameraRelativeInverseViewProjection(currentView, renderProjection);
-        cameraConstants.psrCameraPosition[0] = frameView.position.x;
-        cameraConstants.psrCameraPosition[1] = frameView.position.y;
-        cameraConstants.psrCameraPosition[2] = frameView.position.z;
-    }
+    cameraConstants.psrEligibility = psrInPlace || m_psrGuideOnlyThisFrame ? 1u : 0u;
+    cameraConstants.primarySurfaceLiftScale = rasterPrimaryFrame ? 1u : 0u;
+    // Silhouette parallax occlusion mapping: parallax draws find their triangle's silhouette edges through the records.
+    cameraConstants.instanceDataIndex = m_rayTracingScene.GetInstanceDataDescriptorIndex();
+
+    // The path tracer's camera, on every frame: a parallax pixel stores its lift scale in every lighting mode
+    // (PathTracePrimaryReliefLiftScale), because its depth lies under the mesh for every pass that traces from it.
+    cameraConstants.psrResolution[0] = m_sceneWidth;
+    cameraConstants.psrResolution[1] = m_sceneHeight;
+    cameraConstants.psrInverseCameraRelativeViewProjection =
+        CameraRelativeInverseViewProjection(currentView, renderProjection);
+    cameraConstants.psrCameraPosition[0] = frameView.position.x;
+    cameraConstants.psrCameraPosition[1] = frameView.position.y;
+    cameraConstants.psrCameraPosition[2] = frameView.position.z;
     // UPSCALING.3D: DLSS reconstructs output-resolution texture detail from biased render samples.
     cameraConstants.textureMipBias = 0.0f;
 
@@ -14840,6 +15367,11 @@ bool Renderer::RecordRenderFrame(
         CountReGIRLocalLights(frameLighting.table) : 0u;
     const bool regirFrame = runPathTrace && pathTracePrimary == PathTracePrimary::RasterReSTIRDI &&
         m_frameReGIRLocalLights > m_regirSettings.localLightThreshold;
+    // World-level noise fix: the camera the light sampling's global distribution is weighted for (the path-trace recording
+    // sets the same position again later in the frame).
+    m_frameCameraPosition[0] = frameView.position.x;
+    m_frameCameraPosition[1] = frameView.position.y;
+    m_frameCameraPosition[2] = frameView.position.z;
     m_frameLightSamplingConstants = RecordLightSampling(commandList, frameLighting, lightingRevision, regirFrame,
         m_restirPtFrameThisFrame);
     ApplySampledIndirectNee(frameLighting, sceneLightConstants);
@@ -14931,6 +15463,8 @@ bool Renderer::RecordRenderFrame(
     shadowConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
 
     shadowConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
+    shadowConstants.instanceDataIndex = m_rayTracingScene.GetInstanceDataDescriptorIndex();
+    shadowConstants.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
     shadowConstants.lightAngularRadius = light.angularRadius;
 
     shadowConstants.frameIndex = m_shadowSampleIndex++;
@@ -15250,6 +15784,7 @@ bool Renderer::RecordRenderFrame(
             aoConstants.inverseViewProjection = reconstructionConstants.inverseViewProjection;
             aoConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
             aoConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+            aoConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
             aoConstants.frameIndex = reflectionConstants.frameIndex;
 
             aoConstants.maxDistance = aoRadius;
@@ -15650,6 +16185,11 @@ bool Renderer::RecordRenderFrame(
         const bool snapAfterUnlitFrames = litThisFrame && m_exposureSnapAfterUnlitFrames;
         m_exposureSnapAfterUnlitFrames = !litThisFrame;
         m_litLastFrame = litThisFrame;
+        if(litThisFrame && !m_litFramePresented)
+        {
+            m_firstLitFrameTime = std::chrono::steady_clock::now();
+        }
+
         m_litFramePresented = m_litFramePresented || litThisFrame;
         exposure.reset = options.exposureReset || snapAfterUnlitFrames ||
             std::exchange(m_exposureSnapAfterEnvironmentPublication, false) || !m_exposureInitialized || !(frameView.identity == m_exposureViewIdentity) ||
@@ -16014,6 +16554,16 @@ bool Renderer::RecordRenderFrame(
     // (and after exposure metering, which therefore does not see it). It reads the sun, the Light table and the TLAS as this frame's
     // deferred lighting and sun shadow do. Unlit mist keeps its place after tone mapping, below.
     // R1.2b: packaged frames draw the haze too (lit or unlit), never the AIR mist or a froxel path.
+    // AIR async compute: the mist and the AIR views below are AIR's readers. When AIR went to the compute queue this frame, the
+    // recording continues from here on a second direct list that waits for AIR's compute work (RecordAirWork, SplitForAirReaders).
+    commandList = SplitForAirReaders(commandList, frameIndex);
+
+    if(commandList == nullptr)
+    {
+        m_abortedFrameForTesting = AbortTrackedRecording();
+        return false;
+    }
+
     const bool litMist = options.airMist && options.airMist->lighting;
     m_lastAirMistRequestForTesting = options.airMist;
     // AIR.4E.5c.2: this frame's render extent, for the Internal resolution basis.
@@ -16348,6 +16898,7 @@ bool Renderer::RecordRenderFrame(
     // S0.8B: staged geometry copies, ahead of the next recording's BLAS builds on this queue.
     RecordGeometryUploads(commandList);
     m_gpuTimestampProfiler.EndFrameAndResolve(commandList, frameIndex);
+    RecordAirFrameEnd(commandList, frameIndex);
 
     m_cpuFrameTiming.recording = CpuTiming::MillisecondsSince(recordingStart);
     // Close before ordinary/covered execution; keep their failure and provenance policies separate.
@@ -16699,6 +17250,7 @@ void Renderer::Shutdown()
     m_gBuffer.Shutdown();
 
     m_deferredLightingPass.Shutdown();
+    m_parallaxGeometryPipeline.Shutdown();
     m_toneMapPass.Shutdown();
     m_editorColliderPass.Shutdown();
     m_editorGridPass.Shutdown();
@@ -16777,9 +17329,13 @@ void Renderer::Shutdown()
 
     ReleasePreparedReSTIRPTPipelines();
     m_restirPtPipelinePreparation = ReSTIRPTPipelinePreparation::NotSubmitted;
-    ReleasePreparedReSTIRPTLayeredPipelines();
-    m_restirPtLayeredPreparing = false;
-    m_restirPtLayeredFailed = false;
+    m_restirDiWarmupSettled = false;
+    for(std::size_t index = 1; index < ReSTIRPTMaterialTierCount; ++index)
+    {
+        ReleasePreparedReSTIRPTTierPipelines(static_cast<ReSTIRPTMaterialTier>(index));
+        m_restirPtTierPreparations[index].preparing = false;
+        m_restirPtTierPreparations[index].failed = false;
+    }
 
     m_volumetricState = VolumetricState::NotRequested;
     m_volumetricHoldThisFrame = false;
@@ -17447,6 +18003,289 @@ bool Renderer::InitializeVolumetrics()
     }
 
     return true;
+}
+
+namespace
+{
+    // ENGINE_AIR_ASYNC=0: AIR stays on the frame queue for the whole session (A/B measurement).
+    bool AirAsyncComputeAllowedByEnvironment()
+    {
+        static const bool allowed = []
+        {
+            const char* setting = std::getenv("ENGINE_AIR_ASYNC");
+            return setting == nullptr || std::string_view(setting) != "0";
+        }();
+        return allowed;
+    }
+
+    // ENGINE_AIR_ASYNC_SPLIT=0: frames that read AIR keep it on the frame queue instead of splitting their recording (A/B measurement).
+    bool AirAsyncSplitAllowedByEnvironment()
+    {
+        static const bool allowed = []
+        {
+            const char* setting = std::getenv("ENGINE_AIR_ASYNC_SPLIT");
+            return setting == nullptr || std::string_view(setting) != "0";
+        }();
+        return allowed;
+    }
+}
+
+ID3D12GraphicsCommandList* Renderer::SplitForAirReaders(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex)
+{
+    if(!m_airSplitPending)
+    {
+        return commandList;
+    }
+
+    m_airSplitPending = false;
+    ID3D12GraphicsCommandList* second = m_commandContext.SplitForAsyncComputeReaders(frameIndex);
+
+    if(second == nullptr)
+    {
+        Log::Error("AIR async compute: the frame recording could not be split at AIR's first reader; the frame is discarded.");
+        return nullptr;
+    }
+
+    // A new list starts without state: the frame's shader-visible heap again (each pass sets its own root signature and targets).
+    ID3D12DescriptorHeap* heaps[] = {m_resourceDescriptorHeap.GetHeap()};
+    second->SetDescriptorHeaps(1, heaps);
+    MarkDredStage(second, L"Frame: after AIR's compute work");
+    m_airField.PrepareForFrameReaders(second);
+    return second;
+}
+
+bool Renderer::EnsureAirQueueTiming()
+{
+    AirQueueTiming& timing = m_airQueueTiming;
+
+    if(timing.ticks != nullptr || timing.attempted)
+    {
+        return timing.ticks != nullptr;
+    }
+
+    timing.attempted = true;
+    ID3D12Device* device = m_graphicsDevice.GetDevice();
+    // Per slot: AIR's start and end (on AIR's queue), then the direct list's AIR-point and frame-end stamps.
+    constexpr UINT Queries = 4 * CommandContext::FrameCount;
+    D3D12_QUERY_HEAP_DESC heapDescription{};
+    heapDescription.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heapDescription.Count = Queries;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC description{};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = Queries * sizeof(UINT64);
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.SampleDesc.Count = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* mapped = nullptr;
+    void* spanMapped = nullptr;
+    UINT64 frequency = 0;
+
+    if(device == nullptr || FAILED(device->CreateQueryHeap(&heapDescription, IID_PPV_ARGS(&timing.heap))) ||
+        FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&timing.readback))) || FAILED(timing.readback->Map(0, nullptr, &mapped)) ||
+        FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&timing.spanReadback))) || FAILED(timing.spanReadback->Map(0, nullptr, &spanMapped)) ||
+        FAILED(m_commandContext.GetCommandQueue()->GetTimestampFrequency(&frequency)) || frequency == 0)
+    {
+        Log::Warning("AIR queue timing unavailable (query heap, readback or timestamp frequency).");
+        timing.heap.Reset();
+        timing.readback.Reset();
+        timing.spanReadback.Reset();
+        return false;
+    }
+
+    timing.heap->SetName(L"AIR queue timing");
+    timing.readback->SetName(L"AIR queue timing readback");
+    timing.spanReadback->SetName(L"AIR frame span readback");
+    timing.ticks = static_cast<const UINT64*>(mapped);
+    timing.spanTicks = static_cast<const UINT64*>(spanMapped);
+    timing.directTicksPerMillisecond = static_cast<double>(frequency) / 1000.0;
+    frequency = 0;
+
+    // The span compares stamps from both queues on CPU time: each queue's clock calibration, taken once here.
+    LARGE_INTEGER qpcFrequency{};
+    QueryPerformanceFrequency(&qpcFrequency);
+    timing.qpcTicksPerMillisecond = static_cast<double>(qpcFrequency.QuadPart) / 1000.0;
+
+    if(FAILED(m_commandContext.GetCommandQueue()->GetClockCalibration(&timing.directCalibrationGpu, &timing.directCalibrationCpu)))
+    {
+        timing.qpcTicksPerMillisecond = 0.0;
+    }
+
+    // Timestamps on a compute queue use that queue's frequency; without one, async frames go untimed.
+    if(ID3D12CommandQueue* compute = m_commandContext.GetComputeQueue();
+        compute != nullptr && SUCCEEDED(compute->GetTimestampFrequency(&frequency)) && frequency != 0 &&
+        SUCCEEDED(compute->GetClockCalibration(&timing.computeCalibrationGpu, &timing.computeCalibrationCpu)))
+    {
+        timing.computeTicksPerMillisecond = static_cast<double>(frequency) / 1000.0;
+    }
+
+    return true;
+}
+
+void Renderer::RecordAirFrameEnd(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex)
+{
+    AirQueueTiming& timing = m_airQueueTiming;
+
+    if(timing.ticks == nullptr || frameIndex >= CommandContext::FrameCount || !timing.directPoint[frameIndex])
+    {
+        return;
+    }
+
+    timing.directPoint[frameIndex] = false;
+    commandList->EndQuery(timing.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 4 + 3);
+    commandList->ResolveQueryData(timing.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 4 + 2, 2, timing.spanReadback.Get(),
+        (frameIndex * 4 + 2) * sizeof(UINT64));
+    timing.spanPending[frameIndex] = true;
+}
+
+void Renderer::RecordAirWork(ID3D12GraphicsCommandList* commandList, const RendererOptions& options, unsigned int frameIndex)
+{
+    AirQueueStatistics& statistics = m_airQueueStatistics;
+    AirQueueTiming& timing = m_airQueueTiming;
+
+    statistics.lastBeginFenceWaitMilliseconds = m_commandContext.GetBeginFenceWaitMilliseconds();
+
+    // This slot's previous AIR timestamps: Begin waited for its fence.
+    if(timing.ticks != nullptr && timing.pending[frameIndex])
+    {
+        const UINT64 start = timing.ticks[frameIndex * 4];
+        const UINT64 end = timing.ticks[frameIndex * 4 + 1];
+        const bool measuredAsync = timing.async[frameIndex];
+        const double ticksPerMillisecond = measuredAsync ? timing.computeTicksPerMillisecond : timing.directTicksPerMillisecond;
+
+        if(end >= start && ticksPerMillisecond > 0.0)
+        {
+            statistics.lastMilliseconds = static_cast<double>(end - start) / ticksPerMillisecond;
+            statistics.lastMeasuredAsync = measuredAsync;
+            ++statistics.measuredFrames;
+            statistics.lastSpanMilliseconds = -1.0;
+
+            // The GPU frame span from the AIR point on the direct queue, on CPU time: max(AIR end, direct end) - AIR point.
+            if(timing.spanPending[frameIndex] && timing.qpcTicksPerMillisecond > 0.0 && timing.directTicksPerMillisecond > 0.0)
+            {
+                const auto toCpuMilliseconds = [&](UINT64 ticks, bool compute)
+                {
+                    const UINT64 calibrationGpu = compute ? timing.computeCalibrationGpu : timing.directCalibrationGpu;
+                    const UINT64 calibrationCpu = compute ? timing.computeCalibrationCpu : timing.directCalibrationCpu;
+                    const double perMillisecond = compute ? timing.computeTicksPerMillisecond : timing.directTicksPerMillisecond;
+                    return static_cast<double>(calibrationCpu) / timing.qpcTicksPerMillisecond +
+                        static_cast<double>(static_cast<std::int64_t>(ticks - calibrationGpu)) / perMillisecond;
+                };
+                const double airPoint = toCpuMilliseconds(timing.spanTicks[frameIndex * 4 + 2], false);
+                const double directEnd = toCpuMilliseconds(timing.spanTicks[frameIndex * 4 + 3], false);
+                const double airEnd = toCpuMilliseconds(end, measuredAsync);
+                statistics.lastSpanMilliseconds = (std::max)(airEnd, directEnd) - airPoint;
+            }
+        }
+
+        timing.pending[frameIndex] = false;
+    }
+
+    timing.spanPending[frameIndex] = false;
+    timing.directPoint[frameIndex] = false;
+
+    const AirFrameRequest request = options.air.value_or(AirFrameRequest{});
+
+    // Without enabled AIR the field records nothing (AirField::Record), on the frame list as before.
+    if(!request.enabled || !m_airField.IsInitialized())
+    {
+        statistics.lastAsync = false;
+        m_airField.Record(commandList, m_resourceDescriptorHeap, m_uploadBuffer, request, m_voxelResidency.GetBinding(), frameIndex,
+            m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+        return;
+    }
+
+    // The frame's readers of AIR, all on the frame list after AIR: the mist (only while it is shown: haze alone never reads the
+    // field, EditorMistPass mistActive) and the Editor's AIR views. The VX.5 residency's copies this frame are written on the frame
+    // list before AIR, which reads the residency. Stage markers record timestamps their owners resolve on the frame list.
+    const bool readers = (options.airMist && options.airMist->mistVisible) || options.airCells || options.airTemperature ||
+        options.airDivergence || options.airVisualization;
+    bool async = false;
+    m_airSplitPending = false;
+
+    if(!m_airAsyncCompute || !AirAsyncComputeAllowedByEnvironment() || !m_commandContext.HasAsyncCompute())
+    {
+        ++statistics.syncDisabled;
+    }
+    else if(readers && !AirAsyncSplitAllowedByEnvironment())
+    {
+        ++statistics.syncReaders;
+    }
+    else if(m_voxelResidency.RecordedWritesLastFrame())
+    {
+        ++statistics.syncVoxelUploads;
+    }
+    else if(m_airField.HasStageMarkers())
+    {
+        ++statistics.syncStageMarkers;
+    }
+    else
+    {
+        async = true;
+    }
+
+    ID3D12GraphicsCommandList* list = commandList;
+
+    if(async)
+    {
+        list = m_commandContext.BeginAsyncCompute(frameIndex);
+
+        if(list == nullptr)
+        {
+            list = commandList;
+            async = false;
+            ++statistics.syncDisabled;
+        }
+    }
+
+    ++(async ? statistics.asyncFrames : statistics.syncFrames);
+    statistics.lastAsync = async;
+
+    // Readers of AIR in an async frame read it after the split (RecordRenderFrame, SplitForAirReaders).
+    if(async && readers)
+    {
+        m_airSplitPending = true;
+        ++statistics.asyncSplitFrames;
+    }
+
+    const bool timed = EnsureAirQueueTiming() &&
+        (async ? timing.computeTicksPerMillisecond : timing.directTicksPerMillisecond) > 0.0;
+
+    if(timed)
+    {
+        // The span's start on the direct list, whichever queue AIR uses; RecordAirFrameEnd adds its end and resolves the pair.
+        commandList->EndQuery(timing.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 4 + 2);
+        timing.directPoint[frameIndex] = true;
+        list->EndQuery(timing.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 4);
+    }
+
+    // A buffer AIR creates while it records (first enable, a new window, mist, pressure or motor storage) is activated and
+    // zero-filled on the frame list at once: the compute work then waits for this frame's direct list instead of overlapping it.
+    const std::uint64_t activations = TextureMemoryAllocator::GetFrameRecordingActivationCount();
+    m_airField.SetComputeQueueRecording(async);
+    m_airField.Record(list, m_resourceDescriptorHeap, m_uploadBuffer, request, m_voxelResidency.GetBinding(), frameIndex,
+        m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+    m_airField.SetComputeQueueRecording(false);
+
+    if(async && activations != TextureMemoryAllocator::GetFrameRecordingActivationCount())
+    {
+        m_commandContext.RequireAsyncComputeAfterFrame();
+        ++statistics.afterFrame;
+    }
+
+    if(timed)
+    {
+        list->EndQuery(timing.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 4 + 1);
+        list->ResolveQueryData(timing.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 4, 2, timing.readback.Get(),
+            frameIndex * 4 * sizeof(UINT64));
+        timing.pending[frameIndex] = true;
+        timing.async[frameIndex] = async;
+    }
 }
 
 // M0c.5 Stage 5.3: called by an Editor frame that requests AIR, its views, mist or haze, before it records. Returns whether

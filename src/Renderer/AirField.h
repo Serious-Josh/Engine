@@ -96,6 +96,12 @@ struct AirSolverSettings
     // decays by exp(-t / temperatureRelaxationTime) seconds; 0 turns the relaxation off.
     float ambientTemperature = 293.15f;
     float temperatureRelaxationTime = 30.0f;
+    // AIR optimization report item 2: dormant air. Once the GPU's check has found no velocity component above AirField::DormantSpeed and
+    // ΔT exactly 0 everywhere for AirField::DormantQuietFrames frames, with nothing able to stir the air (no motor reaching the window, no
+    // moving-solid change, ambient velocity 0, no mist stepping, no warm air), the velocity is zeroed once and steps are no longer
+    // recorded until something can stir it again; maintenance (recentres, rebakes) continues. Off here (exact suites); the Engine turns it
+    // on.
+    bool dormancy = false;
 
     bool operator==(const AirSolverSettings&) const = default;
 };
@@ -273,9 +279,10 @@ struct AirPressureRequest
     // AIR O2.2: the red-black sweeps per side of those adaptive solves (cold and buoyant solves keep solve.smoothingSweeps). Measured, 3
     // sweeps with a minimum of 1 cycle meet the criterion and save about 0.28 ms per warm step, but a gated second cycle then runs in one
     // run of the projection suite's isolation check and not the other, so a sealed room's velocity differs by about 4e-5 relative (not bit-
-    // identical). Not the default pending review (AirOptimizationInvestigation.md, O2.2): 2 and 2 are O2.1.
-    static constexpr std::uint32_t DefaultAdaptiveMinimumCycles = 2;
-    static constexpr std::uint32_t DefaultAdaptiveSmoothingSweeps = 2;
+    // identical). AIR solver restructure (2026-11-26, Josh's decision): 3 sweeps and a minimum of 1 are the defaults, with sealed-room
+    // isolation numerical (bounded, not bit-identical); 2 and 2 are O2.1.
+    static constexpr std::uint32_t DefaultAdaptiveMinimumCycles = 1;
+    static constexpr std::uint32_t DefaultAdaptiveSmoothingSweeps = 3;
 
     bool enabled = false;
     AirPressureSolveSettings solve{DefaultCycles};
@@ -291,6 +298,22 @@ struct AirPressureRequest
     // default) is no buoyancy. It acts only through the projection, so it does nothing while `enabled` is false. The reference temperature
     // is the solver's ambientTemperature. Negative or non-finite values are no buoyancy.
     float buoyancyGravity = 0.0f;
+    // AIR optimization report item 1: while no air can be warm (no heating emitter has run since the field was last reset, or the step's
+    // GPU check has since found every piece's ΔT exactly 0), the face force g dt ΔT / (T0 + ΔT) is exactly 0, so a buoyant solve is a
+    // non-buoyant one with a larger fixed budget. Such steps take the non-buoyant budgets (bit-identical to buoyancy off). Set this to keep
+    // the buoyant budgets and face-force code at ΔT = 0 regardless (the buoyancy suite's ambient-neutrality check).
+    bool assumeWarmAirForDiagnostics = false;
+    // AIR optimization report item 4: record a single recovery cycle (instead of the full budget) on steady steps once the GPU's recovery
+    // counters, read back a few frames later, have shown no recovery cycle used for AirField::RecoveryQuietFrames frames in a row. Any
+    // recovery cycle, failure, rebuild or moving-solid update restores the full budget. Off here (exact suites); the Engine turns it on.
+    // AIR solver restructure: "recovery cycle" here means one beyond the step's own budget (the adaptive warm cycles are always recorded,
+    // and their use keeps the air quiet). Local moving-solid updates take a tier too: their budgeted cycles plus
+    // AirField::LocalRecoveryCycles while quiet; a forced relabel (several pending updates or a box past the topology check's capacity), a
+    // full rebuild, a recovery cycle beyond the budget or a failure restores the full budget.
+    bool adaptiveRecovery = false;
+    // AIR solver restructure: whether adaptiveRecovery also tiers local moving-solid updates (above). ENGINE_AIR_LOCAL_RECOVERY_TIER=0
+    // turns only that part off (A/B measurement).
+    bool localRecoveryTier = true;
 };
 
 // AIR.4F.3 F1a: one participating moving solid as AIR receives it. Engine converts Physics::MovingSolidSnapshot entries, so AIR never
@@ -454,6 +477,17 @@ public:
     // with moving solids and buoyancy: a step records up to about 420 KiB of constants, the rest of a Demo Scene frame about 30 KiB.
     static constexpr std::size_t UploadReserveBytes = 256 * 1024;
     static constexpr std::uint32_t MaximumStepsPerFrame = 2;
+    // AIR optimization report item 2: the speed (m/s, per velocity component) at or below which air counts as at rest, and the stepped
+    // frames in a row the GPU's check must find it so (with ΔT exactly 0) before the air goes dormant. Must match AirDormantSpeed in
+    // AirSolver.hlsl.
+    static constexpr float DormantSpeed = 1.0e-4f;
+    static constexpr std::uint32_t DormantQuietFrames = 3;
+    // Item 4: readbacks in a row without any recovery cycle beyond the budget (or failure) before steady steps record only their budgeted
+    // cycles (at least one) and local moving-solid updates their tier (AirPressureRequest::adaptiveRecovery).
+    static constexpr std::uint32_t RecoveryQuietFrames = 8;
+    // AIR solver restructure (scope §2.6, option A): the recovery cycles a quiet local moving-solid update records beyond its budgeted
+    // ones (instead of filling the budget up to the cold cycles).
+    static constexpr std::uint32_t LocalRecoveryCycles = 1;
     static constexpr std::uint32_t MaximumMotors = 64;
     static constexpr std::uint32_t MaximumMistEmitters = 32;
     // AIR.4F.3 F1a: the overlay's solids per frame (the first by object ID; the rest are not carved, counted in truncatedFrames), the
@@ -549,6 +583,25 @@ public:
         m_stageMarker = std::move(marker);
     }
 
+    // AIR async compute: stage markers record into whatever list AIR records into, and their owners resolve them on the frame
+    // list, so frames with markers keep AIR on the frame queue.
+    bool HasStageMarkers() const noexcept
+    {
+        return static_cast<bool>(m_stageMarker) || m_pressure.HasStageMarker();
+    }
+
+    // AIR async compute: the next Record goes into a compute-queue list (true) or the frame's direct list (false, the default).
+    // A compute list cannot name PIXEL_SHADER_RESOURCE, so on the compute queue the field leaves its storage in
+    // NON_PIXEL_SHADER_RESOURCE rather than ALL_SHADER_RESOURCE (nothing in such a frame reads it; later frames' readers promote it
+    // from COMMON, buffers decaying at each submission's end), and tracked states naming PIXEL_SHADER_RESOURCE restart from COMMON.
+    void SetComputeQueueRecording(bool compute);
+
+    // AIR async compute, readers in the frame: on the frame's direct list after it waited for this frame's compute work
+    // (CommandContext::SplitForAsyncComputeReaders). The compute submission's end decayed the field's buffers to COMMON; they go to
+    // the readers' state (ALL_SHADER_RESOURCE, as a frame-queue Record leaves them) on that list. The pressure storage is left in
+    // COMMON (readers promote it, or transition it, from there).
+    void PrepareForFrameReaders(ID3D12GraphicsCommandList* commandList);
+
     // AIR.4F.3 F1a: the overlay's counters, and the solids as the field last applied them (by object ID).
     // Steps deferred to the next frame because the frame's upload ring could not hold them (UploadReserveBytes).
     std::uint64_t GetUploadDeferredSteps() const noexcept
@@ -567,6 +620,33 @@ public:
     }
 
     // AIR.4E.5b.1: the fixed steps the latest Record actually recorded (0 when air is off or paused, no time was due, or recording failed).
+    // AIR optimization report item 2: no steps are being recorded because the air is at rest (see AirSolverSettings::dormancy).
+    bool IsDormant() const noexcept
+    {
+        return m_dormant;
+    }
+
+    // Diagnostics: how often the air went dormant, the steps not recorded while it was, and whether any air may be warm (item 1).
+    std::uint64_t GetDormantEntries() const noexcept
+    {
+        return m_dormantEntries;
+    }
+
+    std::uint64_t GetDormantSteps() const noexcept
+    {
+        return m_dormantSteps;
+    }
+
+    bool IsWarmAirPossible() const noexcept
+    {
+        return m_warmAirPossible;
+    }
+
+    std::uint32_t GetRecoveryQuietFrames() const noexcept
+    {
+        return m_recoveryQuietFrames;
+    }
+
     std::uint32_t GetLastStepCount() const noexcept
     {
         return m_lastStepCount;
@@ -626,10 +706,10 @@ private:
     bool EnsureVisibilityCapacity(std::size_t motors, std::uint64_t fence);
 
     // Every buffer of the field's storage, for allocation, transitions and retirement alike.
-    std::array<Buffer*, 13> StorageBuffers() noexcept
+    std::array<Buffer*, 14> StorageBuffers() noexcept
     {
         return {&m_velocity[0], &m_velocity[1], &m_piece1Velocity[0], &m_piece1Velocity[1], &m_obstacles, &m_pieces, &m_visibility,
-            &m_emissionStatus, &m_emissionSamples, &m_splitList, &m_splitArguments, &m_mistStatus, &m_apertures};
+            &m_emissionStatus, &m_emissionSamples, &m_splitList, &m_splitArguments, &m_mistStatus, &m_apertures, &m_activity};
     }
 
     // AIR.4F: the four mist buffers (piece 0's pair, then piece 1's), allocated only while mist is enabled.
@@ -685,6 +765,13 @@ private:
     bool RecordMotorWork(ID3D12GraphicsCommandList* commandList, UploadBuffer& upload, const AirFieldBinding& next, D3D12_GPU_VIRTUAL_ADDRESS motors,
         std::uint32_t motorCount, const std::vector<std::uint32_t>& recompute, unsigned int frameIndex);
     void PollEmissionStatus(std::uint64_t completedFence);
+    // AIR optimization report items 1, 2 and 4: the activity readbacks (see ActivitySlot).
+    void PollActivity(std::uint64_t completedFence);
+    bool RecordActivityReset(ID3D12GraphicsCommandList* commandList, UploadBuffer& upload, const AirFieldBinding& next);
+    bool RecordZeroVelocity(ID3D12GraphicsCommandList* commandList, UploadBuffer& upload, const AirFieldBinding& next);
+    void RecordActivityCopy(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex, std::uint64_t heatEpoch);
+    // Whether a motor's bounding sphere reaches the window `next` (UploadMotors' test, without uploading anything).
+    bool AnyMotorReachesWindow(const std::array<std::int32_t, 3>& minimum, const AirFrameRequest& request) const;
     // AIR.4F.3 F1a: re-carves the cells `previous` and `target` disagree on (all of both when `restampAll`: after maintenance rebuilt pieces
     // from residency alone), then the face connections reading them. F1b: remaps velocity, ΔT and mist onto the new pieces in the same
     // update. False only when recording failed (no room for constants): the GPU geometry and state are then unchanged.
@@ -866,10 +953,49 @@ private:
     // AIR.4F.1b: projected steps left that take the buoyant recentre budget (AirPressureRequest::buoyantRecentreSteps after a recentre).
     std::uint32_t m_pressureRecentreSteps = 0;
     AirPressure::StageMarker m_stageMarker;
+    // AIR async compute: the storage's read state at the end of the frame's work (SetComputeQueueRecording).
+    D3D12_RESOURCE_STATES m_readState = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
     // Diagnostics: projected steps recorded.
     std::uint64_t m_projections = 0;
     // AIR.4E.5b.1: steps the latest Record recorded.
     std::uint32_t m_lastStepCount = 0;
+
+    // AIR optimization report items 1, 2 and 4: the activity check. Each step ORs AirActivityMoving (a velocity component above
+    // DormantSpeed) and AirActivityWarm (a non-zero ΔT) into m_activity (cleared once per stepped frame); at the frame's end that word and
+    // the pressure solver's cumulative recovery counters are copied to one readback per frame slot, read once the frame completes.
+    struct ActivitySlot
+    {
+        Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+        bool recorded = false;
+        std::uint64_t fence = 0;
+        // m_activityEpoch when recorded: only readbacks of the current epoch (nothing stirred the air since) count toward dormancy and
+        // adaptive recovery.
+        std::uint64_t epoch = 0;
+        // m_heatEpoch before the frame's emitters were uploaded: ΔT is known to stay 0 only if no heating emitter ran since.
+        std::uint64_t heatEpoch = 0;
+        bool counters = false;
+    };
+
+    Buffer m_activity;
+    std::array<ActivitySlot, 3> m_activitySlots;
+    std::uint64_t m_activityEpoch = 1;
+    std::uint64_t m_heatEpoch = 0;
+    // Item 1: whether any piece may hold a non-zero ΔT.
+    bool m_warmAirPossible = false;
+    // Item 2.
+    bool m_dormant = false;
+    bool m_dormancyZeroPending = false;
+    std::uint32_t m_dormantQuietFrames = 0;
+    std::uint64_t m_dormantEntries = 0;
+    std::uint64_t m_dormantSteps = 0;
+    // Item 4: consecutive readbacks without a recovery cycle (beyond the budget), and the counters last read.
+    std::uint32_t m_recoveryQuietFrames = 0;
+    std::uint64_t m_recoveryCyclesRead = 0;
+    std::uint64_t m_recoveryFailuresRead = 0;
+    std::uint64_t m_recoveryBeyondBudgetRead = 0;
+    bool m_recoveryCountersValid = false;
+    ComputePipeline m_resetActivityPipeline;
+    ComputePipeline m_zeroVelocityPipeline;
 
     // AIR.4D D2 motor visibility: 2 bits per cell (piece 0, piece 1) in the obstacle mask's layout, for each of MaximumMotors slots.
     // An entry names the motor geometry its slot was computed for, and the obstacles (m_obstacleEpoch) and window it is valid for.

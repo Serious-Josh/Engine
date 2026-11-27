@@ -3,6 +3,7 @@
 #include "DiffuseHDRIConfig.hlsli"
 
 #include "GIModeConfig.hlsli"
+#include "PrimarySurfaceLift.hlsli"
 #ifndef GI_PRODUCTION_CLAMP_SAMPLES
 #define GI_PRODUCTION_CLAMP_SAMPLES 64
 #endif
@@ -766,6 +767,10 @@ void GIRayGeneration()
     }
 
     const float3 geometricNormal = normalize(geometricNormalValue);
+    // A parallax pixel's depth is the relief's, under the mesh: its stored lift takes the origin back to the mesh
+    // surface, or the mesh's own triangle would block every ray. 0 for every other pixel.
+    const float surfaceLift = PrimarySurfaceStoredLift(gbufferPixel, fullResolution, depth, worldPosition.xyz,
+        geometricNormalValue, inverseViewProjection);
 
 #if GI_DIAGNOSTIC_MODE == GI_MODE_PRIMARY_VISIBILITY_DEBUG
     // Temporary geometry-only diagnostic: production primary parameters, without hit shading.
@@ -774,7 +779,7 @@ void GIRayGeneration()
     for(uint sampleIndex = 0u; sampleIndex < 64u; ++sampleIndex)
     {
         RayDesc visibilityRay;
-        visibilityRay.Origin = worldPosition.xyz + geometricNormal * 0.001f;
+        visibilityRay.Origin = worldPosition.xyz + geometricNormal * (0.001f + surfaceLift);
         visibilityRay.Direction = SampleGICosineHemisphere(normal, pixel, frameIndex * 64u + sampleIndex);
         visibilityRay.TMin = 0.001f;
         visibilityRay.TMax = 10000.0f;
@@ -982,7 +987,7 @@ void GIRayGeneration()
         // Distinct indices within a frame; the existing secondary helper salts this again.
         uint sampleSeed = frameIndex * sampleCount + sample;
         RayDesc diagnosticRay;
-        diagnosticRay.Origin = worldPosition.xyz + geometricNormal * 0.001f;
+        diagnosticRay.Origin = worldPosition.xyz + geometricNormal * (0.001f + surfaceLift);
         diagnosticRay.Direction = SampleGICosineHemisphere(normal, pixel, sampleSeed);
         diagnosticRay.TMin = 0.001f;
         diagnosticRay.TMax = 60.0f;
@@ -1072,7 +1077,7 @@ void GIRayGeneration()
         // Distinct indices within a frame; the existing secondary helper salts this again.
         uint sampleSeed = frameIndex * sampleCount + sample;
         RayDesc diagnosticRay;
-        diagnosticRay.Origin = worldPosition.xyz + geometricNormal * 0.001f;
+        diagnosticRay.Origin = worldPosition.xyz + geometricNormal * (0.001f + surfaceLift);
         diagnosticRay.Direction = SampleGICosineHemisphere(normal, pixel, sampleSeed);
         diagnosticRay.TMin = 0.001f;
         diagnosticRay.TMax = 10000.0f;
@@ -1133,7 +1138,7 @@ void GIRayGeneration()
     return;
 #else
     RayDesc ray;
-    ray.Origin = worldPosition.xyz + geometricNormal * 0.001f;
+    ray.Origin = worldPosition.xyz + geometricNormal * (0.001f + surfaceLift);
 #if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
     float irradianceWeight;
     ray.Direction = SampleGIImportanceHemisphere(normal, pixel, frameIndex, irradianceWeight);

@@ -1135,13 +1135,17 @@ bool UpdateLightSamplingIncremental(const SceneLightTable& table, const SceneLig
     if(!demoted.empty() || !added.empty() || weightsChanged)
     {
         const auto rewrite = [&](const std::vector<std::uint32_t>& members, std::uint64_t startWord,
-            std::uint32_t previousCount)
+            std::uint32_t previousCount, bool global)
         {
             std::vector<double> weights(members.size());
+            // World-level noise fix: the global distribution keeps its applied camera weighting.
+            const auto& camera = data.cameraWeighting;
 
             for(std::size_t entry = 0; entry < members.size(); ++entry)
             {
-                weights[entry] = LightSamplingPower(table.lights[members[entry]]);
+                const std::uint32_t light = members[entry];
+                const bool distant = global && camera.applied && light < camera.reach.size() && camera.reach[light] == 0;
+                weights[entry] = LightSamplingPower(table.lights[light]) * (distant ? settings.cameraFarFactor : 1.0);
             }
 
             WriteAliasTable(members, weights, settings.defensiveShare, data.words.data() + startWord);
@@ -1153,12 +1157,12 @@ bool UpdateLightSamplingIncremental(const SceneLightTable& table, const SceneLig
             }
         };
 
-        rewrite(state.wideMembers, state.wideStartWord, data.constants.wideCount);
+        rewrite(state.wideMembers, state.wideStartWord, data.constants.wideCount, false);
 
         // A demotion moves a light between the cell and wide pools; the global pool changes only with weights or members.
         if(weightsChanged || !added.empty())
         {
-            rewrite(state.globalMembers, state.globalStartWord, data.constants.globalCount);
+            rewrite(state.globalMembers, state.globalStartWord, data.constants.globalCount, true);
         }
 
         data.constants.wideCount = static_cast<std::uint32_t>(state.wideMembers.size());
@@ -1223,6 +1227,173 @@ bool UpdateLightSamplingIncremental(const SceneLightTable& table, const SceneLig
     statistics.incrementalMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
         started).count();
     return true;
+}
+
+LightSamplingCameraUpdate UpdateLightSamplingCameraWeighting(const SceneLightTable& table,
+    const LightSamplingSettings& settings, const LightSamplingCameraView& view, LightSamplingData& data,
+    std::vector<LightSamplingDirtyRange>& dirty)
+{
+    LightSamplingCameraUpdate update;
+    const auto started = std::chrono::steady_clock::now();
+    auto& weighting = data.cameraWeighting;
+    const LightSamplingIncrementalState& state = data.incremental;
+
+    if(!state.valid || table.lights.size() != table.lightCount || state.categories.size() != table.lightCount)
+    {
+        return update;
+    }
+
+    std::vector<std::uint8_t> reach(table.lightCount, 1);
+    bool weighted = settings.cameraWeighting;
+
+    if(weighted)
+    {
+        const float* camera = view.position;
+        const double cellSize = (std::max)(static_cast<double>(settings.cameraCellSize), 1.0e-3);
+        std::int64_t cell[3];
+
+        for(int axis = 0; axis < 3; ++axis)
+        {
+            cell[axis] = static_cast<std::int64_t>(std::floor(static_cast<double>(camera[axis]) / cellSize));
+        }
+
+        const double turnCosine = std::cos(static_cast<double>(settings.cameraTurnDegrees) * 3.14159265358979323846 / 180.0);
+        const double sameDirection = static_cast<double>(view.forward[0]) * weighting.forward[0] +
+            static_cast<double>(view.forward[1]) * weighting.forward[1] +
+            static_cast<double>(view.forward[2]) * weighting.forward[2];
+        const bool sameView = !settings.cameraFrustum || (sameDirection >= turnCosine &&
+            view.verticalFov == weighting.verticalFov && view.aspectRatio == weighting.aspectRatio);
+
+        if(weighting.applied && weighting.cellValid && std::equal(cell, cell + 3, weighting.cell) && sameView)
+        {
+            return update;
+        }
+
+        weighting.cellValid = true;
+        std::copy(cell, cell + 3, weighting.cell);
+        std::copy(view.forward, view.forward + 3, weighting.forward);
+        weighting.verticalFov = view.verticalFov;
+        weighting.aspectRatio = view.aspectRatio;
+
+        // The view frustum's side planes (inward unit normals through the camera) and its far plane, from RenderView's
+        // basis: a point at view coordinates (x, y, z) is inside when |y| <= z tan(fov / 2), |x| <= z tan(fov / 2) aspect.
+        const bool frustum = settings.cameraFrustum && view.verticalFov > 0.0f && view.aspectRatio > 0.0f;
+        const double tanVertical = std::tan(0.5 * static_cast<double>(view.verticalFov));
+        const double tanHorizontal = tanVertical * static_cast<double>(view.aspectRatio);
+        double planes[4][3]{};
+
+        for(int axis = 0; axis < 3; ++axis)
+        {
+            planes[0][axis] = tanVertical * view.forward[axis] - view.up[axis];
+            planes[1][axis] = tanVertical * view.forward[axis] + view.up[axis];
+            planes[2][axis] = tanHorizontal * view.forward[axis] - view.right[axis];
+            planes[3][axis] = tanHorizontal * view.forward[axis] + view.right[axis];
+        }
+
+        const double verticalLength = std::sqrt(1.0 + tanVertical * tanVertical);
+        const double horizontalLength = std::sqrt(1.0 + tanHorizontal * tanHorizontal);
+        const double planeLength[4] = {verticalLength, verticalLength, horizontalLength, horizontalLength};
+        const double farPlane = view.farPlane > 0.0f ? static_cast<double>(view.farPlane) : 1.0e30;
+
+        // Lights without a finite range (range attenuation off: a negative record range, or non-finite) count as reaching.
+        for(const std::uint32_t light : state.globalMembers)
+        {
+            const GPULight& record = table.lights[light];
+
+            if(!(record.range > 0.0f) || !std::isfinite(record.range))
+            {
+                continue;
+            }
+
+            const double offset[3] = {static_cast<double>(record.position[0]) - camera[0],
+                static_cast<double>(record.position[1]) - camera[1], static_cast<double>(record.position[2]) - camera[2]};
+            const double radius = static_cast<double>(record.range) + settings.cameraReachRadius;
+            bool reaches = offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2] <= radius * radius;
+
+            // Conservative sphere-frustum test: the widened range sphere is not wholly outside any plane.
+            if(!reaches && frustum)
+            {
+                const double depth = offset[0] * view.forward[0] + offset[1] * view.forward[1] + offset[2] * view.forward[2];
+                reaches = depth >= -radius && depth <= farPlane + radius;
+
+                for(int plane = 0; plane < 4 && reaches; ++plane)
+                {
+                    const double distance = (offset[0] * planes[plane][0] + offset[1] * planes[plane][1] +
+                        offset[2] * planes[plane][2]) / planeLength[plane];
+                    reaches = distance >= -radius;
+                }
+            }
+
+            if(!reaches)
+            {
+                reach[light] = 0;
+                ++update.farLights;
+            }
+        }
+    }
+    else if(!weighting.applied)
+    {
+        return update;
+    }
+
+    // Unchanged classification: nothing to rewrite (most cell crossings).
+    // Without an applied weighting the distribution holds pure power: every light counts as reaching.
+    for(std::uint32_t light = 0; light < table.lightCount; ++light)
+    {
+        const std::uint8_t before = weighting.applied && light < weighting.reach.size() ? weighting.reach[light] : 1;
+        update.changedLights += reach[light] != before ? 1u : 0u;
+    }
+
+    weighting.applied = weighted;
+    weighting.reach = std::move(reach);
+
+    if(update.changedLights == 0)
+    {
+        update.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        return update;
+    }
+
+    std::vector<double> weights(state.globalMembers.size());
+
+    for(std::size_t entry = 0; entry < state.globalMembers.size(); ++entry)
+    {
+        const std::uint32_t light = state.globalMembers[entry];
+        weights[entry] = LightSamplingPower(table.lights[light]) *
+            (weighted && weighting.reach[light] == 0 ? settings.cameraFarFactor : 1.0);
+    }
+
+    WriteAliasTable(state.globalMembers, weights, settings.defensiveShare, data.words.data() + state.globalStartWord);
+    const std::uint64_t words = std::uint64_t{state.globalMembers.size()} * AliasWords;
+
+    if(words != 0)
+    {
+        // Merged into the caller's sorted ranges (an incremental update of this frame may have listed some already).
+        dirty.push_back(LightSamplingDirtyRange{state.globalStartWord, words});
+        std::sort(dirty.begin(), dirty.end(), [](const LightSamplingDirtyRange& left, const LightSamplingDirtyRange& right)
+        {
+            return left.firstWord < right.firstWord;
+        });
+        std::vector<LightSamplingDirtyRange> merged;
+
+        for(const LightSamplingDirtyRange& range : dirty)
+        {
+            if(!merged.empty() && range.firstWord <= merged.back().firstWord + merged.back().wordCount)
+            {
+                const std::uint64_t end = (std::max)(merged.back().firstWord + merged.back().wordCount,
+                    range.firstWord + range.wordCount);
+                merged.back().wordCount = end - merged.back().firstWord;
+                continue;
+            }
+
+            merged.push_back(range);
+        }
+
+        dirty = std::move(merged);
+    }
+
+    update.rewritten = true;
+    update.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    return update;
 }
 
 std::string DescribeLightSamplingStatistics(const LightSamplingData& data)

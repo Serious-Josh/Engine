@@ -423,6 +423,7 @@ add_library(EngineCore OBJECT
     src/Renderer/MaterialTables/MaterialTableResources.cpp
     src/Renderer/Passes/ShadowDenoisePass.cpp
     src/Renderer/ComputePipeline.cpp
+    src/Renderer/PipelineStateCache.cpp
     src/Editor/Editor.cpp
     src/Editor/EditorPreferences.cpp
     src/Editor/ProjectBrowser.cpp

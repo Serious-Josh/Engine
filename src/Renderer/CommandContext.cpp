@@ -142,7 +142,161 @@ bool CommandContext::Initialize(ID3D12Device* device)
     m_lastSubmissionFence = 0;
     m_nextRetentionID = 1;
     m_retainedSubmissionFences = {};
+    InitializeAsyncCompute(device);
     return true;
+}
+
+void CommandContext::InitializeAsyncCompute(ID3D12Device* device)
+{
+    ShutdownAsyncCompute();
+    D3D12_COMMAND_QUEUE_DESC description{};
+    description.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    description.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    bool created = SUCCEEDED(device->CreateCommandQueue(&description, IID_PPV_ARGS(&m_computeQueue)));
+
+    for (unsigned int i = 0; created && i < FrameCount; ++i)
+    {
+        created = SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&m_computeAllocators[i])));
+    }
+
+    created = created && SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, m_computeAllocators[0], nullptr,
+        IID_PPV_ARGS(&m_computeList))) && SUCCEEDED(m_computeList->Close());
+    created = created && SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_computeFence)));
+    created = created && SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_directListFence)));
+    // The second direct list of a split recording (SplitForAsyncComputeReaders), closed until a split resets it.
+    created = created && SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_commandAllocators[0], nullptr,
+        IID_PPV_ARGS(&m_splitSecondList))) && SUCCEEDED(m_splitSecondList->Close()) &&
+        SUCCEEDED(m_splitSecondList->QueryInterface(IID_PPV_ARGS(&m_splitSecondRayTracingList)));
+
+    if (!created)
+    {
+        Log::Warning("AIR async compute: no compute queue (creation failed); AIR stays on the frame queue.");
+        ShutdownAsyncCompute();
+        return;
+    }
+
+    m_computeQueue->SetName(L"Async compute queue (AIR)");
+    m_computeList->SetName(L"Async compute command list (AIR)");
+    m_splitSecondList->SetName(L"Frame command list (after AIR's compute work)");
+}
+
+void CommandContext::ShutdownAsyncCompute()
+{
+    const auto release = [](auto*& object)
+    {
+        if (object)
+        {
+            object->Release();
+            object = nullptr;
+        }
+    };
+
+    EndSplit(true);
+    release(m_computeList);
+    release(m_splitSecondRayTracingList);
+    release(m_splitSecondList);
+
+    for (auto*& allocator : m_computeAllocators)
+    {
+        release(allocator);
+    }
+
+    release(m_computeFence);
+    release(m_directListFence);
+    release(m_computeQueue);
+    m_computeFenceValue = 0;
+    m_directListFenceValue = 0;
+    m_asyncComputeOpen = false;
+    m_asyncComputeAfterFrame = false;
+}
+
+ID3D12GraphicsCommandList* CommandContext::BeginAsyncCompute(unsigned int frameIndex)
+{
+    if (!m_computeQueue || frameIndex >= FrameCount || ResourceStateTransaction::RecordingFor(m_commandList) == 0)
+    {
+        return nullptr;
+    }
+
+    if (m_asyncComputeOpen)
+    {
+        return m_computeList;
+    }
+
+    // Begin waited for this slot's frame fence, and the frame queue waits for each frame's compute work before signalling it.
+    if (FAILED(m_computeAllocators[frameIndex]->Reset()) || FAILED(m_computeList->Reset(m_computeAllocators[frameIndex], nullptr)))
+    {
+        Log::Error("AIR async compute: the compute list could not be reset; AIR records on the frame list.");
+        return nullptr;
+    }
+
+    m_asyncComputeOpen = true;
+    m_asyncComputeAfterFrame = false;
+    ResourceStateTransaction::AttachRecordingList(m_computeList);
+    return m_computeList;
+}
+
+ID3D12GraphicsCommandList* CommandContext::SplitForAsyncComputeReaders(unsigned int frameIndex)
+{
+    if (!m_asyncComputeOpen || m_splitFirstList != nullptr || m_splitSecondList == nullptr || frameIndex >= FrameCount ||
+        ResourceStateTransaction::RecordingFor(m_commandList) == 0)
+    {
+        return nullptr;
+    }
+
+    if (FAILED(m_commandList->Close()))
+    {
+        Log::Error("AIR async compute: the frame list could not be closed at AIR's first reader.");
+        return nullptr;
+    }
+
+    // From here the recording is split, whether or not the second list opens: abort and discard then close only what is open.
+    m_splitFirstList = m_commandList;
+    m_splitFirstRayTracingList = m_rayTracingCommandList;
+    m_commandList = m_splitSecondList;
+    m_rayTracingCommandList = m_splitSecondRayTracingList;
+
+    // The first part is closed, so the slot's allocator is free for the second (Begin waited for the slot's previous frame).
+    if (FAILED(m_splitSecondList->Reset(m_commandAllocators[frameIndex], nullptr)))
+    {
+        Log::Error("AIR async compute: the second frame list could not be reset; the frame is abandoned.");
+        m_splitSecondOpen = false;
+        return nullptr;
+    }
+
+    m_splitSecondOpen = true;
+    ResourceStateTransaction::SwitchRecordingList(m_commandList, m_rayTracingCommandList);
+    TextureMemoryAllocator::SwitchFrameRecordingList(m_commandList);
+    return m_commandList;
+}
+
+void CommandContext::EndSplit(bool closeSecond)
+{
+    if (m_splitFirstList == nullptr)
+    {
+        return;
+    }
+
+    if (closeSecond && m_splitSecondOpen)
+    {
+        m_commandList->Close();
+    }
+
+    m_splitSecondOpen = false;
+    m_splitSecondEnded = false;
+    m_commandList = m_splitFirstList;
+    m_rayTracingCommandList = m_splitFirstRayTracingList;
+    m_splitFirstList = nullptr;
+    m_splitFirstRayTracingList = nullptr;
+}
+
+void CommandContext::AbandonAsyncCompute()
+{
+    if (m_asyncComputeOpen)
+    {
+        m_computeList->Close();
+        m_asyncComputeOpen = false;
+        m_asyncComputeAfterFrame = false;
+    }
 }
 
 void CommandContext::Shutdown()
@@ -152,6 +306,9 @@ void CommandContext::Shutdown()
         Log::Error("Command context shutdown: unresolved submission reservation; aborting without teardown.");
         std::abort();
     }
+
+    // A split recording's first list is the frame list again (released below; the second list goes with the compute queue).
+    EndSplit(true);
 
     // Invalidate provenance even if clients have not released their tokens.
     // Resource completion/teardown remains the caller's responsibility.
@@ -211,6 +368,8 @@ void CommandContext::Shutdown()
     m_lifecycleOpen = false;
     m_lifecycleFenceValue = 0;
     m_lifecycleUncertain = false;
+
+    ShutdownAsyncCompute();
 
     if (m_commandQueue)
     {
@@ -345,6 +504,11 @@ bool CommandContext::Begin(unsigned int frameIndex)
         return false;
     }
 
+    // AIR async compute: a compute list left open by a recording that was never executed is never submitted, nor a split
+    // recording's parts.
+    AbandonAsyncCompute();
+    EndSplit(true);
+
     ID3D12CommandAllocator* commandAllocator = m_commandAllocators[frameIndex];
 
     CpuTiming::ScopedDuration resetDuration(m_beginResetMilliseconds);
@@ -374,6 +538,16 @@ bool CommandContext::Begin(unsigned int frameIndex)
 bool CommandContext::End()
 {
     TextureMemoryAllocator::EndFrameRecording();
+
+    // A split recording ends with its second list (the first part is closed already).
+    if (m_splitFirstList != nullptr)
+    {
+        const bool closed = m_splitSecondOpen && SUCCEEDED(m_commandList->Close());
+        m_splitSecondOpen = false;
+        m_splitSecondEnded = true;
+        return closed;
+    }
+
     return SUCCEEDED(m_commandList->Close());
 }
 
@@ -387,8 +561,21 @@ bool CommandContext::AbortRecording()
     // Close the command list without submitting it.
     // The next Begin() will reset it. R.1: its barriers never run, so the tracked states return to the submitted ones, and
     // the texture activations it held are recorded again by the next Begin.
+    AbandonAsyncCompute();
     ResourceStateTransaction::DiscardRecording();
     TextureMemoryAllocator::EndFrameRecording();
+
+    // A split recording: nothing of either part was submitted (Execute submits both); the first part is closed already, the
+    // second is closed if still open (or if End closed it, the abort succeeds as for any ended recording).
+    if (m_splitFirstList != nullptr)
+    {
+        // After End, closing again fails as for an unsplit recording; a second list that never opened has nothing to close.
+        const bool closed = !m_splitSecondEnded && (!m_splitSecondOpen || SUCCEEDED(m_commandList->Close()));
+        m_splitSecondOpen = false;
+        EndSplit(false);
+        return closed;
+    }
+
     return SUCCEEDED(m_commandList->Close());
 }
 
@@ -421,9 +608,111 @@ bool CommandContext::Execute(unsigned int frameIndex)
         diagnosticStart = CpuTiming::Clock::now();
     }
 
+    // AIR async compute: the frame's compute list, overlapped (ahead of the direct list, after the frame queue's earlier work) or
+    // after the frame (behind this direct list). computeWait: the compute fence value the frame fence must wait for (0: none).
+    std::uint64_t computeWait = 0;
+    const bool asyncCompute = m_asyncComputeOpen;
+    const bool afterFrame = m_asyncComputeAfterFrame;
+    m_asyncComputeOpen = false;
+    m_asyncComputeAfterFrame = false;
+    bool asyncClosed = asyncCompute && SUCCEEDED(m_computeList->Close());
+
+    if (asyncCompute && !asyncClosed)
+    {
+        Log::Error("AIR async compute: the compute list could not be closed; this frame's AIR work is dropped.");
+    }
+
+    const auto submitCompute = [&]()
+    {
+        ID3D12CommandList* computeLists[] = {m_computeList};
+        m_computeQueue->ExecuteCommandLists(1, computeLists);
+        const std::uint64_t value = m_computeFenceValue + 1;
+
+        if (FAILED(m_computeQueue->Signal(m_computeFence, value)))
+        {
+            Log::Error("AIR async compute: the compute fence could not be signalled.");
+            return;
+        }
+
+        m_computeFenceValue = value;
+        computeWait = value;
+        ++m_asyncComputeSubmissions;
+    };
+
+    if (asyncClosed && !afterFrame)
+    {
+        // Every frame-fence value below m_fenceValue has been signalled (it advances only after a successful Signal).
+        if (m_fenceValue > 1)
+        {
+            m_computeQueue->Wait(m_fence, m_fenceValue - 1);
+        }
+
+        submitCompute();
+    }
+
+    // A split recording (SplitForAsyncComputeReaders): the first part now; the compute work is ordered after it (after-the-frame
+    // ordering) or beside it, and the second part, which reads the compute work, waits for it. One frame-fence signal follows.
+    const bool split = m_splitFirstList != nullptr;
+
+    if (split)
+    {
+        ID3D12CommandList* firstLists[] = {m_splitFirstList};
+        m_commandQueue->ExecuteCommandLists(1, firstLists);
+
+        if (asyncClosed && afterFrame)
+        {
+            const std::uint64_t directValue = m_directListFenceValue + 1;
+
+            if (SUCCEEDED(m_commandQueue->Signal(m_directListFence, directValue)))
+            {
+                m_directListFenceValue = directValue;
+                m_computeQueue->Wait(m_directListFence, directValue);
+                submitCompute();
+                ++m_asyncComputeAfterFrameSubmissions;
+            }
+            else
+            {
+                Log::Error("AIR async compute: the direct-list fence could not be signalled; this frame's AIR work is dropped.");
+            }
+        }
+
+        if (computeWait != 0)
+        {
+            m_commandQueue->Wait(m_computeFence, computeWait);
+            computeWait = 0;
+        }
+
+        ++m_splitSubmissions;
+    }
+
     m_commandQueue->ExecuteCommandLists(1, commandLists);
     // R.1: submitted (whether or not the fence signal below succeeds): its state changes are authoritative.
     ResourceStateTransaction::CommitRecording();
+    EndSplit(false);
+
+    if (asyncClosed && afterFrame && !split)
+    {
+        const std::uint64_t directValue = m_directListFenceValue + 1;
+
+        if (SUCCEEDED(m_commandQueue->Signal(m_directListFence, directValue)))
+        {
+            m_directListFenceValue = directValue;
+            m_computeQueue->Wait(m_directListFence, directValue);
+            submitCompute();
+            ++m_asyncComputeAfterFrameSubmissions;
+        }
+        else
+        {
+            Log::Error("AIR async compute: the direct-list fence could not be signalled; this frame's AIR work is dropped.");
+        }
+    }
+
+    // The frame fence covers the compute work: every user of it (slot allocators, the upload ring, retirements, readbacks) stays
+    // correct without knowing about the compute queue.
+    if (computeWait != 0)
+    {
+        m_commandQueue->Wait(m_computeFence, computeWait);
+    }
 
     if (m_executeCpuTimingEnabled)
     {
@@ -1007,7 +1296,9 @@ bool CommandContext::DiscardCommandsAfterGPUDrain()
         return false;
     }
 
-    // R.1: an open recording on the old list is never submitted.
+    // R.1: an open recording on the old list is never submitted (nor either part of a split one).
+    AbandonAsyncCompute();
+    EndSplit(true);
     ResourceStateTransaction::DiscardRecording();
     TextureMemoryAllocator::EndFrameRecording();
 

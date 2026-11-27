@@ -94,7 +94,10 @@ cbuffer AirPressureConstants : register(b0)
     // AIR P1/C1: each piece's gross right-hand-side magnitude G (uint per slot: two truncated floats, CSPrepare), for the residual's
     // rounding allowance (CSResidual).
     uint rhsGrossIndex;
-    uint3 constantsPadding;
+    // AIR solver restructure: how many of the first recovery cycles belong to the step's own cycle budget (the adaptive warm cycles);
+    // CSRecoveryGate counts the cycles run beyond them in TopologyRecoveryBeyondBudget.
+    uint budgetedRecoveryCycles;
+    uint2 constantsPadding;
 };
 
 // AIR.4F.1b: buoyancy (AirDivergence.hlsli's AirBuoyancy), two root constants bound for CSPrepare and CSCorrect only, so the shared
@@ -215,6 +218,9 @@ static const uint TopologyClassOther = 172;
 // AIR P1/C1 (diagnostics): solves the recovery gate accepted only through the rounding allowance (their largest raw residual was above the
 // criterion; cumulative).
 static const uint TopologyRhsRoundingConverged = 176;
+// AIR solver restructure: recovery cycles run beyond the solves' budgeted recovery cycles (cumulative): true recovery, as opposed to the
+// adaptive warm cycles the budget itself gates. The adaptive recovery budget (AirField) reads it.
+static const uint TopologyRecoveryBeyondBudget = 180;
 // The topology check's capacity: pieces of its box held in group shared memory.
 static const uint TopologyNodeCapacity = 4096;
 static const uint PressureChangedFlags = 64;
@@ -395,39 +401,92 @@ uint CoarseMap(AirPressureLevel target, uint cellIndex, uint slot)
     return (Raw(hierarchyIndex).Load(target.map + cellIndex * 4) >> (slot * 4)) & 0xFu;
 }
 
-// Slot `slot` of a coarse cell: the sum of its couplings times the neighbours' phi (window-local neighbours only).
-float CoarseNeighbours(AirPressureLevel target, int3 local, uint cellIndex, uint slot)
+// AIR.4E.6 C2: one fp16 coupling from a cell's axis rows held as uint4 (two per axis, 16 entries I * PressureSlots + J). `entry` must be
+// a compile-time index (every caller's loops are unrolled), so the rows stay in registers.
+float CoarseRowCoupling(uint4 words[6], uint axis, uint entry)
 {
-    float sum = 0.0;
+    const uint word = words[axis * 2 + entry / 8][(entry / 2) % 4];
+    return f16tof32((entry & 1) != 0 ? word >> 16 : word & 0xFFFFu);
+}
+
+// AIR solver restructure (scope §2.7.1, C2 for levels 1 to 3): what a coarse cell's slots need from its neighbours, loaded once per cell
+// instead of once per slot and coupling: per axis, its own couplings toward the +axis neighbour and those of its -axis neighbour toward
+// it (each 32 bytes, two uint4), and both neighbours' phi (four slots, one uint4). Window-local neighbours only.
+struct CoarseNeighbourhood
+{
+    uint4 next[6];
+    uint4 previous[6];
+    float4 nextPhi[3];
+    float4 previousPhi[3];
+    bool hasNext[3];
+    bool hasPrevious[3];
+};
+
+CoarseNeighbourhood LoadCoarseNeighbourhood(AirPressureLevel target, int3 local, uint cellIndex)
+{
+    CoarseNeighbourhood neighbourhood;
 
     [unroll]
     for(uint axis = 0; axis < 3; ++axis)
     {
         int3 next = local;
         next[axis] += 1;
+        int3 previous = local;
+        previous[axis] -= 1;
+        neighbourhood.hasNext[axis] = CoarseContains(target, next);
+        neighbourhood.hasPrevious[axis] = CoarseContains(target, previous);
+        neighbourhood.next[axis * 2] = uint4(0, 0, 0, 0);
+        neighbourhood.next[axis * 2 + 1] = uint4(0, 0, 0, 0);
+        neighbourhood.previous[axis * 2] = uint4(0, 0, 0, 0);
+        neighbourhood.previous[axis * 2 + 1] = uint4(0, 0, 0, 0);
+        neighbourhood.nextPhi[axis] = float4(0.0, 0.0, 0.0, 0.0);
+        neighbourhood.previousPhi[axis] = float4(0.0, 0.0, 0.0, 0.0);
 
-        if(CoarseContains(target, next))
+        if(neighbourhood.hasNext[axis])
         {
-            const uint nextIndex = CoarseCellIndex(target, next);
+            const uint own = target.weights + cellIndex * PressureWeightBytes + axis * 32;
+            neighbourhood.next[axis * 2] = Raw(hierarchyIndex).Load4(own);
+            neighbourhood.next[axis * 2 + 1] = Raw(hierarchyIndex).Load4(own + 16);
+            neighbourhood.nextPhi[axis] = asfloat(Raw(hierarchyIndex).Load4(target.phi + CoarseCellIndex(target, next) * PressureSlots * 4));
+        }
 
+        if(neighbourhood.hasPrevious[axis])
+        {
+            const uint previousIndex = CoarseCellIndex(target, previous);
+            const uint other = target.weights + previousIndex * PressureWeightBytes + axis * 32;
+            neighbourhood.previous[axis * 2] = Raw(hierarchyIndex).Load4(other);
+            neighbourhood.previous[axis * 2 + 1] = Raw(hierarchyIndex).Load4(other + 16);
+            neighbourhood.previousPhi[axis] = asfloat(Raw(hierarchyIndex).Load4(target.phi + previousIndex * PressureSlots * 4));
+        }
+    }
+
+    return neighbourhood;
+}
+
+// Slot `slot` (a compile-time index) of a coarse cell: the sum of its couplings times the neighbours' phi, per axis the +axis neighbour's
+// slots then the -axis neighbour's (the summation order of the scalar loads it replaced, so the result is bit-identical).
+float CoarseNeighbours(CoarseNeighbourhood neighbourhood, uint slot)
+{
+    float sum = 0.0;
+
+    [unroll]
+    for(uint axis = 0; axis < 3; ++axis)
+    {
+        if(neighbourhood.hasNext[axis])
+        {
             [unroll]
             for(uint other = 0; other < PressureSlots; ++other)
             {
-                sum += CoarseWeight(target, cellIndex, axis, slot, other) * CoarseValue(target.phi, nextIndex, other);
+                sum += CoarseRowCoupling(neighbourhood.next, axis, slot * PressureSlots + other) * neighbourhood.nextPhi[axis][other];
             }
         }
 
-        int3 previous = local;
-        previous[axis] -= 1;
-
-        if(CoarseContains(target, previous))
+        if(neighbourhood.hasPrevious[axis])
         {
-            const uint previousIndex = CoarseCellIndex(target, previous);
-
             [unroll]
             for(uint other = 0; other < PressureSlots; ++other)
             {
-                sum += CoarseWeight(target, previousIndex, axis, other, slot) * CoarseValue(target.phi, previousIndex, other);
+                sum += CoarseRowCoupling(neighbourhood.previous, axis, other * PressureSlots + slot) * neighbourhood.previousPhi[axis][other];
             }
         }
     }
@@ -1785,7 +1844,9 @@ void CSSmoothCoarse(uint3 thread : SV_DispatchThreadID)
     const int3 local = int3(thread);
     const uint cellIndex = CoarseCellIndex(level, local);
     const uint present = CoarsePresent(level, cellIndex);
+    const CoarseNeighbourhood neighbourhood = LoadCoarseNeighbourhood(level, local, cellIndex);
 
+    [unroll]
     for(uint slot = 0; slot < PressureSlots; ++slot)
     {
         const float diagonal = CoarseValue(level.diagonal, cellIndex, slot);
@@ -1795,7 +1856,7 @@ void CSSmoothCoarse(uint3 thread : SV_DispatchThreadID)
             continue;
         }
 
-        const float value = (CoarseValue(level.rhs, cellIndex, slot) + CoarseNeighbours(level, local, cellIndex, slot)) / diagonal;
+        const float value = (CoarseValue(level.rhs, cellIndex, slot) + CoarseNeighbours(neighbourhood, slot)) / diagonal;
         Raw(hierarchyIndex).Store(level.phi + (cellIndex * PressureSlots + slot) * 4, asuint(value));
     }
 }
@@ -1811,7 +1872,9 @@ void CSRestrictCoarse(uint3 thread : SV_DispatchThreadID, uint3 groupThread : SV
     {
         const uint childIndex = CoarseCellIndex(level, local);
         const uint present = CoarsePresent(level, childIndex);
+        const CoarseNeighbourhood neighbourhood = LoadCoarseNeighbourhood(level, local, childIndex);
 
+        [unroll]
         for(uint slot = 0; slot < PressureSlots; ++slot)
         {
             const uint target = CoarseMap(level, childIndex, slot);
@@ -1823,7 +1886,7 @@ void CSRestrictCoarse(uint3 thread : SV_DispatchThreadID, uint3 groupThread : SV
             }
 
             const float applied = CoarseValue(level.diagonal, childIndex, slot) * CoarseValue(level.phi, childIndex, slot) -
-                CoarseNeighbours(level, local, childIndex, slot);
+                CoarseNeighbours(neighbourhood, slot);
             restrictTerms[groupIndex * PressureSlots + slot] = CoarseValue(level.rhs, childIndex, slot) - applied;
             targets = (targets & ~(0xFu << (slot * 4))) | (target << (slot * 4));
         }
@@ -1879,12 +1942,6 @@ struct CoarsestCouplings
     bool hasPrevious[3];
 };
 
-float CoarsestCoupling(uint4 words[6], uint axis, uint entry)
-{
-    const uint word = words[axis * 2 + entry / 8][(entry / 2) % 4];
-    return f16tof32((entry & 1) != 0 ? word >> 16 : word & 0xFFFFu);
-}
-
 CoarsestCouplings LoadCoarsestCouplings(int3 local, uint cellIndex, bool inside)
 {
     CoarsestCouplings couplings;
@@ -1927,7 +1984,7 @@ float SharedNeighbours(CoarsestCouplings couplings, int3 local, uint slot)
             [unroll]
             for(uint other = 0; other < PressureSlots; ++other)
             {
-                sum += CoarsestCoupling(couplings.next, axis, slot * PressureSlots + other) * coarsestPhi[nextIndex * PressureSlots + other];
+                sum += CoarseRowCoupling(couplings.next, axis, slot * PressureSlots + other) * coarsestPhi[nextIndex * PressureSlots + other];
             }
         }
 
@@ -1941,7 +1998,7 @@ float SharedNeighbours(CoarsestCouplings couplings, int3 local, uint slot)
             [unroll]
             for(uint other = 0; other < PressureSlots; ++other)
             {
-                sum += CoarsestCoupling(couplings.previous, axis, other * PressureSlots + slot) * coarsestPhi[previousIndex * PressureSlots + other];
+                sum += CoarseRowCoupling(couplings.previous, axis, other * PressureSlots + slot) * coarsestPhi[previousIndex * PressureSlots + other];
             }
         }
     }
@@ -2768,6 +2825,11 @@ void CSRecoveryGate(uint3 thread : SV_DispatchThreadID)
     if(active)
     {
         topology.Store(TopologyRecoveryCycles, topology.Load(TopologyRecoveryCycles) + 1);
+
+        if(recoveryStep >= budgetedRecoveryCycles)
+        {
+            topology.Store(TopologyRecoveryBeyondBudget, topology.Load(TopologyRecoveryBeyondBudget) + 1);
+        }
     }
     else if(above)
     {

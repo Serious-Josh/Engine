@@ -5,7 +5,8 @@ struct ToneMapConstants
 {
     uint sceneColorIndex;
     // Raw camera exposure state (AutoExposure.hlsl): word 1 is the multiplier 2^(EV_ref - EV_eff) from GPU values to
-    // tone-mapper input, the same value DLSS receives as its exposure texture.
+    // tone-mapper input, the same value DLSS receives as its exposure texture. 0xFFFFFFFF (ToneMapPass::NoCameraExposure)
+    // reads no state and keeps the reference exposure (multiplier 1): the Editor's material and mesh previews.
     uint exposureStateIndex;
     uint debugTextureIndex;
     uint debugView;
@@ -574,7 +575,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
     }
 
     // Camera exposure applies to the normal image only; diagnostic lighting views stay at the reference exposure.
-    if(toneMapConstants.debugView == 0u)
+    if(toneMapConstants.debugView == 0u && toneMapConstants.exposureStateIndex != 0xFFFFFFFFu)
     {
         ByteAddressBuffer exposureState = ResourceDescriptorHeap[toneMapConstants.exposureStateIndex];
         hdrColor *= asfloat(exposureState.Load(4u));

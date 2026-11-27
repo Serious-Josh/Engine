@@ -77,6 +77,58 @@
     bool normalMapped = materialValid && hasTangents &&
         materials[instance.materialIndex].normalTextureIndex != 0xFFFFFFFFu;
     bool anisotropic = materialValid && hasTangents && (lobeFlags & GPU_MATERIAL_LOBE_ANISOTROPY) != 0u;
+
+#if defined(PATH_TRACE_RESTIR_PT_LIBRARY) && defined(PATH_TRACE_SURFACE_DETAIL_RELIEF)
+    // POM D2a (the relief kernel tiers): parallax occlusion mapping at the hit, so reflections and bounce light see the
+    // same relief as the raster primary. The march follows this ray into the material's height field from the hit's UV,
+    // with the triangle's own edges for the UV mapping and the ray cone (the camera pixel's angle times the distance the
+    // ray travelled) for the height mip; every later texture read and the normal map use the UV it finds. The hit point
+    // itself stays on the mesh. reliefClipped: with silhouette POM, the ray leaves the mesh before it meets the relief
+    // (SurfaceDetailSilhouette.hlsli); an inline tracer then continues past the hit (RestirPtTraceInline).
+    bool reliefClipped = false;
+
+    if(materialValid && SurfaceDetailUsesParallax(materials[instance.materialIndex]))
+    {
+        GPUMaterial reliefMaterial = materials[instance.materialIndex];
+        float3x3 reliefObjectToWorld = (float3x3)PATH_TRACE_HIT_OBJECT_TO_WORLD;
+        float3 reliefEdge1 = mul(reliefObjectToWorld, position1 - position0);
+        float3 reliefEdge2 = mul(reliefObjectToWorld, position2 - position0);
+        float2 reliefUV0 = PathTraceLoadUV(vertexBuffer, indices.x, instance);
+        float2 reliefUVEdge1 = PathTraceLoadUV(vertexBuffer, indices.y, instance) - reliefUV0;
+        float2 reliefUVEdge2 = PathTraceLoadUV(vertexBuffer, indices.z, instance) - reliefUV0;
+        float4 reliefTangent = float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+        if(hasTangents)
+        {
+            float4 objectReliefTangent = PathTraceLoadTangent(vertexBuffer, indices.x, instance) * barycentrics.x +
+                PathTraceLoadTangent(vertexBuffer, indices.y, instance) * barycentrics.y +
+                PathTraceLoadTangent(vertexBuffer, indices.z, instance) * barycentrics.z;
+            reliefTangent = float4(mul(reliefObjectToWorld, objectReliefTangent.xyz), objectReliefTangent.w);
+        }
+
+        float2 uvPerHeight;
+        float viewCosine;
+
+        if(SurfaceDetailUVPerHeight(worldNormal, reliefTangent, -PATH_TRACE_HIT_WORLD_RAY_DIRECTION, reliefEdge1,
+            reliefEdge2, reliefUVEdge1, reliefUVEdge2, uvPerHeight, viewCosine))
+        {
+            // The ray cone's width at the hit, in UV: its world width over the triangle's world length per UV.
+            float coneWidth = PATH_TRACE_HIT_T * PathTraceCameraPixelAngle(PATH_TRACE_HIT_WORLD_RAY_DIRECTION);
+            float uvArea = abs(reliefUVEdge1.x * reliefUVEdge2.y - reliefUVEdge1.y * reliefUVEdge2.x);
+            float worldArea = length(cross(reliefEdge1, reliefEdge2));
+            float uvFootprint = coneWidth * sqrt(uvArea / max(worldArea, 1.0e-20f));
+            SurfaceDetailResult relief = SurfaceDetailMarch(reliefMaterial, materialSampler, uv,
+                float2(uvFootprint, 0.0f), float2(0.0f, uvFootprint), uvPerHeight, viewCosine, 0.0f);
+
+            if(relief.displaced && all(isfinite(relief.uv)))
+            {
+                reliefClipped = (reliefMaterial.lobeFlags & GPU_MATERIAL_PARALLAX_SILHOUETTE) != 0u &&
+                    SurfaceDetailLeavesSilhouette(instance, PATH_TRACE_HIT_PRIMITIVE_INDEX, relief.uv);
+                uv = relief.uv;
+            }
+        }
+    }
+#endif
     uint packedSmoothNormal = OPENPBR_PACKED_VECTOR_NONE;
     uint packedTangent = OPENPBR_PACKED_VECTOR_NONE;
 

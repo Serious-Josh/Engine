@@ -3,9 +3,12 @@
 #include "assets/ProjectSceneMembership.h"
 
 #include <array>
+#include <atomic>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 class ProjectPaths;
@@ -18,6 +21,12 @@ class ProjectAssetRegistry;
 class SceneMembershipPanel
 {
 public:
+    SceneMembershipPanel() = default;
+    SceneMembershipPanel(const SceneMembershipPanel&) = delete;
+    SceneMembershipPanel& operator=(const SceneMembershipPanel&) = delete;
+    // Stops and joins a scene read in flight.
+    ~SceneMembershipPanel();
+
     enum class Action
     {
         CreateWorld,
@@ -59,7 +68,9 @@ public:
         std::filesystem::path builtinSource;
     };
 
-    // Re-reads every scene when stale or when the project changed.
+    // Re-reads every scene when stale or when the project changed. Startup work (4.3): on a thread of its own (below normal
+    // priority, over copies of the paths and registry), so opening a project with large scenes never stalls a frame; the
+    // previous state stays shown until the read finishes and is adopted by a later call.
     void Refresh(const ProjectPaths& paths, const ProjectAssetRegistry& registry);
     void Invalidate() noexcept { m_stale = true; }
 
@@ -94,6 +105,18 @@ private:
 
     std::filesystem::path m_root;
     bool m_stale = true;
+
+    // Startup work (4.3): the read in flight, written only by its thread until `done`.
+    struct PendingRead
+    {
+        std::filesystem::path root;
+        std::vector<ProjectSceneMembership::SceneInfo> scenes;
+        std::vector<std::string> problems;
+        std::atomic<bool> done{false};
+        std::atomic<bool> cancel{false};
+    };
+    std::shared_ptr<PendingRead> m_read;
+    std::thread m_readThread;
     std::vector<ProjectSceneMembership::SceneInfo> m_scenes;
     std::vector<std::string> m_problems;
 

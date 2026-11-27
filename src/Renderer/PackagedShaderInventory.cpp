@@ -34,6 +34,8 @@ namespace
         {"ToneMap.hlsl", "PSMain", Pixel, Feature::Core},
         {"Triangle.hlsl", "VSMain", Vertex, Feature::Core},
         {"Triangle.hlsl", "PSMain", Pixel, Feature::Core},
+        // Parallax materials' G-buffer pixel shader (Renderer::InitializeParallaxGeometryPipeline).
+        {"Triangle.hlsl", "PSMainParallax", Pixel, Feature::Core},
         {"AutoExposure.hlsl", "CSClear", Compute, Feature::Core},
         {"AutoExposure.hlsl", "CSHistogram", Compute, Feature::Core},
         {"AutoExposure.hlsl", "CSAdapt", Compute, Feature::Core},
@@ -149,8 +151,9 @@ namespace
         {"RrInputPreparationPsr.hlsl", "CSMain", Compute, Feature::RayReconstruction},
 
         // Cooked-game port: ReSTIR PT Enhanced's production pipelines (ReSTIRPTPass's PipelineSources and
-        // LayeredPipelineSources rows marked production), base tier then the OpenPBR layered tier, and the SHARC twins of
-        // its kernels. Keep these in step with those tables: a missing row makes ReSTIR PT unavailable in packaged games.
+        // TierPipelineSources rows marked production): the base tier, the OpenPBR layered tier, then (POM B2) the
+        // parallax and layered parallax tiers, and the SHARC twins of its kernels. Keep these in step with those
+        // tables: a missing row makes ReSTIR PT unavailable in packaged games.
         {"ReSTIRPT/RestirPtInitialReGIRLightBounce.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
         {"ReSTIRPT/RestirPtInitialReGIR.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
         {"ReSTIRPT/RestirPtInitial.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
@@ -163,6 +166,16 @@ namespace
         {"ReSTIRPT/RestirPtInitialLayered.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
         {"ReSTIRPT/RestirPtInitialLayered.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPT},
         {"ReSTIRPT/RestirPtInitialLayered.hlsl", "RestirPtSpatialResampleCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounceRelief.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialReGIRRelief.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialRelief.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialRelief.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialRelief.hlsl", "RestirPtSpatialResampleCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounceLayeredRelief.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialReGIRLayeredRelief.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialLayeredRelief.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialLayeredRelief.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPT},
+        {"ReSTIRPT/RestirPtInitialLayeredRelief.hlsl", "RestirPtSpatialResampleCS", Compute, Feature::ReSTIRPT},
         {"ReSTIRPT/RestirPtInitialReGIRLightBounceSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
         {"ReSTIRPT/RestirPtInitialReGIRSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
         {"ReSTIRPT/RestirPtInitialSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
@@ -174,6 +187,19 @@ namespace
         {"ReSTIRPT/RestirPtInitialLayeredSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
         {"ReSTIRPT/RestirPtInitialLayeredSharc.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPTSharc},
         {"ReSTIRPT/RestirPtInitialLayeredSharc.hlsl", "RestirPtSpatialResampleCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounceReliefSharc.hlsl", "RestirPtInitialCS", Compute,
+            Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReGIRReliefSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReliefSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReliefSharc.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReliefSharc.hlsl", "RestirPtSpatialResampleCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReGIRLightBounceLayeredReliefSharc.hlsl", "RestirPtInitialCS", Compute,
+            Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialReGIRLayeredReliefSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialLayeredReliefSharc.hlsl", "RestirPtInitialCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialLayeredReliefSharc.hlsl", "RestirPtSpatialPairsCS", Compute, Feature::ReSTIRPTSharc},
+        {"ReSTIRPT/RestirPtInitialLayeredReliefSharc.hlsl", "RestirPtSpatialResampleCS", Compute,
+            Feature::ReSTIRPTSharc},
 
         // R1.2b: EditorMistPass's haze core (Initialize) and its production Gaussian filter (EnsureFilterPipeline). The mist
         // stages (EnsureMistPipelines) are Feature::Air below; the froxel diagnostics stay unpackaged.
@@ -192,6 +218,8 @@ namespace
         {"AirSolver.hlsl", "CSStepSplit", Compute, Feature::Air},
         {"AirSolver.hlsl", "CSPrepareSplit", Compute, Feature::Air},
         {"AirSolver.hlsl", "CSResetSplit", Compute, Feature::Air},
+        {"AirSolver.hlsl", "CSResetActivity", Compute, Feature::Air},
+        {"AirSolver.hlsl", "CSZeroVelocity", Compute, Feature::Air},
         {"AirSolver.hlsl", "CSMotorVisibility", Compute, Feature::Air},
         {"AirSolver.hlsl", "CSEmissionStatus", Compute, Feature::Air},
         {"AirSolver.hlsl", "CSEmissionSamples", Compute, Feature::Air},
@@ -263,7 +291,19 @@ namespace
         {"EditorMist.hlsl", "CSRaymarch", Compute, Feature::Air},
         {"EditorMist.hlsl", "CSSunVisibility", Compute, Feature::Air},
         {"EditorMist.hlsl", "CSIndirectFill", Compute, Feature::Air},
-        {"EditorMist.hlsl", "CSOccupancy", Compute, Feature::Air}};
+        {"EditorMist.hlsl", "CSOccupancy", Compute, Feature::Air},
+        // Fog step 1: the render volume's build and the three marches that read it (EditorMistPass::EnsureRenderVolumePipelines).
+        {"EditorMist.hlsl", "CSBuildRenderVolume", Compute, Feature::Air},
+        {"EditorMist.hlsl", "CSRaymarchVolume", Compute, Feature::Air},
+        {"EditorMist.hlsl", "CSRaymarchAtmosphereVolume", Compute, Feature::Air},
+        {"EditorMist.hlsl", "CSRaymarchAtmosphereBoundedVolume", Compute, Feature::Air},
+        // Fog step 2: the hybrid froxel lights and the three marches that read them (EditorMistPass::EnsureHybridLightPipelines).
+        {"EditorMist.hlsl", "CSFroxelHybridLights", Compute, Feature::Air},
+        {"EditorMist.hlsl", "CSRaymarchVolumeLights", Compute, Feature::Air},
+        {"EditorMist.hlsl", "CSRaymarchAtmosphereVolumeLights", Compute, Feature::Air},
+        {"EditorMist.hlsl", "CSRaymarchAtmosphereBoundedVolumeLights", Compute, Feature::Air},
+        // Step 2b: the automatic choice's Light count.
+        {"EditorMist.hlsl", "CSCountFogLights", Compute, Feature::Air}};
 }
 
 const char* PackagedShaderFeatureName(PackagedShaderFeature feature)

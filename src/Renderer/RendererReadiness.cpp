@@ -297,7 +297,8 @@ ConfigurationReadiness Renderer::EvaluateConfigurationReadiness(const RenderingC
 
         DependencyReadiness pipelinesReadiness = ObserveDxrRequirements(baseLibraries, basePipelines);
 
-        if(pipelinesReadiness.state == ReadinessState::Ready && m_pathTraceReferencePass.IsInitialized() &&
+        // Startup work (4.1): ReSTIR PT Enhanced records no primary pipeline.
+        if(pipelinesReadiness.state == ReadinessState::Ready && m_pathTraceReferencePass.IsInitialized() && !restirPT &&
             !m_pathTraceReferencePass.IsPrimaryReady(GetLightingModePrimary(mode)))
         {
             pipelinesReadiness = Make(ReadinessState::Preparing, "primary pipeline prepared, adopted on activation");

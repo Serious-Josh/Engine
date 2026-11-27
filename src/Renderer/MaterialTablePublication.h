@@ -1,6 +1,8 @@
 #pragma once
 
+#include "Renderer/Material.h"
 #include "Renderer/ShaderData.h"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstddef>
@@ -25,6 +27,16 @@ struct MaterialTablePublication
     // layered kernels (ReSTIRPTPass::SetLayeredMaterials).
     bool layeredLobes = false;
 
+    // POM B2: whether a desired material renders with parallax occlusion mapping, so ReSTIR PT must run its parallax
+    // kernels (the relief's own shadow at the raster primary, ReSTIRPTPass::SetMaterialTier).
+    bool parallax = false;
+
+    static bool UsesParallax(const std::vector<GPUMaterial>& materials)
+    {
+        return std::any_of(materials.begin(), materials.end(),
+            [](const GPUMaterial& material) { return SurfaceDetailUsesParallax(material); });
+    }
+
     static bool UsesLayeredLobes(const std::vector<GPUMaterial>& materials)
     {
         constexpr unsigned int layered = GpuMaterialLobeFlags::Coat | GpuMaterialLobeFlags::Fuzz |
@@ -45,7 +57,8 @@ struct MaterialTablePublication
     {
         constexpr unsigned int knownLobeFlags = GpuMaterialLobeFlags::Coat | GpuMaterialLobeFlags::Fuzz |
             GpuMaterialLobeFlags::ThinFilm | GpuMaterialLobeFlags::Anisotropy |
-            GpuMaterialLobeFlags::CoatFollowsBaseNormal | GpuMaterialLobeFlags::PathTracedAO;
+            GpuMaterialLobeFlags::CoatFollowsBaseNormal | GpuMaterialLobeFlags::PathTracedAO |
+            GpuMaterialLobeFlags::ParallaxSilhouette;
 
         if((material.lobeFlags & ~knownLobeFlags) != 0u || material.preferARM > 1 || material.surfaceDetailMode > 2)
         {
@@ -118,6 +131,7 @@ struct MaterialTablePublication
         auto copy = records; // Strong guarantee: allocation failure cannot partially replace the desired table.
         desired.swap(copy);
         layeredLobes = UsesLayeredLobes(desired);
+        parallax = UsesParallax(desired);
         ++revision;
         return true;
     }
@@ -139,6 +153,7 @@ struct MaterialTablePublication
         copy.push_back(record);
         desired.swap(copy);
         layeredLobes = UsesLayeredLobes(desired);
+        parallax = UsesParallax(desired);
         ++revision;
         return true;
     }
